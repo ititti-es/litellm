@@ -1510,12 +1510,19 @@ model LiteLLM_ConversationSession {
   compaction_policy_id String?
   last_upstream_at     DateTime
   expires_at           DateTime?
+  pinned               Boolean                        @default(false)
+  source               String?
+  source_id            String?
+  title                String?
+  parent_session_id    String?
+  metadata             Json?
   created_at           DateTime                       @default(now())
   updated_at           DateTime                       @default(now()) @updatedAt
   items                LiteLLM_ConversationItem[]
   responses            LiteLLM_ConversationResponse[]
   compaction_policy    LiteLLM_CompactionPolicy?      @relation(fields: [compaction_policy_id], references: [policy_id], onDelete: SetNull)
 
+  @@unique([source, source_id])
   @@index([owner])
   @@index([expires_at])
 }
@@ -1527,6 +1534,7 @@ model LiteLLM_ConversationItem {
   seq        Int
   content    Json
   is_output  Boolean
+  meta       Json?
   created_at DateTime                    @default(now())
   session    LiteLLM_ConversationSession @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
 

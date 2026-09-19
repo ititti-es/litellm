@@ -27,6 +27,7 @@ from litellm.types.utils import ADDRESSED_RESPONSE_ID_FIELD, CallTypesLiteral, L
 if TYPE_CHECKING:
     from litellm.caching.caching import DualCache
     from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.sessions import SessionManager
 
 
 _RESPONSES_API_PROVIDER_PREFIX: Final = "/openai"
@@ -44,6 +45,12 @@ def _proxy_general_settings() -> Mapping[str, Any]:
     from litellm.proxy.proxy_server import general_settings
 
     return general_settings
+
+
+def _proxy_session_manager() -> "SessionManager | None":
+    import litellm
+
+    return litellm.session_manager
 
 
 def _proxy_signing_key() -> str | None:
@@ -109,9 +116,11 @@ class ResponsesIDSecurity(CustomLogger):
         self,
         general_settings_reader: Callable[[], Mapping[str, Any]] = _proxy_general_settings,
         signing_key_reader: Callable[[], str | None] = _proxy_signing_key,
+        session_manager_reader: Callable[[], "SessionManager | None"] = _proxy_session_manager,
     ) -> None:
         self._general_settings_reader: Final = general_settings_reader
         self._signing_key_reader: Final = signing_key_reader
+        self._session_manager_reader: Final = session_manager_reader
 
     async def async_pre_call_hook(
         self,
@@ -137,10 +146,33 @@ class ResponsesIDSecurity(CustomLogger):
         )
         if not isinstance(addressed_id, str) or not addressed_id:
             return data
-        authorized_id: Final = self._authorize_response_id(addressed_id, user_api_key_dict)
+        authorized_id: Final = (
+            addressed_id
+            if await self._held_by_session_manager(addressed_id, user_api_key_dict)
+            else self._authorize_response_id(addressed_id, user_api_key_dict)
+        )
         data[addressed_id_field] = authorized_id
         data[ADDRESSED_RESPONSE_ID_FIELD] = addressed_id
         return data
+
+    async def _held_by_session_manager(self, response_id: str, user_api_key_dict: "UserAPIKeyAuth") -> bool:
+        """The session manager vouches for the ids it holds (imported sessions, for example), bound to the exact key
+
+        True when it holds the id for this key, a 403 when it holds it for another, and False when it does not
+        know the id, which leaves the decision to the checks below
+        """
+        manager: Final = self._session_manager_reader()
+        if manager is None or self._is_encrypted_response_id(response_id):
+            return False
+        from litellm.sessions import Forbidden, Resolved
+        from litellm.sessions.responses import provider_response_id
+
+        resolution: Final = await manager.resolve_async(
+            provider_response_id(response_id), user_api_key_dict.api_key or ""
+        )
+        if isinstance(resolution, Forbidden):
+            raise HTTPException(status_code=403, detail="Forbidden. This response id belongs to another key.")
+        return isinstance(resolution, Resolved)
 
     def _authorize_response_id(
         self,

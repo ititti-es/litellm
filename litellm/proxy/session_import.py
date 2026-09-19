@@ -1,0 +1,199 @@
+"""Import harness sessions into the session manager's transcript store
+
+    python -m litellm.proxy.session_import opencode [--source ~/.local/share/opencode/opencode.db] [--owner-key sk-...]
+    python -m litellm.proxy.session_import openclaw [--source ~/.openclaw] [--owner-key sk-...]
+    python -m litellm.proxy.session_import pin|unpin SESSION_ID
+
+Sources are read from a private copy, never written. Re-running is safe: a session that grew since the last
+import is appended to, and one whose history the harness rewrote is stored as a new version beside the old.
+Without --owner-key, imports are archive-only: stored, but continuable by no key.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import sys
+from collections.abc import AsyncGenerator, Iterable, Iterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Final
+
+from litellm.proxy._types import hash_token
+from litellm.repositories.conversation_session_repository import (
+    ConversationSessionRepository,
+    ImportWrite,
+    ItemRow,
+    StoredTranscript,
+    jsonb_text,
+)
+from litellm.sessions.importers.common import ImportedSession
+from litellm.sessions.importers.openclaw import read_openclaw
+from litellm.sessions.importers.opencode import read_opencode
+from litellm.sessions.session import canonical
+
+_DEFAULT_SOURCES: Final = MappingProxyType(
+    {
+        "opencode": Path.home() / ".local" / "share" / "opencode" / "opencode.db",
+        "openclaw": Path(os.environ.get("OPENCLAW_STATE_DIR", Path.home() / ".openclaw")),
+    }
+)
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:24]
+
+
+def imported_session_id(source: str, source_id: str) -> str:
+    return f"imp_{source}_{_digest(source_id)}"
+
+
+def imported_response_id(source: str, source_id: str, turn: int) -> str:
+    return f"resp_imp_{_digest(f'{source}:{source_id}:{turn}')}"
+
+
+@dataclass(frozen=True, slots=True)
+class Planned:
+    write: ImportWrite
+    action: str
+
+
+def plan_import(session: ImportedSession, owner: str, stored: StoredTranscript | None) -> Planned:
+    """Append when the stored transcript is a prefix of the source, otherwise store the source as a new version"""
+    contents: Final = tuple(canonical(json.loads(jsonb_text(item.item))) for item in session.items)
+    held: Final = tuple(canonical(_decoded(content)) for content in stored.contents) if stored is not None else ()
+    extends: Final = stored is not None and contents[: len(held)] == held
+    unchanged: Final = extends and len(held) == len(contents)
+    version: Final = 0 if stored is None else stored.version if extends else stored.version + 1
+    first_new: Final = len(held) if extends else 0
+    session_id: Final = imported_session_id(session.source, session.source_id)
+    write: Final = ImportWrite(
+        session_id=session_id,
+        owner=owner,
+        version=version,
+        source=session.source,
+        source_id=session.source_id,
+        title=session.title,
+        parent_session_id=(
+            imported_session_id(session.source, session.parent_source_id) if session.parent_source_id else None
+        ),
+        metadata=jsonb_text(MappingProxyType({**session.metadata, "skipped": session.skipped})),
+        created_at=session.created_at,
+        last_upstream_at=session.updated_at,
+        items=tuple(
+            ItemRow(
+                seq=seq, content=jsonb_text(imported.item), is_output=imported.is_output, meta=jsonb_text(imported.meta)
+            )
+            for seq, imported in enumerate(session.items)
+            if seq >= first_new
+        ),
+        responses=tuple(
+            (imported_response_id(session.source, session.source_id, turn), end)
+            for turn, end in enumerate(session.turn_ends)
+        ),
+    )
+    action: Final = (
+        "new" if stored is None else "unchanged" if unchanged else "appended" if extends else f"new version {version}"
+    )
+    return Planned(write, action)
+
+
+def _decoded(content: object) -> object:
+    return json.loads(content) if isinstance(content, str) else content
+
+
+async def run_import(
+    sessions: Iterable[ImportedSession], owner: str, repository: ConversationSessionRepository | None
+) -> Iterator[str]:
+    lines: Final = tuple([await _import_one(session, owner, repository) for session in sessions])
+    return iter(lines)
+
+
+async def _import_one(session: ImportedSession, owner: str, repository: ConversationSessionRepository | None) -> str:
+    stored: Final = (
+        await repository.current_transcript(imported_session_id(session.source, session.source_id))
+        if repository is not None
+        else None
+    )
+    planned: Final = plan_import(session, owner, stored)
+    if repository is not None and planned.action != "unchanged":
+        await repository.import_session(planned.write)
+    title: Final = (session.title or "")[:60]
+    return (
+        f"{planned.write.session_id}  {planned.action:<13} items={len(session.items):<5} "
+        f"turns={len(session.turn_ends):<4} skipped={session.skipped:<3} {title}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Client:
+    db: object
+
+
+@asynccontextmanager
+async def _repository(url: str | None) -> AsyncGenerator[ConversationSessionRepository | None]:
+    if url is None:
+        yield None
+        return
+    from prisma import Prisma
+
+    client: Final = Prisma(datasource={"url": url})  # mutable-ok: the Prisma constructor takes a dict
+    await client.connect()
+    try:
+        yield ConversationSessionRepository(_Client(client))
+    finally:
+        await client.disconnect()
+
+
+async def _main(args: argparse.Namespace) -> int:
+    url: Final = None if getattr(args, "dry_run", False) else args.database_url or os.environ.get("DATABASE_URL")
+    if url is None and not getattr(args, "dry_run", False):
+        sys.stderr.write("DATABASE_URL (or --database-url) is required unless --dry-run\n")
+        return 2
+    async with _repository(url) as repository:
+        if args.command in ("pin", "unpin"):
+            if repository is None:
+                return 2
+            found: Final = await repository.set_pinned(args.session_id, args.command == "pin")
+            sys.stdout.write(f"{args.session_id}: {args.command + 'ned' if found else 'not found'}\n")
+            return 0 if found else 1
+        source: Final = Path(args.source).expanduser() if args.source else _DEFAULT_SOURCES[args.command]
+        owner: Final = hash_token(args.owner_key) if args.owner_key else f"archive:{args.command}"
+        reader: Final = read_opencode if args.command == "opencode" else read_openclaw
+        scratch: Final = Path(args.scratch_dir).expanduser() if args.scratch_dir else None
+        for line in await run_import(reader(source, scratch), owner, repository):
+            sys.stdout.write(line + "\n")
+        return 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser: Final = argparse.ArgumentParser(
+        prog="python -m litellm.proxy.session_import", description=(__doc__ or "").split("\n")[0]
+    )
+    parser.add_argument("--database-url", help="defaults to $DATABASE_URL")
+    commands: Final = parser.add_subparsers(dest="command", required=True)
+    for name in ("opencode", "openclaw"):
+        sub = commands.add_parser(name, help=f"import {name} sessions")  # rebind-ok: one subcommand per iteration
+        sub.add_argument("--source", help=f"defaults to {_DEFAULT_SOURCES[name]}")
+        sub.add_argument("--owner-key", help="the virtual key that may continue these sessions")
+        sub.add_argument("--dry-run", action="store_true", help="read and convert, write nothing")
+        sub.add_argument(
+            "--scratch-dir", help="read a private copy made here instead of the live file (read-only either way)"
+        )
+    for name in ("pin", "unpin"):
+        sub = commands.add_parser(name, help=f"{name} a stored session")  # rebind-ok: one subcommand per iteration
+        sub.add_argument("session_id")
+    return parser
+
+
+def main() -> int:
+    return asyncio.run(_main(_parser().parse_args()))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

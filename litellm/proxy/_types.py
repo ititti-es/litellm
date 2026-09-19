@@ -2575,7 +2575,12 @@ class SessionManagerSettings(LiteLLMPydanticObjectBase):
         False, description="Persist transcripts to the database so any worker can resume them"
     )
     retention_days: int | None = Field(
-        None, ge=1, description="Delete stored transcripts this long after their last turn"
+        None,
+        ge=1,
+        description=(
+            "Delete stored transcripts this long after their last turn. Unset keeps them permanently; "
+            "pinned sessions (including every import) are always kept"
+        ),
     )
 
 

@@ -1094,3 +1094,60 @@ class TestClientSuppliedRetainedIdCannotBypassAuthorization:
 
         assert result["response_id"] == "resp_strangerownprovideridcccccccc"
         assert result["response_id"] != victim_provider_id
+
+
+def _held_session(response_id, owner_key_hash):
+    from litellm.sessions import SessionManager
+
+    manager = SessionManager()
+    manager.commit(
+        owner=owner_key_hash,
+        prior=None,
+        turn_input=({"role": "user", "content": "imported"},),
+        output=(),
+        response_id=response_id,
+        now=0.0,
+    )
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("caller_key_hash", "outcome"),
+    [("owner-key-hash", "allowed"), ("other-key-hash", 403)],
+    ids=["session-owner", "another-key"],
+)
+@pytest.mark.asyncio
+async def test_session_manager_vouches_for_the_ids_it_holds(caller_key_hash, outcome):
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    manager = _held_session("resp_imp_abc", "owner-key-hash")
+    hook = ResponsesIDSecurity(
+        general_settings_reader=lambda: {},
+        signing_key_reader=lambda: _UNIT_TEST_SALT_KEY,
+        session_manager_reader=lambda: manager,
+    )
+    data = {"previous_response_id": "resp_imp_abc"}
+    caller = UserAPIKeyAuth(api_key=caller_key_hash, user_id="someone")
+    if outcome == "allowed":
+        result = await hook.async_pre_call_hook(caller, None, data, "aresponses")
+        assert result["previous_response_id"] == "resp_imp_abc"
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await hook.async_pre_call_hook(caller, None, data, "aresponses")
+        assert exc.value.status_code == outcome
+
+
+@pytest.mark.asyncio
+async def test_ids_the_session_manager_does_not_hold_keep_the_unmanaged_id_rule():
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    hook = ResponsesIDSecurity(
+        general_settings_reader=lambda: {},
+        signing_key_reader=lambda: _UNIT_TEST_SALT_KEY,
+        session_manager_reader=lambda: _held_session("resp_imp_other", "owner-key-hash"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await hook.async_pre_call_hook(
+            UserAPIKeyAuth(api_key="owner-key-hash"), None, {"previous_response_id": "resp_unknown"}, "aresponses"
+        )
+    assert exc.value.status_code == 403 and "not issued by this proxy" in exc.value.detail

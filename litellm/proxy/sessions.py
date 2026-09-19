@@ -15,6 +15,7 @@ from litellm.repositories.conversation_session_repository import (
     ItemRow,
     StoredSession,
     TurnWrite,
+    jsonb_text,
 )
 from litellm.repositories.prisma_protocols import DatabaseClient
 from litellm.sessions import Item, Session, SessionManager
@@ -51,7 +52,7 @@ class PrismaTranscriptStore:
                 last_upstream_at=datetime.fromtimestamp(session.last_upstream_at, UTC),
                 expires_at=now + self._retention if self._retention is not None else None,
                 items=tuple(
-                    ItemRow(seq=seq, content=json.dumps(item), is_output=seq in session.outputs)
+                    ItemRow(seq=seq, content=jsonb_text(item), is_output=seq in session.outputs)
                     for seq, item in enumerate(session.items)
                     if seq >= first_new
                 ),

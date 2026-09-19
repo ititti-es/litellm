@@ -6,6 +6,12 @@ CREATE TABLE "LiteLLM_ConversationSession" (
     "compaction_policy_id" TEXT,
     "last_upstream_at" TIMESTAMP(3) NOT NULL,
     "expires_at" TIMESTAMP(3),
+    "pinned" BOOLEAN NOT NULL DEFAULT false,
+    "source" TEXT,
+    "source_id" TEXT,
+    "title" TEXT,
+    "parent_session_id" TEXT,
+    "metadata" JSONB,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -19,6 +25,7 @@ CREATE TABLE "LiteLLM_ConversationItem" (
     "seq" INTEGER NOT NULL,
     "content" JSONB NOT NULL,
     "is_output" BOOLEAN NOT NULL,
+    "meta" JSONB,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "LiteLLM_ConversationItem_pkey" PRIMARY KEY ("session_id","version","seq")
@@ -55,6 +62,9 @@ CREATE INDEX "LiteLLM_ConversationSession_owner_idx" ON "LiteLLM_ConversationSes
 
 -- CreateIndex
 CREATE INDEX "LiteLLM_ConversationSession_expires_at_idx" ON "LiteLLM_ConversationSession"("expires_at");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "LiteLLM_ConversationSession_source_source_id_key" ON "LiteLLM_ConversationSession"("source", "source_id");
 
 -- CreateIndex
 CREATE INDEX "LiteLLM_ConversationResponse_session_id_idx" ON "LiteLLM_ConversationResponse"("session_id");
