@@ -3352,7 +3352,7 @@ class TestManagedHandlerWithSessionManager:
             websocket=ws,
             model="xai/grok-4",
             logging_obj=MagicMock(),
-            user_api_key_dict=UserAPIKeyAuth(token=token),
+            user_api_key_dict=UserAPIKeyAuth(api_key=token),
             session_manager=manager,
         )
 

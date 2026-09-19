@@ -917,6 +917,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             # Latch so wrappers (FallbackResponsesStreamWrapper) + proxy
             # container-ownership hook can read completed_response.
             self.completed_response = response_completed_event
+            self._notify_completed()
             return response_completed_event
         else:
             if sync_mode:

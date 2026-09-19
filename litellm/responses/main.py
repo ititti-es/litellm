@@ -68,6 +68,9 @@ if TYPE_CHECKING:
 else:
     MCPTool = Any
 
+from litellm.sessions import Forbidden
+from litellm.sessions.responses import PendingTurn, begin_turn
+
 from .streaming_iterator import BaseResponsesAPIStreamingIterator
 
 __all__ = (
@@ -692,9 +695,21 @@ async def aresponses(
                 ),
             )
 
+        session_turn: Final = None if store is False else _begin_session_turn(previous_response_id, input, kwargs)
+        if isinstance(session_turn, Forbidden):
+            raise litellm.BadRequestError(
+                message=f"Previous response {previous_response_id} not found",
+                model=model,
+                llm_provider=custom_llm_provider or "",
+            )
+        session_input: Final = (
+            session_turn.upstream_input()
+            if isinstance(session_turn, PendingTurn) and session_turn.prior is not None
+            else None
+        )
         func: Final = partial(
             responses,
-            input=input,
+            input=input if session_input is None else cast(ResponseInputParam, session_input),
             model=model,
             include=include,
             instructions=instructions,
@@ -702,7 +717,7 @@ async def aresponses(
             prompt=prompt,
             metadata=metadata,
             parallel_tool_calls=parallel_tool_calls,
-            previous_response_id=previous_response_id,
+            previous_response_id=previous_response_id if session_input is None else None,
             reasoning=reasoning,
             store=store,
             background=background,
@@ -747,6 +762,11 @@ async def aresponses(
         if response is None:
             raise ValueError(f"Got an unexpected None response from the Responses API: {response}")
 
+        if isinstance(session_turn, PendingTurn):
+            if isinstance(response, ResponsesAPIResponse):
+                session_turn.finish(response)
+            else:
+                response.on_completed = session_turn.finish
         return response
     except Exception as e:
         raise litellm.exception_type(
@@ -756,6 +776,17 @@ async def aresponses(
             completion_kwargs=local_vars,
             extra_kwargs=kwargs,
         )
+
+
+def _begin_session_turn(
+    previous_response_id: str | None, turn_input: object, kwargs: Mapping[str, object]
+) -> PendingTurn | Forbidden | None:
+    manager: Final = litellm.session_manager
+    if manager is None:
+        return None
+    metadata: Final = kwargs.get("litellm_metadata")
+    owner: Final = metadata.get("user_api_key_hash") if isinstance(metadata, dict) else None
+    return begin_turn(manager, previous_response_id, turn_input, owner if isinstance(owner, str) else "")
 
 
 def _resolve_prompt_swapped_provider(

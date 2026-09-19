@@ -38,6 +38,7 @@ from litellm.responses.litellm_completion_transformation.transformation import (
 )
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
 from litellm.sessions import Forbidden, Item, Resolution, Resolved, SessionManager
+from litellm.sessions.responses import provider_response_id
 from litellm.types.integrations.custom_logger import converted_stream_requested
 from litellm.types.llms.openai import (
     PART_UNION_TYPES,
@@ -268,6 +269,8 @@ class BaseResponsesAPIStreamingIterator:
     This class contains shared logic for both synchronous and asynchronous iterators.
     """
 
+    on_completed: Callable[[ResponsesAPIResponse], None] | None = None
+
     def __init__(
         self,
         response: httpx.Response,
@@ -483,6 +486,8 @@ class BaseResponsesAPIStreamingIterator:
                     )
                     self.completed_response = _terminal_chunk
                     _stamp_responses_usage_cost(_billed_response, self.logging_obj)
+                    if _chunk_type == openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
+                        self._notify_completed()
 
                     if _chunk_type == openai_types.ResponsesAPIStreamEvents.RESPONSE_FAILED:
                         self._handle_logging_failed_response()
@@ -641,6 +646,11 @@ class BaseResponsesAPIStreamingIterator:
             generated_content=self._generated_content,
             is_pre_first_chunk=not self._yielded_first_chunk,
         )
+
+    def _notify_completed(self) -> None:
+        completed: Final = self._get_completed_response_object()
+        if self.on_completed is not None and completed is not None:
+            self.on_completed(completed)
 
     def _get_completed_response_object(self) -> ResponsesAPIResponse | None:
         openai_types: Final = _get_openai_response_types()
@@ -2376,11 +2386,6 @@ _MANAGED_WS_SKIP_KWARGS: Final[frozenset[str]] = frozenset(
 _WARMUP_RESPONSE_ID_PREFIX: Final = "resp_warmup_"
 
 
-def _provider_response_id(response_id: str) -> str:
-    decoded: Final = ResponsesAPIRequestUtils._decode_responses_api_response_id(response_id)  # pyright: ignore[reportPrivateUsage]  # the handler keys history by the decoded provider id
-    return str(decoded.get("response_id") or response_id)
-
-
 class ManagedResponsesWebSocketHandler:
     """
     Handles Responses API WebSocket mode for providers that do not expose a
@@ -2416,8 +2421,8 @@ class ManagedResponsesWebSocketHandler:
     ) -> None:
         self.websocket = websocket
         self.session_manager = session_manager
-        token: Final = getattr(user_api_key_dict, "token", None)
-        self.session_owner: str = token if isinstance(token, str) else ""
+        hashed_key: Final = getattr(user_api_key_dict, "api_key", None)
+        self.session_owner: str = hashed_key if isinstance(hashed_key, str) else ""
         self.model = model
         self.logging_obj = logging_obj
         self.user_api_key_dict = user_api_key_dict
@@ -2475,7 +2480,7 @@ class ManagedResponsesWebSocketHandler:
         The key is the *decoded* response ID (the raw provider response ID before
         LiteLLM base64-encodes it into the ``resp_...`` format).
         """
-        raw_id: Final = _provider_response_id(previous_response_id)
+        raw_id: Final = provider_response_id(previous_response_id)
         return list(self._session_history.get(raw_id, []))
 
     def _store_history(self, response_id: str, messages: list[dict[str, object]]) -> None:
@@ -2498,7 +2503,7 @@ class ManagedResponsesWebSocketHandler:
         encoded_id: Final[str | None] = raw_id if isinstance(raw_id, str) else None
         if not encoded_id:
             return None
-        return _provider_response_id(encoded_id)
+        return provider_response_id(encoded_id)
 
     @staticmethod
     def _extract_output_messages(
@@ -2548,7 +2553,7 @@ class ManagedResponsesWebSocketHandler:
             return None
         if self._is_warmup_response_id(previous_response_id):
             return None
-        return self.session_manager.resolve(_provider_response_id(previous_response_id), self.session_owner)
+        return self.session_manager.resolve(provider_response_id(previous_response_id), self.session_owner)
 
     def _commit_turn(
         self,
@@ -2614,7 +2619,7 @@ class ManagedResponsesWebSocketHandler:
         """Return True for synthetic warmup IDs that only exist on this connection."""
         if not response_id:
             return False
-        raw_id: Final = _provider_response_id(response_id)
+        raw_id: Final = provider_response_id(response_id)
         return str(raw_id).startswith(_WARMUP_RESPONSE_ID_PREFIX)
 
     @staticmethod

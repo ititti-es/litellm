@@ -156,3 +156,27 @@ async def test_sync_callbacks_run_only_after_async_handler_completes(recording_e
     submit_times = recording_executor.submit_times_for(logging_obj)
     assert len(submit_times) == 1
     assert submit_times[0] >= recorder.async_hook_finished
+
+
+@pytest.mark.parametrize(("event", "notified"), [("response.completed", True), ("response.failed", False)])
+async def test_on_completed_fires_only_for_a_completed_response(event, notified):
+    import json
+
+    from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+
+    iterator = ResponsesAPIStreamingIterator(
+        response=httpx.Response(200),
+        model="gpt-5.4-nano",
+        responses_api_provider_config=OpenAIResponsesAPIConfig(),
+        logging_obj=_make_logging_obj(),
+    )
+    received: list = []
+    iterator.on_completed = received.append
+    output = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]
+    iterator._process_chunk(
+        json.dumps({"type": event, "response": {"id": "resp_x", "created_at": 0, "status": "completed", "output": output}})
+    )
+
+    from litellm.sessions.responses import provider_response_id
+
+    assert [(provider_response_id(r.id), r.output) for r in received] == ([("resp_x", output)] if notified else [])
