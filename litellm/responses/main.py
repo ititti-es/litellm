@@ -69,6 +69,8 @@ else:
     MCPTool = Any
 
 from litellm.sessions import Forbidden
+from litellm.sessions.compaction import replay_params
+from litellm.sessions.manager import ReplayBase
 from litellm.sessions.responses import MANAGED_BY_CALLER, PendingTurn, begin_turn, turn_affinity
 
 from .streaming_iterator import BaseResponsesAPIStreamingIterator
@@ -707,6 +709,38 @@ async def aresponses(
             if isinstance(session_turn, PendingTurn) and session_turn.prior is not None
             else None
         )
+        affinity: Final = turn_affinity(session_turn, custom_llm_provider, kwargs)
+        managed_turn: Final = (
+            session_turn.replaying(
+                ReplayBase(
+                    provider=custom_llm_provider or "",
+                    model=model,
+                    params=replay_params(
+                        {  # mutable-ok: the request's parameters, filtered into a read-only view
+                            "instructions": instructions,
+                            "tools": tools,
+                            "tool_choice": tool_choice,
+                            "parallel_tool_calls": parallel_tool_calls,
+                            "reasoning": reasoning,
+                            "text": text,
+                            "truncation": truncation,
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "service_tier": service_tier,
+                            "include": include,
+                            "store": store,
+                            "extra_headers": extra_headers,
+                            "extra_body": extra_body,
+                            **kwargs,
+                            **affinity,
+                        }
+                    ),
+                    deployment=_deployment_id(kwargs),
+                )
+            )
+            if isinstance(session_turn, PendingTurn)
+            else None
+        )
         func: Final = partial(
             responses,
             input=input if session_input is None else cast(ResponseInputParam, session_input),
@@ -737,7 +771,7 @@ async def aresponses(
             service_tier=service_tier,
             safety_identifier=safety_identifier,
             **kwargs,
-            **turn_affinity(session_turn, custom_llm_provider, kwargs),
+            **affinity,
         )
 
         ctx: Final = contextvars.copy_context()
@@ -763,11 +797,11 @@ async def aresponses(
         if response is None:
             raise ValueError(f"Got an unexpected None response from the Responses API: {response}")
 
-        if isinstance(session_turn, PendingTurn):
+        if managed_turn is not None:
             if isinstance(response, ResponsesAPIResponse):
-                session_turn.finish(response)
+                managed_turn.finish(response)
             else:
-                response.on_completed = session_turn.finish
+                response.on_completed = managed_turn.finish
         return response
     except Exception as e:
         raise litellm.exception_type(
@@ -777,6 +811,12 @@ async def aresponses(
             completion_kwargs=local_vars,
             extra_kwargs=kwargs,
         )
+
+
+def _deployment_id(kwargs: Mapping[str, object]) -> str | None:
+    model_info: Final = kwargs.get("model_info")
+    deployment: Final = model_info.get("id") if isinstance(model_info, dict) else None
+    return deployment if isinstance(deployment, str) else None
 
 
 async def _begin_session_turn(

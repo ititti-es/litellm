@@ -118,7 +118,9 @@ async def test_durable_commits_write_only_the_new_items_in_order():
     manager.attach_store(store)
     first = first_turn(manager)
     prior = manager.resolve("r1", "key-a")
-    manager.commit(owner="key-a", prior=prior, turn_input=(CALL_OUTPUT,), output=(ASSISTANT,), response_id="r2", now=2.0)
+    manager.commit(
+        owner="key-a", prior=prior, turn_input=(CALL_OUTPUT,), output=(ASSISTANT,), response_id="r2", now=2.0
+    )
     manager.commit(owner="key-a", prior=None, turn_input=(USER,), output=(), response_id="r3", now=3.0, durable=False)
     await manager.flush()
     assert store.saved == [(first.id, 0, "r1"), (first.id, 3, "r2")]

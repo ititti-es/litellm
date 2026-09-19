@@ -3,12 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Final, TypeAlias
 
 from pydantic import JsonValue
 
 Item: TypeAlias = Mapping[str, JsonValue]
+Meta: TypeAlias = Mapping[str, JsonValue]
+
+
+def _no_annotations() -> Mapping[int, Meta]:
+    return MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +26,8 @@ class Session:
     responses: Mapping[str, int]
     version: int
     last_upstream_at: float
+    annotations: Mapping[int, Meta] = field(default_factory=_no_annotations)
+    """Item meta by position (e.g. what a compaction summary covers); stored beside the item, never replayed"""
 
     def replayable_at(self, response_id: str) -> tuple[Item, ...]:
         """History up to *response_id*, with model output reduced to what a stateless upstream accepts back"""

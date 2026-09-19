@@ -3,14 +3,15 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, JsonValue
 
 from litellm.responses.utils import ResponsesAPIRequestUtils
-from litellm.sessions.manager import Forbidden, Resolved, SessionManager
+from litellm.sessions.compaction import turn_usage
+from litellm.sessions.manager import Forbidden, ReplayBase, Resolved, SessionManager
 from litellm.sessions.session import Item
 
 if TYPE_CHECKING:
@@ -61,6 +62,11 @@ class PendingTurn:
     prior: Resolved | None
     turn_input: tuple[Item, ...]
     key: str
+    started_at: float = 0.0
+    replay: ReplayBase | None = None
+
+    def replaying(self, replay: ReplayBase) -> PendingTurn:
+        return replace(self, replay=replay)
 
     def upstream_input(self) -> list[Mapping[str, JsonValue]]:  # mutable-ok: provider request input is a JSON list
         history: Final = self.prior.history if self.prior is not None else ()
@@ -77,6 +83,9 @@ class PendingTurn:
             response_id=provider_response_id(response.id),
             now=time.time(),
             new_session_id=self.key,
+            started_at=self.started_at or None,
+            usage=turn_usage(response.usage),
+            replay=self.replay,
         )
 
 
@@ -91,9 +100,11 @@ async def begin_turn(
 ) -> PendingTurn | Forbidden | None:
     """None leaves the request to the existing continuation paths: the id predates the manager or was evicted"""
     items: Final = input_items(turn_input)
+    started_at: Final = time.time()
     if not previous_response_id:
-        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex)
+        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at)
     resolution: Final = await manager.resolve_async(provider_response_id(previous_response_id), owner)
     if isinstance(resolution, Resolved):
-        return PendingTurn(manager, owner, resolution, items, resolution.session.id)
+        manager.begin(resolution.session.id, started_at)
+        return PendingTurn(manager, owner, resolution, items, resolution.session.id, started_at)
     return resolution if isinstance(resolution, Forbidden) else None

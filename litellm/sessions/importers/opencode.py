@@ -294,6 +294,9 @@ def _v2_session(db: sqlite3.Connection, row: tuple[object, ...], store: str) -> 
 
 
 _V2_CONTROL: Final = frozenset({"agent-switched", "model-switched", "idle", "location-switched"})
+_V2_NOTE_KINDS: Final = MappingProxyType(
+    {"synthetic": "harness_context", "system": "system_note", "shell": "shell_note"}
+)
 
 
 def _v2_message_items(
@@ -341,13 +344,7 @@ def _v2_note(message: Mapping[str, JsonValue], kind: str, source: Meta) -> Impor
         if kind == "compaction"
         else str(message.get("text", ""))
     )
-    label: Final = {
-        "synthetic": "harness_context",
-        "system": "system_note",
-        "shell": "shell_note",
-    }.get(  # mutable-ok: lookup table
-        kind, "compaction_summary"
-    )
+    label: Final = _V2_NOTE_KINDS.get(kind, "compaction_summary")
     return user_message((input_text(text),), MappingProxyType({"kind": label, "source": source}))
 
 

@@ -85,3 +85,30 @@ async def test_calls_made_by_a_session_aware_caller_are_not_tracked_twice(manage
         litellm_metadata={"user_api_key_hash": "k", MANAGED_BY_CALLER: True},
     )
     assert manager.stats().commits == 0
+
+
+async def test_aresponses_records_what_a_compaction_needs_to_reuse_the_turns_prefix(manager):
+    response = await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="hi",
+        instructions="be terse",
+        max_output_tokens=50,
+        mock_response="yo",
+        litellm_metadata={"user_api_key_hash": "key-a"},
+        model_info={"id": "deployment-1"},
+    )
+    resolved = manager.resolve(_provider_id(response.id), "key-a")
+    assert isinstance(resolved, Resolved)
+    record = manager.last_turn(resolved.session.id)
+    assert record is not None and record.replay is not None
+    assert record.replay.provider == "openai" and record.replay.deployment == "deployment-1"
+    assert record.replay.params["instructions"] == "be terse"
+    assert record.replay.params["prompt_cache_key"] == resolved.session.id
+    assert "max_output_tokens" not in record.replay.params
+    assert record.usage is not None and record.started_at > 0
+
+
+def _provider_id(response_id: str) -> str:
+    from litellm.sessions.responses import provider_response_id
+
+    return provider_response_id(response_id)

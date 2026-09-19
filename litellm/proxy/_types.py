@@ -2566,6 +2566,26 @@ class ScheduledJobStaggerSettings(LiteLLMPydanticObjectBase):
     )
 
 
+class SessionCompactionSettings(LiteLLMPydanticObjectBase):
+    enabled: bool = False
+    policy: str | None = Field(
+        None, description="Name of a stored compaction policy (LiteLLM_CompactionPolicy); unset uses the built-in one"
+    )
+    min_prefix_tokens: int = Field(
+        20_000, ge=0, description="Only sessions whose next prefix is at least this long are compacted"
+    )
+    lead_seconds: float = Field(
+        20.0, gt=0, description="Start compacting this long before the cache is predicted to expire"
+    )
+    target_hit_rate: float = Field(
+        0.8,
+        gt=0,
+        lt=1,
+        description="The predicted expiry is the longest idle gap at which the cache was still hit at least this often",
+    )
+    tick_seconds: float = Field(5.0, gt=0, description="How often to look for sessions whose cache is about to expire")
+
+
 class SessionManagerSettings(LiteLLMPydanticObjectBase):
     enabled: bool = False
     budget_mb: int = Field(
@@ -2581,6 +2601,10 @@ class SessionManagerSettings(LiteLLMPydanticObjectBase):
             "Delete stored transcripts this long after their last turn. Unset keeps them permanently; "
             "pinned sessions (including every import) are always kept"
         ),
+    )
+    compaction: SessionCompactionSettings = Field(
+        default_factory=SessionCompactionSettings,
+        description="Compact sessions while their upstream prompt cache is still warm, just before it expires",
     )
 
 
