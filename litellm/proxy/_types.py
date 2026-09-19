@@ -2566,6 +2566,17 @@ class ScheduledJobStaggerSettings(LiteLLMPydanticObjectBase):
     )
 
 
+class CompactionModelSettings(LiteLLMPydanticObjectBase):
+    """Per-model compaction bars; unset fields use the proxy-wide values"""
+
+    enabled: bool | None = None
+    min_prefix_tokens: int | None = Field(None, ge=0)
+    min_context_fraction: float | None = Field(None, gt=0, le=1)
+    context_window: int | None = Field(
+        None, gt=0, description="Overrides the model's known context window (needed when LiteLLM does not know it)"
+    )
+
+
 class SessionCompactionSettings(LiteLLMPydanticObjectBase):
     enabled: bool = False
     policy: str | None = Field(
@@ -2573,6 +2584,19 @@ class SessionCompactionSettings(LiteLLMPydanticObjectBase):
     )
     min_prefix_tokens: int = Field(
         20_000, ge=0, description="Only sessions whose next prefix is at least this long are compacted"
+    )
+    min_context_fraction: float | None = Field(
+        0.5,
+        gt=0,
+        le=1,
+        description=(
+            "Only sessions filling at least this share of the model's context window are compacted, so a modest "
+            "session keeps its full history through a break; unset to rely on min_prefix_tokens alone"
+        ),
+    )
+    models: dict[str, CompactionModelSettings] = Field(
+        default_factory=dict,
+        description="Per-model overrides, keyed by model_list name (or the provider model string)",
     )
     lead_seconds: float = Field(
         20.0, gt=0, description="Start compacting this long before the cache is predicted to expire"

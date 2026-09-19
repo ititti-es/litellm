@@ -227,13 +227,14 @@ async def test_due_sessions_are_compacted_with_the_configured_policy():
 
     settings = SessionCompactionSettings(enabled=True, policy="mine")
     deadline = manager.warm_until("s1")
-    assert await _start_due(manager, settings, call, PolicyRepository(), deadline - 60) == ()
+    assert await _start_due(manager, settings, call, PolicyRepository(), deadline - 60, lambda model: 40_000) == ()
     tasks = await _start_due(
         manager,
         settings,
         call,
         PolicyRepository(SimpleNamespace(name="mine", source="custom", instructions="Be brief", settings=None)),
         deadline - 5,
+        lambda model: 40_000,
     )
     (compacted,) = [await task for task in tasks]
     assert instructions == ["Be brief"]
@@ -248,3 +249,69 @@ def test_compaction_settings_are_off_unless_asked_for():
     assert settings.compaction.min_prefix_tokens == 20_000
     with pytest.raises(pydantic.ValidationError):
         SessionManagerSettings.model_validate({"enabled": True, "compaction": {"target_hit_rate": 1.5}})
+
+
+def test_thresholds_come_from_settings_then_the_model_then_the_policy():
+    from litellm.proxy._types import SessionCompactionSettings
+    from litellm.proxy.sessions import compaction_thresholds
+    from litellm.sessions import ReplayBase
+    from litellm.sessions.compaction_policy import CompactionPolicy, PolicySettings
+    from litellm.sessions.compaction_presets import DEFAULT, OFF
+    from litellm.sessions.compaction_thresholds import Thresholds
+
+    settings = SessionCompactionSettings.model_validate(
+        {"enabled": True, "models": {"grok": {"min_context_fraction": 0.7}, "xai/other": {"enabled": False}}}
+    )
+    grok = ReplayBase("xai", "xai/grok-build-0.1", {}, model_group="grok")
+    assert compaction_thresholds(settings, grok, DEFAULT, 256_000) == Thresholds(
+        min_prefix_tokens=20_000, min_context_fraction=0.7, context_window=256_000
+    )
+    other = ReplayBase("xai", "xai/other", {})
+    assert not compaction_thresholds(settings, other, DEFAULT, 256_000).enabled
+    assert not compaction_thresholds(settings, grok, OFF, 256_000).enabled
+    eager = CompactionPolicy("eager", "Summarize.", PolicySettings(min_context_fraction=0.1))
+    assert compaction_thresholds(settings, grok, eager, 256_000).min_context_fraction == 0.1
+
+
+async def test_sessions_below_the_bars_keep_their_history():
+    from litellm.proxy._types import SessionCompactionSettings
+    from litellm.proxy.sessions import _start_due
+    from litellm.sessions import ReplayBase, Resolved, SessionManager, TurnUsage
+
+    manager = SessionManager()
+    replay = ReplayBase("xai", "xai/grok-build-0.1", {}, model_group="grok")
+    usage = TurnUsage(20_000, 19_000, 500)
+    user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]}
+    manager.commit(
+        owner="k",
+        prior=None,
+        turn_input=(user,),
+        output=(),
+        response_id="r1",
+        now=1.0,
+        new_session_id="s1",
+        started_at=0.0,
+        usage=usage,
+        replay=replay,
+    )
+    prior = manager.resolve("r1", "k")
+    assert isinstance(prior, Resolved)
+    manager.commit(
+        owner="k",
+        prior=prior,
+        turn_input=(user,),
+        output=(),
+        response_id="r2",
+        now=11.0,
+        started_at=10.0,
+        usage=usage,
+        replay=replay,
+    )
+    called = []
+
+    async def call(replay, items, owner, max_output_tokens):
+        called.append(items)
+
+    settings = SessionCompactionSettings(enabled=True)
+    assert await _start_due(manager, settings, call, None, manager.warm_until("s1") - 5, lambda model: 256_000) == ()
+    assert called == []

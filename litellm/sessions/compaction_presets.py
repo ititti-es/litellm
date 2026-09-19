@@ -372,4 +372,11 @@ assistant has not yet answered. Only write "None" if the last exchange was fully
     source="hermes-agent@7c6f21a5e1",
 )
 
-PRESETS: Final = MappingProxyType({policy.name: policy for policy in (DEFAULT, OPENCODE, OPENCLAW, HERMES)})
+OFF: Final = CompactionPolicy(
+    name="off",
+    instructions="(never sent: this policy turns compaction off)",
+    settings=PolicySettings(enabled=False),
+    source="litellm",
+)
+
+PRESETS: Final = MappingProxyType({policy.name: policy for policy in (DEFAULT, OPENCODE, OPENCLAW, HERMES, OFF)})

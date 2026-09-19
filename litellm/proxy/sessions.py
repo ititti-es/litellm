@@ -21,11 +21,12 @@ from litellm.repositories.conversation_session_repository import (
     jsonb_text,
 )
 from litellm.repositories.prisma_protocols import DatabaseClient
-from litellm.sessions import Item, ReplayBase, Session, SessionManager
-from litellm.sessions.cache_clock import CacheClock
+from litellm.sessions import CompactionJob, Item, ReplayBase, Session, SessionManager
+from litellm.sessions.cache_clock import MIN_CACHEABLE_TOKENS, CacheClock
 from litellm.sessions.compaction import CallUpstream, CompactionReply, compact, reply_from
 from litellm.sessions.compaction_policy import CompactionPolicy, policy_from
 from litellm.sessions.compaction_presets import DEFAULT, PRESETS
+from litellm.sessions.compaction_thresholds import ThresholdOverrides, Thresholds, layered, worth_compacting
 from litellm.sessions.responses import MANAGED_BY_CALLER
 
 if TYPE_CHECKING:
@@ -242,12 +243,68 @@ async def _start_due(
     call: CallUpstream,
     repository: ConversationSessionRepository | None,
     now: float,
+    context_window: Callable[[str], int | None] | None = None,
 ) -> tuple[asyncio.Task[Session | None], ...]:
-    jobs: Final = manager.due_compactions(now, settings.min_prefix_tokens, settings.lead_seconds)
+    jobs: Final = manager.due_compactions(now, MIN_CACHEABLE_TOKENS, settings.lead_seconds)
+    if not jobs:
+        return ()
     policies: Final = await asyncio.gather(
         *(load_policy(repository, job.replay.compaction_policy, settings.policy) for job in jobs)
     )
-    return tuple(asyncio.create_task(compact(manager, job, policy, call)) for job, policy in zip(jobs, policies))
+    window: Final = context_window or known_context_window
+    return tuple(
+        asyncio.create_task(compact(manager, job, policy, call))
+        for job, policy in zip(jobs, policies)
+        if _worth_it(job, policy, settings, window)
+    )
+
+
+def compaction_thresholds(
+    settings: SessionCompactionSettings, replay: ReplayBase, policy: CompactionPolicy, window: int | None
+) -> Thresholds:
+    """Proxy-wide bars, then the model's entry, then the policy's own, each field falling back independently"""
+    model: Final = settings.models.get(replay.model_group or "") or settings.models.get(replay.model)
+    return layered(
+        Thresholds(
+            enabled=True,
+            min_prefix_tokens=settings.min_prefix_tokens,
+            min_context_fraction=settings.min_context_fraction,
+            context_window=window,
+        ),
+        ThresholdOverrides(
+            enabled=model.enabled,
+            min_prefix_tokens=model.min_prefix_tokens,
+            min_context_fraction=model.min_context_fraction,
+            context_window=model.context_window,
+        )
+        if model is not None
+        else None,
+        policy.settings.thresholds(),
+    )
+
+
+def _worth_it(
+    job: CompactionJob,
+    policy: CompactionPolicy,
+    settings: SessionCompactionSettings,
+    window: Callable[[str], int | None],
+) -> bool:
+    thresholds: Final = compaction_thresholds(settings, job.replay, policy, window(job.replay.model))
+    worth: Final = worth_compacting(job.next_prefix_tokens, thresholds)
+    if not worth:
+        verbose_proxy_logger.debug(
+            "session manager: keeping %s verbatim (%d tokens, %s)", job.session.id, job.next_prefix_tokens, thresholds
+        )
+    return worth
+
+
+def known_context_window(model: str) -> int | None:
+    try:
+        info: Final = litellm.get_model_info(model=model)
+    except Exception:
+        return None
+    window: Final = info.get("max_input_tokens")
+    return window if isinstance(window, int) else None
 
 
 def start_compaction(

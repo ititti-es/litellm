@@ -10,6 +10,8 @@ A policy is plain data so it can live in the database (`LiteLLM_CompactionPolicy
   - `summary_prefix`, `summary_suffix`: text wrapped around the summary
   - `keep_turns`: how many of the latest user turns are kept verbatim after the summary (default 1)
   - `max_output_tokens`: a cap for the summary call
+  - `enabled`, `min_prefix_tokens`, `min_context_fraction`: when a session is worth compacting at all, overriding
+    the proxy's settings (see compaction_thresholds.py); `enabled: false` turns compaction off
 
 `{{date}}` in any text is replaced with the current UTC date. The summary call always reuses the turn's cached
 prefix (model, instructions, tools), so a policy changes only what is asked and how the answer is framed.
@@ -25,6 +27,7 @@ from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from litellm.sessions.compaction_thresholds import ThresholdOverrides
 from litellm.sessions.session import Item
 
 DATE_PLACEHOLDER: Final = "{{date}}"
@@ -42,6 +45,17 @@ class PolicySettings(BaseModel):
     summary_suffix: str = ""
     keep_turns: Annotated[int, Field(ge=1)] = 1
     max_output_tokens: Annotated[int | None, Field(ge=256)] = None
+    enabled: bool | None = None
+    min_prefix_tokens: Annotated[int | None, Field(ge=0)] = None
+    min_context_fraction: Annotated[float | None, Field(gt=0, le=1)] = None
+
+    def thresholds(self) -> ThresholdOverrides:
+        """This policy's say on when to compact; unset fields defer to the proxy's settings"""
+        return ThresholdOverrides(
+            enabled=self.enabled,
+            min_prefix_tokens=self.min_prefix_tokens,
+            min_context_fraction=self.min_context_fraction,
+        )
 
 
 class PolicyDocument(BaseModel):

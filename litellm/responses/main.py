@@ -737,6 +737,7 @@ async def aresponses(
                     ),
                     deployment=_deployment_id(kwargs),
                     compaction_policy=requested_policy(metadata, _requester_metadata(kwargs)),
+                    model_group=_model_group(kwargs),
                 )
             )
             if isinstance(session_turn, PendingTurn)
@@ -812,6 +813,12 @@ async def aresponses(
             completion_kwargs=local_vars,
             extra_kwargs=kwargs,
         )
+
+
+def _model_group(kwargs: Mapping[str, object]) -> str | None:
+    litellm_metadata: Final = kwargs.get("litellm_metadata")
+    group: Final = litellm_metadata.get("model_group") if isinstance(litellm_metadata, dict) else None
+    return group if isinstance(group, str) else None
 
 
 def _requester_metadata(kwargs: Mapping[str, object]) -> object:

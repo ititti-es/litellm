@@ -64,6 +64,8 @@ class ReplayBase:
     deployment: str | None = None
     compaction_policy: str | None = None
     """The policy the client asked for (request metadata `compaction_policy`), if any"""
+    model_group: str | None = None
+    """The proxy's public model name, which per-model compaction settings are keyed by"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,9 @@ class CompactionJob:
     warm_until: float
     turn_started_at: float
     prefix_tokens: int
+    """What the last turn read (its input), the yardstick for whether its cache survived"""
+    next_prefix_tokens: int
+    """What the next turn would send: the last turn's input and output"""
 
 
 class TranscriptStore(Protocol):
@@ -284,6 +289,7 @@ class SessionManager:
             warm_until=deadline,
             turn_started_at=record.started_at,
             prefix_tokens=record.usage.input_tokens,
+            next_prefix_tokens=record.usage.input_tokens + record.usage.output_tokens,
         )
 
     def apply_compaction(

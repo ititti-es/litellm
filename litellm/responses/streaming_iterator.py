@@ -2942,6 +2942,7 @@ class ManagedResponsesWebSocketHandler:
             params=replay_params(call_kwargs),
             deployment=self._deployment_id() if model == self.model else self.model_group,
             compaction_policy=requested_policy(call_kwargs.get("metadata"), self.litellm_metadata.get("requester_metadata")),
+            model_group=self.model_group,
         )
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
         call_kwargs.update(self.extra_kwargs)
