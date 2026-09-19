@@ -2916,7 +2916,8 @@ class ManagedResponsesWebSocketHandler:
         self._apply_history(call_kwargs, previous_response_id, current_messages, prior_history)
         self._inject_credentials(call_kwargs, model=model)
         if self.session_manager is not None:
-            call_kwargs.update(cache_affinity(self._resolve_provider(model), session_key, call_kwargs))
+            provider: Final = self._resolve_provider(model) or self._connection_provider
+            call_kwargs.update(cache_affinity(provider, session_key, call_kwargs))
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
         call_kwargs.update(self.extra_kwargs)
 

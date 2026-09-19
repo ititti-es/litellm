@@ -3340,7 +3340,7 @@ class TestManagedHandlerWithSessionManager:
     """Continuation through a shared SessionManager instead of per-connection history"""
 
     @staticmethod
-    def _handler(manager, token, websocket=None):
+    def _handler(manager, token, websocket=None, model="xai/grok-4", custom_llm_provider=None):
         from unittest.mock import AsyncMock, MagicMock
 
         from litellm.proxy._types import UserAPIKeyAuth
@@ -3350,9 +3350,10 @@ class TestManagedHandlerWithSessionManager:
         ws.send_text = AsyncMock()
         return ManagedResponsesWebSocketHandler(
             websocket=ws,
-            model="xai/grok-4",
+            model=model,
             logging_obj=MagicMock(),
             user_api_key_dict=UserAPIKeyAuth(api_key=token),
+            custom_llm_provider=custom_llm_provider,
             session_manager=manager,
         )
 
@@ -3433,7 +3434,12 @@ class TestManagedHandlerWithSessionManager:
 
 
     @pytest.mark.asyncio
-    async def test_every_turn_of_a_session_uses_one_upstream_cache_key(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("model", "provider"),
+        [("xai/grok-4", None), ("grok-4", "xai")],
+        ids=["prefixed-model", "router-resolved-bare-model"],
+    )
+    async def test_every_turn_of_a_session_uses_one_upstream_cache_key(self, monkeypatch, model, provider):
         import json
 
         import litellm
@@ -3443,7 +3449,7 @@ class TestManagedHandlerWithSessionManager:
         keys: list = []
         monkeypatch.setattr(litellm, "aresponses", self._fake_aresponses(calls, keys))
         manager = SessionManager()
-        handler = self._handler(manager, "key-a")
+        handler = self._handler(manager, "key-a", model=model, custom_llm_provider=provider)
         await handler._process_response_create(json.dumps({"type": "response.create", "input": "one"}))
         await handler._process_response_create(
             json.dumps({"type": "response.create", "previous_response_id": "resp_1", "input": "two"})
