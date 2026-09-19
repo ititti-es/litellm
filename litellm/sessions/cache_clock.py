@@ -5,12 +5,17 @@ and whether the provider reported that prefix as cached. A hit at gap g says the
 did not. The estimate is the longest gap at which a monotone fit of the hit rate still clears the target, seeded
 with pseudo-observations from each provider's documented TTL so a new model starts from the published figure
 and only moves when real evidence outweighs it.
+
+Some providers (xAI among them) keep prefixes longer or shorter depending on capacity against load, so the
+lifetime drifts. Evidence therefore decays with age: the estimate follows current conditions, and returns to
+the prior when there is no recent traffic to learn from.
 """
 
 from __future__ import annotations
 
+import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
@@ -43,6 +48,7 @@ class CacheSample:
     gap_seconds: float
     hit: bool
     weight: float = 1.0
+    observed_at: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,24 +128,47 @@ def _nonincreasing_fit(samples: Sequence[CacheSample]) -> tuple[float, ...]:
 class CacheClock:
     """Recent cache observations per (provider, model), and the warm window they imply"""
 
-    def __init__(self, target: float = 0.8, priors: Mapping[str, float] | None = None) -> None:
+    def __init__(
+        self,
+        target: float = 0.8,
+        priors: Mapping[str, float] | None = None,
+        half_life_seconds: float = 3600.0,
+        now: Callable[[], float] = time.time,
+    ) -> None:
         self._target: Final = target
+        self._half_life: Final = half_life_seconds
+        self._now: Final = now
         self._priors: Final = MappingProxyType(dict(priors)) if priors is not None else _PRIOR_TTL
         self._samples: Final[dict[tuple[str, str], deque[CacheSample]]] = {}  # mutable-ok: bounded window per model
 
-    def observe(self, provider: str, model: str, gap_seconds: float, prefix_tokens: int, cached_tokens: int) -> None:
+    def observe(
+        self,
+        provider: str,
+        model: str,
+        gap_seconds: float,
+        prefix_tokens: int,
+        cached_tokens: int,
+        observed_at: float | None = None,
+    ) -> None:
         hit: Final = classify(prefix_tokens, cached_tokens)
         if hit is None or gap_seconds < 0:
             return
         window: Final = self._samples.setdefault((provider, model), deque(maxlen=_WINDOW))  # mutable-ok: bounded window
-        window.append(CacheSample(gap_seconds, hit))
+        window.append(CacheSample(gap_seconds, hit, observed_at=self._now() if observed_at is None else observed_at))
 
     def estimate(self, provider: str, model: str, retention_hint: float | None = None) -> CacheEstimate:
         samples: Final = tuple(self._samples.get((provider, model), ()))
         prior: Final = prior_ttl(provider, retention_hint, self._priors)
+        now: Final = self._now()
+        weighted: Final = tuple(
+            CacheSample(sample.gap_seconds, sample.hit, self._decayed(now - sample.observed_at)) for sample in samples
+        )
         return CacheEstimate(
-            ttl_seconds=estimate_ttl(samples, prior, self._target),
+            ttl_seconds=estimate_ttl(weighted, prior, self._target),
             prior_seconds=prior,
             samples=len(samples),
             hits=sum(1 for sample in samples if sample.hit),
         )
+
+    def _decayed(self, age_seconds: float) -> float:
+        return 0.5 ** (max(age_seconds, 0.0) / self._half_life)

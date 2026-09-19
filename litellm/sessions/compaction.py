@@ -145,6 +145,8 @@ async def compact(
     except Exception as exc:
         verbose_logger.warning("SessionManager: compaction of %s failed: %s", job.session.id, exc)
         return None
+    if reply.usage is not None:
+        manager.observe_compaction(job, started_at, reply.usage)
     if reply.called_tools or not reply.text.strip():
         verbose_logger.warning("SessionManager: compaction of %s returned no usable summary", job.session.id)
         return None

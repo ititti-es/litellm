@@ -82,6 +82,8 @@ class CompactionJob:
     history: tuple[Item, ...]
     tail_start: int
     warm_until: float
+    turn_started_at: float
+    prefix_tokens: int
 
 
 class TranscriptStore(Protocol):
@@ -206,7 +208,23 @@ class SessionManager:
         ):
             return
         self._clock.observe(
-            replay.provider, replay.model, started_at - last.started_at, last.usage.input_tokens, usage.cached_tokens
+            replay.provider,
+            replay.model,
+            started_at - last.started_at,
+            last.usage.input_tokens,
+            usage.cached_tokens,
+            observed_at=started_at,
+        )
+
+    def observe_compaction(self, job: CompactionJob, started_at: float, usage: TurnUsage) -> None:
+        """A compaction reads the prefix at the very gap being predicted, under current load: first-hand evidence"""
+        self._clock.observe(
+            job.replay.provider,
+            job.replay.model,
+            started_at - job.turn_started_at,
+            job.prefix_tokens,
+            usage.cached_tokens,
+            observed_at=started_at,
         )
 
     def cache_estimate(self, session_id: str) -> CacheEstimate | None:
@@ -262,6 +280,8 @@ class SessionManager:
             history=session.replayable_at(record.response_id),
             tail_start=tail,
             warm_until=deadline,
+            turn_started_at=record.started_at,
+            prefix_tokens=record.usage.input_tokens,
         )
 
     def apply_compaction(self, job: CompactionJob, summary: Item, summary_meta: Meta, now: float) -> Session | None:

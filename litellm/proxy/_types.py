@@ -2584,6 +2584,14 @@ class SessionCompactionSettings(LiteLLMPydanticObjectBase):
         description="The predicted expiry is the longest idle gap at which the cache was still hit at least this often",
     )
     tick_seconds: float = Field(5.0, gt=0, description="How often to look for sessions whose cache is about to expire")
+    evidence_half_life_seconds: float = Field(
+        3600.0,
+        gt=0,
+        description=(
+            "How quickly old cache observations lose weight; providers such as xAI vary cache lifetime with load, "
+            "so the prediction should follow recent conditions"
+        ),
+    )
 
 
 class SessionManagerSettings(LiteLLMPydanticObjectBase):

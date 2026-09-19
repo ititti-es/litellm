@@ -65,3 +65,24 @@ def test_explicit_retention_raises_the_prior():
     assert retention_hint({}, ({"type": "message"},)) is None
     assert prior_ttl("anthropic", one_hour) == 3600.0
     assert prior_ttl("anthropic") == 300.0
+
+
+def test_old_evidence_fades_so_the_estimate_follows_current_load():
+    now = [0.0]
+    clock = CacheClock(half_life_seconds=600.0, now=lambda: now[0])
+    for _ in range(40):
+        clock.observe("xai", "grok", gap_seconds=900.0, prefix_tokens=20_000, cached_tokens=19_000)
+    assert clock.estimate("xai", "grok").ttl_seconds == 900.0
+    now[0] = 6 * 3600.0
+    assert clock.estimate("xai", "grok").ttl_seconds == 270.0
+
+
+def test_recent_misses_outweigh_older_hits_at_the_same_gap():
+    now = [0.0]
+    clock = CacheClock(half_life_seconds=600.0, now=lambda: now[0])
+    for _ in range(40):
+        clock.observe("xai", "grok", gap_seconds=240.0, prefix_tokens=20_000, cached_tokens=19_000)
+    now[0] = 3600.0
+    for _ in range(10):
+        clock.observe("xai", "grok", gap_seconds=200.0, prefix_tokens=20_000, cached_tokens=0)
+    assert clock.estimate("xai", "grok").ttl_seconds < 200.0

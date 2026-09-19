@@ -32,7 +32,8 @@ def _state(tmp_path, events, leaf):
         ],
     )
     db.executemany(
-        "insert into transcript_events values ('win-2', ?, ?, 0)", [(seq, json.dumps(e)) for seq, e in enumerate(events)]
+        "insert into transcript_events values ('win-2', ?, ?, 0)",
+        [(seq, json.dumps(e)) for seq, e in enumerate(events)],
     )
     db.execute("insert into session_transcript_index_state values ('win-2', ?)", (leaf,))
     db.commit()
@@ -59,10 +60,24 @@ def test_the_active_branch_becomes_neutral_items(tmp_path):
                 {"type": "toolCall", "id": "call_1|fc_1", "name": "read", "arguments": {"path": "a"}},
             ],
         ),
-        _message("t1", "a1", role="toolResult", toolCallId="call_1|fc_1", toolName="read", content=[{"type": "text", "text": "A"}]),
+        _message(
+            "t1",
+            "a1",
+            role="toolResult",
+            toolCallId="call_1|fc_1",
+            toolName="read",
+            content=[{"type": "text", "text": "A"}],
+        ),
         _message("x1", "t1", role="user", content="abandoned branch"),
         _event("c1", "t1", type="compaction", summary="we read a", firstKeptEntryId="t1", tokensBefore=10),
-        _message("a2", "c1", role="assistant", provider="openai", model="gpt-6-astra", content=[{"type": "text", "text": "ok"}]),
+        _message(
+            "a2",
+            "c1",
+            role="assistant",
+            provider="openai",
+            model="gpt-6-astra",
+            content=[{"type": "text", "text": "ok"}],
+        ),
     ]
     sessions = _state(tmp_path, events, leaf="a2")
     second = sessions["win-2"]

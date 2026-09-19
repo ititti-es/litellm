@@ -244,3 +244,14 @@ def test_only_prefix_shaping_parameters_are_replayed():
         {"tools": [], "api_key": "sk-secret", "stream": True, "prompt_cache_key": "s", "top_p": None}
     )
     assert dict(params) == {"tools": [], "prompt_cache_key": "s"}
+
+
+def test_a_compaction_reports_whether_the_cache_survived_its_gap():
+    manager = SessionManager()
+    two_turns(manager)
+    (job,) = manager.due_compactions(manager.warm_until("s1") - 10, 1000, 20)
+    before = manager.clock.estimate("xai", "xai/grok").samples
+    reply = CompactionReply("notes", False, TurnUsage(30_100, 0, 40))
+    asyncio.run(compact(manager, job, DEFAULT, fake_upstream(reply, [])))
+    estimate = manager.clock.estimate("xai", "xai/grok")
+    assert estimate.samples == before + 1 and estimate.hits == before
