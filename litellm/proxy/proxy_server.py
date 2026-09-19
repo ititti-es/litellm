@@ -694,7 +694,7 @@ from litellm.proxy.response_api_endpoints.endpoints import router as response_ro
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.route_priority import hot_routes_first
 from litellm.proxy.search_endpoints.endpoints import router as search_router
-from litellm.proxy.sessions import configured_session_manager
+from litellm.proxy.sessions import attach_transcript_store, configured_session_manager, sweep_expired_transcripts
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
 from litellm.proxy.spend_tracking.daily_global_spend_rollup import (
@@ -1404,6 +1404,12 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
                 _tagged.strategy._state_loaded = True
     asyncio.create_task(_adaptive_router_flusher_loop())
 
+    transcript_repository: Final = attach_transcript_store(
+        litellm.session_manager, general_settings.get("session_manager"), prisma_client
+    )
+    if transcript_repository is not None:
+        asyncio.create_task(sweep_expired_transcripts(transcript_repository))
+
     ## [Optional] Initialize dd tracer
     ProxyStartupEvent._init_dd_tracer()
 
@@ -1438,6 +1444,8 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
     # so SIGTERM (rolling update, scale-down, liveness kill) doesn't drop them.
     GracefulShutdownManager.start_shutdown()
     await GracefulShutdownManager.wait_for_drain()
+    if litellm.session_manager is not None:
+        await litellm.session_manager.flush()
 
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:

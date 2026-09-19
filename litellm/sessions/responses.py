@@ -86,14 +86,14 @@ def _as_item(item: object) -> Item | None:
     return item if isinstance(item, dict) else None
 
 
-def begin_turn(
+async def begin_turn(
     manager: SessionManager, previous_response_id: str | None, turn_input: object, owner: str
 ) -> PendingTurn | Forbidden | None:
     """None leaves the request to the existing continuation paths: the id predates the manager or was evicted"""
     items: Final = input_items(turn_input)
     if not previous_response_id:
         return PendingTurn(manager, owner, None, items, uuid.uuid4().hex)
-    resolution: Final = manager.resolve(provider_response_id(previous_response_id), owner)
+    resolution: Final = await manager.resolve_async(provider_response_id(previous_response_id), owner)
     if isinstance(resolution, Resolved):
         return PendingTurn(manager, owner, resolution, items, resolution.session.id)
     return resolution if isinstance(resolution, Forbidden) else None

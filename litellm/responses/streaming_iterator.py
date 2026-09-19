@@ -2548,12 +2548,12 @@ class ManagedResponsesWebSocketHandler:
         output: Final = resp_obj.get("output") if _is_json_object(resp_obj) else None
         return tuple(item for item in output if _is_json_object(item)) if _is_json_array(output) else ()
 
-    def _resolve_session(self, previous_response_id: str | None) -> Resolution | None:
+    async def _resolve_session(self, previous_response_id: str | None) -> Resolution | None:
         if self.session_manager is None or not previous_response_id:
             return None
         if self._is_warmup_response_id(previous_response_id):
             return None
-        return self.session_manager.resolve(provider_response_id(previous_response_id), self.session_owner)
+        return await self.session_manager.resolve_async(provider_response_id(previous_response_id), self.session_owner)
 
     def _commit_turn(
         self,
@@ -2561,6 +2561,7 @@ class ManagedResponsesWebSocketHandler:
         resolution: Resolution | None,
         current_messages: list[dict[str, object]],
         session_key: str,
+        durable: bool,
     ) -> None:
         response_id: Final = self._extract_response_id(completed_event) if completed_event is not None else None
         if self.session_manager is None or response_id is None:
@@ -2573,6 +2574,7 @@ class ManagedResponsesWebSocketHandler:
             response_id=response_id,
             now=time.time(),
             new_session_id=session_key,
+            durable=durable,
         )
 
     @staticmethod
@@ -2900,7 +2902,7 @@ class ManagedResponsesWebSocketHandler:
         previous_response_id: Final[str | None] = _optional_str(call_kwargs.pop("previous_response_id", None))
         current_messages: Final = self._input_to_messages(call_kwargs.get("input"))
 
-        resolution: Final = self._resolve_session(previous_response_id)
+        resolution: Final = await self._resolve_session(previous_response_id)
         if isinstance(resolution, Forbidden):
             await self._send_error(f"Previous response {previous_response_id} not found", "invalid_request_error")
             return
@@ -2929,7 +2931,13 @@ class ManagedResponsesWebSocketHandler:
             return
 
         if self.session_manager is not None:
-            self._commit_turn(completed_event, resolution, current_messages, session_key)
+            self._commit_turn(
+                completed_event,
+                resolution,
+                current_messages,
+                session_key,
+                durable=call_kwargs.get("store") is not False,
+            )
             return
         self._save_turn_history(completed_event, prior_history, current_messages)
 

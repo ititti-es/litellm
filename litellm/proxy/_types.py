@@ -2571,6 +2571,12 @@ class SessionManagerSettings(LiteLLMPydanticObjectBase):
     budget_mb: int = Field(
         256, ge=1, description="Memory held by live sessions before the least recently used are evicted"
     )
+    store_transcripts: bool = Field(
+        False, description="Persist transcripts to the database so any worker can resume them"
+    )
+    retention_days: int | None = Field(
+        None, ge=1, description="Delete stored transcripts this long after their last turn"
+    )
 
 
 class ConfigGeneralSettings(LiteLLMPydanticObjectBase):

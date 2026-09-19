@@ -1502,6 +1502,63 @@ model LiteLLM_MemoryTable {
   @@index([team_id])
 }
 
+// Gateway-owned conversation transcripts for the session manager (opt-in: general_settings.session_manager.store_transcripts)
+model LiteLLM_ConversationSession {
+  session_id           String                         @id
+  owner                String
+  version              Int                            @default(0)
+  compaction_policy_id String?
+  last_upstream_at     DateTime
+  expires_at           DateTime?
+  created_at           DateTime                       @default(now())
+  updated_at           DateTime                       @default(now()) @updatedAt
+  items                LiteLLM_ConversationItem[]
+  responses            LiteLLM_ConversationResponse[]
+  compaction_policy    LiteLLM_CompactionPolicy?      @relation(fields: [compaction_policy_id], references: [policy_id], onDelete: SetNull)
+
+  @@index([owner])
+  @@index([expires_at])
+}
+
+// Append-only transcript rows; a compaction writes the rebased transcript under the next version
+model LiteLLM_ConversationItem {
+  session_id String
+  version    Int
+  seq        Int
+  content    Json
+  is_output  Boolean
+  created_at DateTime                    @default(now())
+  session    LiteLLM_ConversationSession @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
+
+  @@id([session_id, version, seq])
+}
+
+// A response id addresses the transcript prefix it completed
+model LiteLLM_ConversationResponse {
+  response_id String                      @id
+  session_id  String
+  version     Int
+  item_count  Int
+  created_at  DateTime                    @default(now())
+  session     LiteLLM_ConversationSession @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
+
+  @@index([session_id])
+}
+
+// Named compaction instruction sets: built-in, imported from a harness, or custom
+model LiteLLM_CompactionPolicy {
+  policy_id    String                        @id @default(uuid())
+  name         String                        @unique
+  source       String
+  instructions String
+  settings     Json?
+  created_at   DateTime                      @default(now())
+  created_by   String?
+  updated_at   DateTime                      @default(now()) @updatedAt
+  updated_by   String?
+  sessions     LiteLLM_ConversationSession[]
+}
+
 // Per-(router, request_type, model) Beta posterior for the adaptive router.
 model LiteLLM_AdaptiveRouterState {
   router_name     String

@@ -94,3 +94,56 @@ def test_least_recently_used_session_is_evicted_first_and_then_resolves_unknown(
     assert isinstance(manager.resolve("a", "key-a"), Resolved)
     assert isinstance(manager.resolve("c", "key-a"), Resolved)
     assert manager.stats().evictions == 1
+
+
+class MemoryStore:
+    def __init__(self, fail: bool = False):
+        self.saved: list = []
+        self.sessions: dict = {}
+        self.fail = fail
+
+    async def save(self, session, first_new, response_id):
+        if self.fail:
+            raise ConnectionError("db down")
+        self.saved.append((session.id, first_new, response_id))
+        self.sessions[response_id] = session
+
+    async def load(self, response_id):
+        return self.sessions.get(response_id)
+
+
+async def test_durable_commits_write_only_the_new_items_in_order():
+    store = MemoryStore()
+    manager = SessionManager()
+    manager.attach_store(store)
+    first = first_turn(manager)
+    prior = manager.resolve("r1", "key-a")
+    manager.commit(owner="key-a", prior=prior, turn_input=(CALL_OUTPUT,), output=(ASSISTANT,), response_id="r2", now=2.0)
+    manager.commit(owner="key-a", prior=None, turn_input=(USER,), output=(), response_id="r3", now=3.0, durable=False)
+    await manager.flush()
+    assert store.saved == [(first.id, 0, "r1"), (first.id, 3, "r2")]
+
+
+async def test_an_evicted_session_is_rehydrated_from_the_store_for_its_owner_only():
+    store = MemoryStore()
+    one_session = first_turn(SessionManager()).size()
+    manager = SessionManager(budget_bytes=one_session + one_session // 2)
+    manager.attach_store(store)
+    first_turn(manager, response_id="a")
+    first_turn(manager, response_id="b")
+    await manager.flush()
+    assert manager.resolve("a", "key-a") == Unknown("a")
+
+    assert await manager.resolve_async("a", "key-b") == Forbidden("a")
+    resolved = await manager.resolve_async("a", "key-a")
+    assert isinstance(resolved, Resolved) and resolved.history[0] == USER
+    assert manager.stats().rehydrations == 1
+
+
+async def test_a_failing_store_never_fails_the_turn():
+    manager = SessionManager()
+    manager.attach_store(MemoryStore(fail=True))
+    first_turn(manager)
+    await manager.flush()
+    assert isinstance(manager.resolve("r1", "key-a"), Resolved)
+    assert manager.stats().unpersisted == 1

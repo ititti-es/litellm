@@ -14,24 +14,24 @@ def completed(response_id: str, text: str) -> ResponsesAPIResponse:
     )
 
 
-def test_a_continued_turn_sends_the_held_history_followed_by_only_the_new_input():
+async def test_a_continued_turn_sends_the_held_history_followed_by_only_the_new_input():
     manager = SessionManager()
-    first = begin_turn(manager, None, "one", "key-a")
+    first = await begin_turn(manager, None, "one", "key-a")
     assert isinstance(first, PendingTurn)
     first.finish(completed("resp_1", "a1"))
 
-    second = begin_turn(manager, "resp_1", "two", "key-a")
+    second = await begin_turn(manager, "resp_1", "two", "key-a")
     assert isinstance(second, PendingTurn) and isinstance(second.prior, Resolved)
     assert [item["content"][0]["text"] for item in second.upstream_input()] == ["one", "a1", "two"]
 
 
-def test_foreign_and_unknown_ids_are_distinguished():
+async def test_foreign_and_unknown_ids_are_distinguished():
     manager = SessionManager()
-    first = begin_turn(manager, None, "one", "key-a")
+    first = await begin_turn(manager, None, "one", "key-a")
     assert isinstance(first, PendingTurn)
     first.finish(completed("resp_1", "a1"))
-    assert begin_turn(manager, "resp_1", "x", "key-b") == Forbidden("resp_1")
-    assert begin_turn(manager, "resp_unknown", "x", "key-a") is None
+    assert await begin_turn(manager, "resp_1", "x", "key-b") == Forbidden("resp_1")
+    assert await begin_turn(manager, "resp_unknown", "x", "key-a") is None
 
 
 @pytest.fixture

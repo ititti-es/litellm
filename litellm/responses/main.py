@@ -695,7 +695,7 @@ async def aresponses(
                 ),
             )
 
-        session_turn: Final = None if store is False else _begin_session_turn(previous_response_id, input, kwargs)
+        session_turn: Final = None if store is False else await _begin_session_turn(previous_response_id, input, kwargs)
         if isinstance(session_turn, Forbidden):
             raise litellm.BadRequestError(
                 message=f"Previous response {previous_response_id} not found",
@@ -779,7 +779,7 @@ async def aresponses(
         )
 
 
-def _begin_session_turn(
+async def _begin_session_turn(
     previous_response_id: str | None, turn_input: object, kwargs: Mapping[str, object]
 ) -> PendingTurn | Forbidden | None:
     manager: Final = litellm.session_manager
@@ -789,7 +789,7 @@ def _begin_session_turn(
     if isinstance(metadata, dict) and metadata.get(MANAGED_BY_CALLER):
         return None
     owner: Final = metadata.get("user_api_key_hash") if isinstance(metadata, dict) else None
-    return begin_turn(manager, previous_response_id, turn_input, owner if isinstance(owner, str) else "")
+    return await begin_turn(manager, previous_response_id, turn_input, owner if isinstance(owner, str) else "")
 
 
 def _resolve_prompt_swapped_provider(
