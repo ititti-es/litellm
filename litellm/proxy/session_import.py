@@ -136,7 +136,7 @@ class _Client:
 
 
 @asynccontextmanager
-async def _repository(url: str | None) -> AsyncGenerator[ConversationSessionRepository | None]:
+async def repository_from_url(url: str | None) -> AsyncGenerator[ConversationSessionRepository | None]:
     if url is None:
         yield None
         return
@@ -155,7 +155,7 @@ async def _main(args: argparse.Namespace) -> int:
     if url is None and not getattr(args, "dry_run", False):
         sys.stderr.write("DATABASE_URL (or --database-url) is required unless --dry-run\n")
         return 2
-    async with _repository(url) as repository:
+    async with repository_from_url(url) as repository:
         if args.command in ("pin", "unpin"):
             if repository is None:
                 return 2

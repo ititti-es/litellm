@@ -62,6 +62,8 @@ class ReplayBase:
     model: str
     params: Mapping[str, object]
     deployment: str | None = None
+    compaction_policy: str | None = None
+    """The policy the client asked for (request metadata `compaction_policy`), if any"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,22 +286,29 @@ class SessionManager:
             prefix_tokens=record.usage.input_tokens,
         )
 
-    def apply_compaction(self, job: CompactionJob, summary: Item, summary_meta: Meta, now: float) -> Session | None:
-        """Rebase the session onto its summary plus the kept tail; None when a turn landed meanwhile"""
+    def apply_compaction(
+        self, job: CompactionJob, summary: Sequence[Item], summary_at: int, summary_meta: Meta, now: float
+    ) -> Session | None:
+        """Rebase the session onto its summary items plus the kept tail; None when a turn landed meanwhile"""
         live: Final = self._sessions.get(job.session.id)
         if live is None or live.version != job.session.version or len(live.items) != len(job.session.items):
             return None
-        tail: Final = live.items[job.tail_start :]
-        items: Final = (summary, *tail)
+        head: Final = len(summary)
+        items: Final = (*summary, *live.items[job.tail_start :])
         compacted: Final = Session(
             id=live.id,
             owner=live.owner,
             items=items,
-            outputs=frozenset(index - job.tail_start + 1 for index in live.outputs if index >= job.tail_start),
+            outputs=frozenset(
+                (
+                    *(index for index, item in enumerate(summary) if item.get("role") == "assistant"),
+                    *(index - job.tail_start + head for index in live.outputs if index >= job.tail_start),
+                )
+            ),
             responses=MappingProxyType({job.response_id: len(items)}),
             version=live.version + 1,
             last_upstream_at=now,
-            annotations=_rebased_annotations(live.annotations, job.tail_start, summary_meta),
+            annotations=_rebased_annotations(live.annotations, job.tail_start, head, summary_at, summary_meta),
         )
         self._hold(compacted)
         record: Final = self._turns.get(live.id)
@@ -454,18 +463,27 @@ def _built(
     )
 
 
-def _rebased_annotations(annotations: Mapping[int, Meta], tail_start: int, summary: Meta) -> Mapping[int, Meta]:
-    """The summary's meta at position 0, and the kept tail's meta moved to follow it"""
-    kept: Final = {i - tail_start + 1: m for i, m in annotations.items() if i >= tail_start}  # mutable-ok: frozen below
-    return MappingProxyType({0: summary, **kept})  # mutable-ok: frozen on construction
+_NO_META: Final[Meta] = MappingProxyType({})
 
 
-def compaction_tail(session: Session) -> int | None:
-    """Where the kept tail starts: the last user message, so the latest exchange survives verbatim"""
+def _rebased_annotations(
+    annotations: Mapping[int, Meta], tail_start: int, head: int, summary_at: int, summary: Meta
+) -> Mapping[int, Meta]:
+    """The summary's meta at its position, and the kept tail's meta moved to follow the summary items"""
+    shift: Final = head - tail_start
+    kept: Final = MappingProxyType({i + shift: m for i, m in annotations.items() if i >= tail_start})
+    return MappingProxyType({summary_at: summary, **kept})  # mutable-ok: frozen on construction
+
+
+def compaction_tail(session: Session, keep_turns: int = 1) -> int | None:
+    """Where the kept tail starts: the *keep_turns*-th last user message, so the latest exchanges stay verbatim"""
     starts: Final = tuple(
         index
         for index, item in enumerate(session.items)
-        if index not in session.outputs and item.get("type", "message") == "message" and item.get("role") == "user"
+        if index not in session.outputs
+        and item.get("type", "message") == "message"
+        and item.get("role") == "user"
+        and session.annotations.get(index, _NO_META).get("kind", "user") == "user"
     )
-    last: Final = starts[-1] if starts else 0
-    return last if last > 0 else None
+    start: Final = starts[-keep_turns] if len(starts) >= keep_turns else 0
+    return start if start > 0 else None

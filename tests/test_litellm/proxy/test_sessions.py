@@ -137,18 +137,22 @@ class PolicyRepository:
         return self.stored
 
 
-async def test_a_named_policy_is_loaded_and_anything_else_falls_back_to_the_built_in_one():
+async def test_policies_resolve_stored_then_built_in_then_default():
     from types import SimpleNamespace
 
     from litellm.proxy.sessions import load_policy
-    from litellm.sessions.compaction import DEFAULT, CompactionPolicy
+    from litellm.sessions.compaction_presets import DEFAULT, OPENCODE
 
-    stored = SimpleNamespace(name="opencode", instructions="Summarize like opencode")
-    assert await load_policy(PolicyRepository(stored), "opencode") == CompactionPolicy("opencode", stored.instructions)
+    stored = SimpleNamespace(name="mine", source="custom", instructions="Summarize tersely", settings={"keep_turns": 2})
+    mine = await load_policy(PolicyRepository(stored), "mine")
+    assert mine.instructions == "Summarize tersely" and mine.settings.keep_turns == 2
+    assert await load_policy(PolicyRepository(None), "opencode") == OPENCODE
+    assert await load_policy(PolicyRepository(None), "missing", "opencode") == OPENCODE
     assert await load_policy(PolicyRepository(None), "missing") is DEFAULT
-    assert await load_policy(PolicyRepository(error=RuntimeError("db down")), "opencode") is DEFAULT
-    assert await load_policy(None, "opencode") is DEFAULT
-    assert await load_policy(PolicyRepository(stored), None) is DEFAULT
+    assert await load_policy(PolicyRepository(error=RuntimeError("db down")), "opencode") == OPENCODE
+    assert await load_policy(None, None, None) is DEFAULT
+    broken = SimpleNamespace(name="opencode", source="custom", instructions="x", settings={"summary_role": "system"})
+    assert await load_policy(PolicyRepository(broken), "opencode") == OPENCODE
 
 
 async def test_compaction_calls_reach_the_deployment_that_served_the_turn():
@@ -168,12 +172,12 @@ async def test_compaction_calls_reach_the_deployment_that_served_the_turn():
             return {"api_key": "sk-upstream", "custom_llm_provider": "xai", "model": "xai/alias"}
 
     replay = ReplayBase("xai", "xai/grok", {"prompt_cache_key": "s1", "stream": True}, deployment="d1")
-    reply = await router_upstream(lambda: Router(), send)(replay, [{"type": "message"}], "owner-hash")
+    reply = await router_upstream(lambda: Router(), send)(replay, [{"type": "message"}], "owner-hash", 3000)
 
     assert reply.text == "notes"
     (call,) = sent
     assert call["api_key"] == "sk-upstream" and call["model"] == "xai/grok" and call["stream"] is False
-    assert call["prompt_cache_key"] == "s1"
+    assert call["prompt_cache_key"] == "s1" and call["max_output_tokens"] == 3000
     assert call["litellm_metadata"][MANAGED_BY_CALLER] is True
     assert call["litellm_metadata"]["user_api_key_hash"] == "owner-hash"
 
@@ -215,7 +219,7 @@ async def test_due_sessions_are_compacted_with_the_configured_policy():
     )
     instructions = []
 
-    async def call(replay, items, owner):
+    async def call(replay, items, owner, max_output_tokens):
         instructions.append(items[-1]["content"][0]["text"])
         return CompactionReply("notes", False, None)
 
@@ -225,7 +229,11 @@ async def test_due_sessions_are_compacted_with_the_configured_policy():
     deadline = manager.warm_until("s1")
     assert await _start_due(manager, settings, call, PolicyRepository(), deadline - 60) == ()
     tasks = await _start_due(
-        manager, settings, call, PolicyRepository(SimpleNamespace(name="mine", instructions="Be brief")), deadline - 5
+        manager,
+        settings,
+        call,
+        PolicyRepository(SimpleNamespace(name="mine", source="custom", instructions="Be brief", settings=None)),
+        deadline - 5,
     )
     (compacted,) = [await task for task in tasks]
     assert instructions == ["Be brief"]

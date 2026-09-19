@@ -10,31 +10,19 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Final, Protocol
 
 from pydantic import BaseModel, JsonValue
 
 from litellm._logging import verbose_logger
-from litellm.sessions.manager import CompactionJob, ReplayBase, SessionManager, TurnUsage
+from litellm.sessions.compaction_policy import CompactionPolicy
+from litellm.sessions.compaction_presets import DEFAULT, PRESETS
+from litellm.sessions.manager import CompactionJob, ReplayBase, SessionManager, TurnUsage, compaction_tail
 from litellm.sessions.session import Item, Meta, Session
 
-DEFAULT_POLICY: Final = "default"
-DEFAULT_INSTRUCTIONS: Final = """\
-Stop working on the task for a moment. The conversation above is about to be compacted: everything before the
-most recent user message will be replaced by the summary you write now, and you will continue from that summary
-alone. Do not call any tools.
-
-Write a summary that lets you pick the work up without the original transcript:
-- the user's goal and every explicit requirement, preference or constraint they stated;
-- decisions made, and why;
-- the current state: files, commands, identifiers, URLs and values that matter, quoted exactly;
-- what was tried and failed, so it is not repeated;
-- open questions and the next steps.
-
-Be specific and complete rather than short. Write it as notes to yourself, without preamble."""
-SUMMARY_PREFIX: Final = "Summary of the conversation so far (earlier turns were compacted):\n\n"
+__all__ = ("DEFAULT", "PRESETS", "CompactionPolicy")
 
 # Parameters that shape the cached prefix upstream; anything else (stream, output limits) is left out
 REPLAY_PARAMS: Final = frozenset(
@@ -66,15 +54,6 @@ def replay_params(request: Mapping[str, object]) -> Mapping[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
-class CompactionPolicy:
-    name: str
-    instructions: str
-
-
-DEFAULT: Final = CompactionPolicy(DEFAULT_POLICY, DEFAULT_INSTRUCTIONS)
-
-
-@dataclass(frozen=True, slots=True)
 class CompactionReply:
     text: str
     called_tools: bool
@@ -84,23 +63,22 @@ class CompactionReply:
 class CallUpstream(Protocol):
     """Sends the input upstream, without streaming, as the replayed turn would have been; returns the reply"""
 
-    def __call__(self, replay: ReplayBase, items: Sequence[Item], owner: str) -> Awaitable[CompactionReply]: ...
+    def __call__(
+        self, replay: ReplayBase, items: Sequence[Item], owner: str, max_output_tokens: int | None
+    ) -> Awaitable[CompactionReply]: ...
 
 
-def instruction_item(policy: CompactionPolicy) -> Item:
+def instruction_item(text: str) -> Item:
     return {  # mutable-ok: sent upstream as JSON input
         "type": "message",
         "role": "user",
-        "content": [{"type": "input_text", "text": policy.instructions}],  # mutable-ok: same JSON payload
+        "content": [{"type": "input_text", "text": text}],  # mutable-ok: same JSON payload
     }
 
 
-def summary_item(text: str) -> Item:
-    return {  # mutable-ok: replayed upstream as JSON input
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": SUMMARY_PREFIX + text}],  # mutable-ok: same JSON payload
-    }
+def updating(session: Session) -> bool:
+    """Whether the history already starts from an earlier summary (the gateway's or a harness's)"""
+    return any(meta.get("kind") == "compaction_summary" for meta in session.annotations.values())
 
 
 def summary_meta(job: CompactionJob, policy: CompactionPolicy, reply: CompactionReply, started_at: float) -> Meta:
@@ -121,6 +99,7 @@ def summary_meta(job: CompactionJob, policy: CompactionPolicy, reply: Compaction
             "kind": "compaction_summary",
             "summary": reply.text,
             "policy": policy.name,
+            "policy_source": policy.source,
             "provenance": MappingProxyType(
                 {"harness": "litellm", "provider": job.replay.provider, "model": job.replay.model}
             ),
@@ -138,10 +117,15 @@ async def compact(
     manager: SessionManager, job: CompactionJob, policy: CompactionPolicy, call: CallUpstream
 ) -> Session | None:
     """One compaction; None when it was not usable or the session moved on while it ran"""
+    tail: Final = compaction_tail(job.session, policy.settings.keep_turns)
+    if tail is None:
+        return None
+    kept: Final = replace(job, tail_start=tail)
     started_at: Final = time.time()
     try:
-        request: Final = [*job.history, instruction_item(policy)]  # mutable-ok: provider input is a JSON list
-        reply: Final = await call(job.replay, request, job.session.owner)
+        text: Final = policy.request_text(updating(job.session))
+        request: Final = [*job.history, instruction_item(text)]  # mutable-ok: provider input is a JSON list
+        reply: Final = await call(job.replay, request, job.session.owner, policy.settings.max_output_tokens)
     except Exception as exc:
         verbose_logger.warning("SessionManager: compaction of %s failed: %s", job.session.id, exc)
         return None
@@ -150,9 +134,8 @@ async def compact(
     if reply.called_tools or not reply.text.strip():
         verbose_logger.warning("SessionManager: compaction of %s returned no usable summary", job.session.id)
         return None
-    return manager.apply_compaction(
-        job, summary_item(reply.text.strip()), summary_meta(job, policy, reply, started_at), time.time()
-    )
+    items, at = policy.summary_items(reply.text.strip())
+    return manager.apply_compaction(kept, items, at, summary_meta(kept, policy, reply, started_at), time.time())
 
 
 def reply_from(response: object) -> CompactionReply:

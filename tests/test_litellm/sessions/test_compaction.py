@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from litellm.sessions import ReplayBase, Resolved, SessionManager, TurnUsage
 from litellm.sessions.compaction import (
     DEFAULT,
-    SUMMARY_PREFIX,
     CompactionReply,
     compact,
     replay_params,
@@ -121,7 +120,7 @@ def test_small_sessions_and_sessions_with_a_turn_in_flight_are_left_alone():
 
 
 def fake_upstream(reply, calls):
-    async def call(replay, items, owner):
+    async def call(replay, items, owner, max_output_tokens):
         calls.append((replay, items, owner))
         return reply
 
@@ -143,7 +142,7 @@ def test_compaction_reuses_the_prefix_and_rebases_onto_summary_and_latest_exchan
     assert items[-1]["content"][0]["text"] == DEFAULT.instructions
 
     assert compacted is not None and compacted.version == 1
-    assert compacted.items[0]["content"][0]["text"] == SUMMARY_PREFIX + "the user counted to two"
+    assert compacted.items[0]["content"][0]["text"] == DEFAULT.settings.summary_prefix + "the user counted to two"
     assert compacted.items[1:] == (user("two"), assistant("a2"))
     assert compacted.outputs == frozenset({2})
     meta = compacted.annotations[0]
@@ -202,7 +201,7 @@ def test_a_reply_that_calls_tools_or_fails_leaves_the_session_untouched():
         assert asyncio.run(compact(manager, job, DEFAULT, call)) is None
         assert manager.resolve("r2", "k").session.version == 0
 
-    async def broken(replay, items, owner):
+    async def broken(replay, items, owner, max_output_tokens):
         raise RuntimeError("upstream down")
 
     manager = SessionManager()

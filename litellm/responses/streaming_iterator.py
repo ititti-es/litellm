@@ -40,7 +40,7 @@ from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequest
 from litellm.sessions import Forbidden, Item, Resolution, Resolved, SessionManager
 from litellm.sessions.compaction import replay_params, turn_usage
 from litellm.sessions.manager import ReplayBase
-from litellm.sessions.responses import MANAGED_BY_CALLER, cache_affinity, provider_response_id
+from litellm.sessions.responses import MANAGED_BY_CALLER, cache_affinity, provider_response_id, requested_policy
 from litellm.types.integrations.custom_logger import converted_stream_requested
 from litellm.types.llms.openai import (
     PART_UNION_TYPES,
@@ -2941,6 +2941,7 @@ class ManagedResponsesWebSocketHandler:
             model=model,
             params=replay_params(call_kwargs),
             deployment=self._deployment_id() if model == self.model else self.model_group,
+            compaction_policy=requested_policy(call_kwargs.get("metadata"), self.litellm_metadata.get("requester_metadata")),
         )
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
         call_kwargs.update(self.extra_kwargs)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -23,7 +23,9 @@ from litellm.repositories.conversation_session_repository import (
 from litellm.repositories.prisma_protocols import DatabaseClient
 from litellm.sessions import Item, ReplayBase, Session, SessionManager
 from litellm.sessions.cache_clock import CacheClock
-from litellm.sessions.compaction import DEFAULT, CallUpstream, CompactionPolicy, CompactionReply, compact, reply_from
+from litellm.sessions.compaction import CallUpstream, CompactionReply, compact, reply_from
+from litellm.sessions.compaction_policy import CompactionPolicy, policy_from
+from litellm.sessions.compaction_presets import DEFAULT, PRESETS
 from litellm.sessions.responses import MANAGED_BY_CALLER
 
 if TYPE_CHECKING:
@@ -32,7 +34,9 @@ if TYPE_CHECKING:
 _ITEM: Final = TypeAdapter(dict[str, JsonValue])
 _RETENTION_SWEEP_SECONDS: Final = 3600
 # Set by the compaction call itself; never taken from the deployment or the replayed request
-_RESERVED: Final = frozenset({"input", "model", "custom_llm_provider", "stream", "litellm_metadata"})
+_RESERVED: Final = frozenset(
+    {"input", "model", "custom_llm_provider", "stream", "litellm_metadata", "max_output_tokens"}
+)
 
 
 def configured_session_manager(raw: object, current: SessionManager | None) -> SessionManager | None:
@@ -150,7 +154,9 @@ def router_upstream(
     """Compaction calls reuse the deployment that served the turn, so they reach the same upstream cache"""
     responses: Final = send or litellm.aresponses
 
-    async def call(replay: ReplayBase, items: Sequence[Item], owner: str) -> CompactionReply:
+    async def call(
+        replay: ReplayBase, items: Sequence[Item], owner: str, max_output_tokens: int | None
+    ) -> CompactionReply:
         current: Final = router()
         credentials: Final = (
             current.get_deployment_credentials_with_provider(replay.deployment)
@@ -160,13 +166,12 @@ def router_upstream(
         deployment: Final = MappingProxyType(credentials) if credentials is not None else MappingProxyType({})
         response: Final = await responses(
             input=items,
-            **{name: value for name, value in deployment.items() if name not in _RESERVED},  # mutable-ok: call kwargs
-            **{
-                name: value for name, value in replay.params.items() if name not in _RESERVED
-            },  # mutable-ok: call kwargs
+            **_passthrough(deployment),
+            **_passthrough(replay.params),
             custom_llm_provider=deployment.get("custom_llm_provider", replay.provider),
             model=replay.model,
             stream=False,
+            **_output_cap(max_output_tokens),
             litellm_metadata=_compaction_metadata(owner),
         )
         return reply_from(response)
@@ -174,21 +179,47 @@ def router_upstream(
     return call
 
 
+def _passthrough(source: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType({name: value for name, value in source.items() if name not in _RESERVED})
+
+
+_NO_CAP: Final[Mapping[str, int]] = MappingProxyType({})
+
+
+def _output_cap(max_output_tokens: int | None) -> Mapping[str, int]:
+    return MappingProxyType({"max_output_tokens": max_output_tokens}) if max_output_tokens is not None else _NO_CAP
+
+
 def _compaction_metadata(owner: str) -> dict[str, object]:
     """Marked as the manager's own call, so it is not tracked as a turn, and attributed to the session's key"""
     return {MANAGED_BY_CALLER: True, "user_api_key_hash": owner, "tags": ["session_compaction"]}  # mutable-ok: metadata
 
 
-async def load_policy(repository: ConversationSessionRepository | None, name: str | None) -> CompactionPolicy:
-    """The configured stored policy, or the built-in one when none is named or it cannot be read"""
-    if repository is None or name is None:
-        return DEFAULT
+async def load_policy(repository: ConversationSessionRepository | None, *names: str | None) -> CompactionPolicy:
+    """The first of *names* that resolves: a stored policy, else a built-in preset; the built-in default otherwise"""
+    for name in names:
+        if name is None:
+            continue
+        found = await _find_policy(repository, name)  # rebind-ok: one lookup per candidate name
+        if found is not None:
+            return found
+        verbose_proxy_logger.warning("session manager: unknown compaction policy %s", name)
+    return DEFAULT
+
+
+async def _find_policy(repository: ConversationSessionRepository | None, name: str) -> CompactionPolicy | None:
     try:
-        stored: Final = await repository.find_policy(name)
+        stored: Final = await repository.find_policy(name) if repository is not None else None
     except Exception as exc:
         verbose_proxy_logger.warning("session manager: could not load compaction policy %s: %s", name, exc)
-        return DEFAULT
-    return CompactionPolicy(stored.name, stored.instructions) if stored is not None else DEFAULT
+        return PRESETS.get(name)
+    if stored is None:
+        return PRESETS.get(name)
+    try:
+        return policy_from(stored.name, stored.source, stored.instructions, stored.settings)
+    except (ValueError, ValidationError) as exc:
+        verbose_proxy_logger.warning("session manager: compaction policy %s is invalid: %s", name, exc)
+        return PRESETS.get(name)
 
 
 async def compact_before_expiry(
@@ -213,10 +244,10 @@ async def _start_due(
     now: float,
 ) -> tuple[asyncio.Task[Session | None], ...]:
     jobs: Final = manager.due_compactions(now, settings.min_prefix_tokens, settings.lead_seconds)
-    if not jobs:
-        return ()
-    policy: Final = await load_policy(repository, settings.policy)
-    return tuple(asyncio.create_task(compact(manager, job, policy, call)) for job in jobs)
+    policies: Final = await asyncio.gather(
+        *(load_policy(repository, job.replay.compaction_policy, settings.policy) for job in jobs)
+    )
+    return tuple(asyncio.create_task(compact(manager, job, policy, call)) for job, policy in zip(jobs, policies))
 
 
 def start_compaction(

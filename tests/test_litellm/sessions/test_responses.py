@@ -112,3 +112,16 @@ def _provider_id(response_id: str) -> str:
     from litellm.sessions.responses import provider_response_id
 
     return provider_response_id(response_id)
+
+
+async def test_a_client_can_name_its_compaction_policy_in_request_metadata(manager):
+    response = await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="hi",
+        mock_response="yo",
+        litellm_metadata={"user_api_key_hash": "key-a", "requester_metadata": {"compaction_policy": "opencode"}},
+    )
+    resolved = manager.resolve(_provider_id(response.id), "key-a")
+    assert isinstance(resolved, Resolved)
+    record = manager.last_turn(resolved.session.id)
+    assert record is not None and record.replay is not None and record.replay.compaction_policy == "opencode"

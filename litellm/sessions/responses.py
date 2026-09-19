@@ -41,6 +41,18 @@ def turn_affinity(turn: object, custom_llm_provider: str | None, request: Mappin
     return cache_affinity(custom_llm_provider, turn.key, request) if isinstance(turn, PendingTurn) else _NO_AFFINITY
 
 
+POLICY_METADATA_KEY: Final = "compaction_policy"
+
+
+def requested_policy(*metadata: object) -> str | None:
+    """The compaction policy a client named in its request metadata, first found wins"""
+    for source in metadata:
+        name = source.get(POLICY_METADATA_KEY) if isinstance(source, Mapping) else None  # rebind-ok: one per source
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
 def input_items(value: object) -> tuple[Item, ...]:
     if isinstance(value, str):
         return (

@@ -71,7 +71,7 @@ else:
 from litellm.sessions import Forbidden
 from litellm.sessions.compaction import replay_params
 from litellm.sessions.manager import ReplayBase
-from litellm.sessions.responses import MANAGED_BY_CALLER, PendingTurn, begin_turn, turn_affinity
+from litellm.sessions.responses import MANAGED_BY_CALLER, PendingTurn, begin_turn, requested_policy, turn_affinity
 
 from .streaming_iterator import BaseResponsesAPIStreamingIterator
 
@@ -736,6 +736,7 @@ async def aresponses(
                         }
                     ),
                     deployment=_deployment_id(kwargs),
+                    compaction_policy=requested_policy(metadata, _requester_metadata(kwargs)),
                 )
             )
             if isinstance(session_turn, PendingTurn)
@@ -811,6 +812,11 @@ async def aresponses(
             completion_kwargs=local_vars,
             extra_kwargs=kwargs,
         )
+
+
+def _requester_metadata(kwargs: Mapping[str, object]) -> object:
+    litellm_metadata: Final = kwargs.get("litellm_metadata")
+    return litellm_metadata.get("requester_metadata") if isinstance(litellm_metadata, dict) else None
 
 
 def _deployment_id(kwargs: Mapping[str, object]) -> str | None:
