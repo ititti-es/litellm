@@ -92,3 +92,73 @@ def test_children_link_to_their_parent_and_reverted_history_is_dropped(tmp_path)
     sessions = _sessions(tmp_path, revert={"messageID": "msg_4"})
     assert sessions["ses_child"].parent_source_id == "ses_parent"
     assert [item.meta["kind"] for item in sessions["ses_parent"].items][-1] == "text"
+
+
+def _v2_db(path, messages):
+    db = sqlite3.connect(path)
+    db.executescript(
+        "create table session_v2 (id text, parent_id text, title text, version text, revert text, time_created int,"
+        " time_updated int, directory text);"
+        "create table session_message (id text, session_id text, type text, seq int, time_created int,"
+        " time_updated int, data text);"
+    )
+    db.execute("insert into session_v2 values ('ses_v2', 'ses_root', 'V2', '2.0', null, 1, 2, '/w')")
+    db.executemany(
+        "insert into session_message values (?, 'ses_v2', ?, ?, 0, 0, ?)",
+        [(f"msg_{seq}", kind, seq, json.dumps(data)) for seq, (kind, data) in enumerate(messages)],
+    )
+    db.commit()
+    db.close()
+
+
+def test_the_v2_store_format_is_read_with_types_from_their_column(tmp_path):
+    model = {"id": "gpt-6-astra", "providerID": "openai"}
+    _v2_db(
+        tmp_path / "v2.db",
+        [
+            ("user", {"text": "fix it", "files": [{"uri": "data:image/png;base64,AA", "mime": "image/png"}]}),
+            ("model-switched", {"model": model}),
+            (
+                "assistant",
+                {
+                    "agent": "build",
+                    "model": model,
+                    "providerState": {"responseId": "resp_up"},
+                    "content": [
+                        {"type": "reasoning", "id": "r", "text": "hmm"},
+                        {
+                            "type": "tool",
+                            "id": "call_1",
+                            "name": "bash",
+                            "state": {"status": "completed", "input": {"command": "ls"}, "content": [{"type": "text", "text": "a"}]},
+                            "time": {"pruned": 9},
+                        },
+                        {"type": "tool", "id": "call_2", "name": "read", "state": {"status": "error", "input": {}, "error": {"message": "nope"}}},
+                        {"type": "text", "id": "t", "text": "done"},
+                    ],
+                },
+            ),
+            ("assistant", {"model": model, "content": [], "error": {"type": "unknown", "message": "boom"}}),
+            ("system", {"text": "operator note"}),
+            ("compaction", {"summary": "so far", "recent": "", "reason": "auto"}),
+            ("some-future-type", {}),
+        ],
+    )
+    (session,) = read_opencode(tmp_path / "v2.db")
+    assert [item.meta["kind"] for item in session.items] == [
+        "user",
+        "reasoning",
+        "tool_call",
+        "tool_output",
+        "tool_call",
+        "tool_output",
+        "text",
+        "system_note",
+        "compaction_summary",
+    ]
+    assert session.items[0].item["content"][1] == {"type": "input_image", "image_url": "data:image/png;base64,AA"}
+    assert session.items[3].item["output"] == "a" and session.items[3].meta["pruned_by_harness"] is True
+    assert session.items[5].item["output"] == "Error: nope"
+    assert session.items[2].meta["provenance"]["provider_response_id"] == "resp_up"
+    assert session.parent_source_id == "ses_root" and session.metadata["format"] == "v2"
+    assert session.turn_ends == (7,) and session.skipped == 1

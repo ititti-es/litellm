@@ -39,7 +39,15 @@ _INTERRUPTED_OUTPUT: Final[Meta] = MappingProxyType({"kind": "interrupted_tool"}
 
 
 def read_opencode(db_path: Path, scratch_dir: Path | None = None) -> Iterator[ImportedSession]:
+    """Either store format: the v1 `session`/`message`/`part` tables, or v2 `session_v2` with `session_message`"""
     with sqlite_snapshot(db_path, scratch_dir) as db:
+        tables: Final = frozenset(
+            str(name) for (name,) in db.execute("select name from sqlite_master where type='table'")
+        )
+        v1_rows: Final = "session" in tables and db.execute("select count(*) from session").fetchone()[0] > 0
+        if not v1_rows and "session_v2" in tables:
+            yield from _v2_sessions(db, db_path.name)
+            return
         sessions: Final = db.execute(
             "select id, parent_id, title, version, revert, time_created, time_updated, directory "
             "from session order by time_created, id"
@@ -81,10 +89,10 @@ def _session(db: sqlite3.Connection, row: tuple[object, ...]) -> ImportedSession
     )
 
 
-def _before_revert(messages: Sequence[tuple[object, object]], revert: JsonValue) -> Sequence[tuple[object, object]]:
+def _before_revert(messages: Sequence[tuple[object, ...]], revert: JsonValue) -> Sequence[tuple[object, ...]]:
     """opencode deletes everything from the reverted message onwards at its next prompt"""
     cut: Final = revert.get("messageID") if isinstance(revert, dict) else None
-    ids: Final = [str(message_id) for message_id, _ in messages]  # mutable-ok: local lookup list
+    ids: Final = [str(row[0]) for row in messages]  # mutable-ok: local lookup list
     return messages[: ids.index(cut)] if isinstance(cut, str) and cut in ids else messages
 
 
@@ -239,3 +247,173 @@ def _object(value: JsonValue) -> Mapping[str, JsonValue]:
 
 def _ms(value: object) -> datetime:
     return datetime.fromtimestamp((value if isinstance(value, int | float) else 0) / 1000, UTC)
+
+
+def _v2_sessions(db: sqlite3.Connection, store: str) -> Iterator[ImportedSession]:
+    sessions: Final = db.execute(
+        "select id, parent_id, title, version, revert, time_created, time_updated, directory "
+        "from session_v2 order by time_created, id"
+    ).fetchall()
+    for row in sessions:
+        yield _v2_session(db, row, store)
+
+
+def _v2_session(db: sqlite3.Connection, row: tuple[object, ...], store: str) -> ImportedSession:
+    session_id, parent_id, title, version, revert, created, updated, directory = row
+    messages: Final = _before_revert(
+        db.execute(
+            "select id, type, data from session_message where session_id = ? order by seq", (session_id,)
+        ).fetchall(),
+        loads(revert),
+    )
+    per_message: Final = tuple(
+        _v2_message_items(str(message_id), MappingProxyType({**_object(loads(data)), "type": kind}), str(version or ""))
+        for message_id, kind, data in messages
+    )
+    ends: Final = tuple(accumulate(len(items) for items, _, _ in per_message))
+    return ImportedSession(
+        source=SOURCE,
+        source_id=str(session_id),
+        title=str(title) if title else None,
+        parent_source_id=str(parent_id) if parent_id else None,
+        created_at=_ms(created),
+        updated_at=_ms(updated),
+        items=tuple(item for items, _, _ in per_message for item in items),
+        turn_ends=tuple(end for end, (items, is_turn, _) in zip(ends, per_message) if is_turn and items),
+        metadata=MappingProxyType(
+            {
+                "harness": SOURCE,
+                "harness_version": str(version or ""),
+                "directory": str(directory or ""),
+                "format": "v2",
+                "store": store,
+            }
+        ),
+        skipped=sum(skipped for _, _, skipped in per_message),
+    )
+
+
+_V2_CONTROL: Final = frozenset({"agent-switched", "model-switched", "idle", "location-switched"})
+
+
+def _v2_message_items(
+    message_id: str, message: Mapping[str, JsonValue], version: str
+) -> tuple[tuple[ImportedItem, ...], bool, int]:
+    """The message's items, whether it is an assistant turn, and whether it was an unrecognized type"""
+    kind: Final = message.get("type")
+    source: Final = MappingProxyType({"message_id": message_id, "message": message})
+    if kind == "user":
+        content: Final = _v2_user_content(message)
+        return (
+            (user_message(content, MappingProxyType({"kind": "user", "source": source})),) if content else (),
+            False,
+            0,
+        )
+    if kind == "assistant":
+        blocks: Final = message.get("content")
+        if message.get("error") and not blocks:
+            return (), False, 0
+        return _v2_assistant_items(message, source, version), True, 0
+    if kind in ("synthetic", "system", "shell", "compaction"):
+        return (_v2_note(message, str(kind), source),), False, 0
+    return (), False, 0 if kind in _V2_CONTROL else 1
+
+
+def _v2_user_content(message: Mapping[str, JsonValue]) -> tuple[Item, ...]:
+    text: Final = message.get("text")
+    files: Final = message.get("files")
+    attachments: Final = tuple(
+        input_image(str(file.get("uri", "")))
+        if str(file.get("mime", "")).startswith("image/")
+        else input_text(f"[file: {file.get('name') or file.get('uri')} ({file.get('mime')})]")
+        for file in (files if isinstance(files, list) else ())
+        if isinstance(file, dict)
+    )
+    return (*((input_text(str(text)),) if text else ()), *attachments)
+
+
+def _v2_note(message: Mapping[str, JsonValue], kind: str, source: Meta) -> ImportedItem:
+    """Harness-authored turns stored as what they are; how each harness frames them is a view"""
+    text: Final = (
+        f"Ran `{message.get('command', '')}`\n{message.get('output', '')}"
+        if kind == "shell"
+        else str(message.get("summary", ""))
+        if kind == "compaction"
+        else str(message.get("text", ""))
+    )
+    label: Final = {
+        "synthetic": "harness_context",
+        "system": "system_note",
+        "shell": "shell_note",
+    }.get(  # mutable-ok: lookup table
+        kind, "compaction_summary"
+    )
+    return user_message((input_text(text),), MappingProxyType({"kind": label, "source": source}))
+
+
+def _v2_assistant_items(message: Mapping[str, JsonValue], source: Meta, version: str) -> tuple[ImportedItem, ...]:
+    model: Final = _object(message.get("model"))
+    provider_state: Final = _object(message.get("providerState"))
+    provenance: Final = MappingProxyType(
+        {
+            "harness": SOURCE,
+            "harness_version": version,
+            "provider": model.get("providerID"),
+            "model": model.get("id"),
+            "variant": model.get("variant"),
+            "agent": message.get("agent"),
+            "provider_response_id": provider_state.get("responseId"),
+        }
+    )
+    blocks: Final = message.get("content")
+    return tuple(
+        item
+        for block in (blocks if isinstance(blocks, list) else ())
+        if isinstance(block, dict)
+        for item in _v2_block(block, source, provenance)
+    )
+
+
+def _v2_block(block: Mapping[str, JsonValue], source: Meta, provenance: Meta) -> tuple[ImportedItem, ...]:
+    kind: Final = block.get("type")
+    meta: Final = MappingProxyType({"source": source, "block_id": block.get("id"), "provenance": provenance})
+    if kind == "text" and block.get("text"):
+        return (assistant_text(str(block["text"]), MappingProxyType({**meta, "kind": "text"})),)
+    if kind == "reasoning":
+        encrypted: Final = _encrypted_content(block.get("providerMetadata"))
+        tagged: Final = MappingProxyType({**meta, "kind": "reasoning", "provider": provenance.get("provider")})
+        return (
+            reasoning(
+                str(block.get("text", "")),
+                encrypted,
+                tagged if encrypted else MappingProxyType({**meta, "kind": "reasoning"}),
+            ),
+        )
+    if kind != "tool":
+        return ()
+    state: Final = _object(block.get("state"))
+    call_id: Final = str(block.get("id", ""))
+    call: Final = function_call(
+        call_id, str(block.get("name", "")), state.get("input") or "{}", MappingProxyType({**meta, "kind": "tool_call"})
+    )
+    status: Final = state.get("status")
+    if status == "completed":
+        pruned: Final = _object(block.get("time")).get("pruned")
+        return (
+            call,
+            function_call_output(call_id, _tool_text(state.get("content")), _PRUNED_OUTPUT if pruned else _TOOL_OUTPUT),
+        )
+    if status == "error":
+        error: Final = _object(state.get("error"))
+        return (call, function_call_output(call_id, f"Error: {error.get('message', '')}", _ERROR_OUTPUT))
+    return (call, function_call_output(call_id, _INTERRUPTED, _INTERRUPTED_OUTPUT))
+
+
+def _tool_text(content: JsonValue) -> str:
+    return "\n".join(
+        str(block.get("text", ""))
+        if block.get("type") == "text"
+        else f"[file: {block.get('name') or block.get('uri')}]"
+        for block in (content if isinstance(content, list) else ())
+        if isinstance(block, dict)
+    )
