@@ -395,6 +395,7 @@ enable_caching_on_provider_specific_optional_params: bool = (
 caching: bool = False  # Not used anymore, will be removed in next MAJOR release - https://github.com/BerriAI/litellm/discussions/648
 caching_with_models: bool = False  # # Not used anymore, will be removed in next MAJOR release - https://github.com/BerriAI/litellm/discussions/648
 cache: Optional["Cache"] = None  # cache object <- use this - https://docs.litellm.ai/docs/caching
+session_manager: Optional["SessionManager"] = None
 default_in_memory_ttl: Optional[float] = None
 default_redis_ttl: Optional[float] = None
 default_redis_batch_cache_expiry: Optional[float] = None
@@ -1540,6 +1541,7 @@ if TYPE_CHECKING:
     from litellm.types.utils import PriorityReservationSettings
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
     from litellm.caching.caching import Cache
+    from litellm.sessions import SessionManager
 
     # Type stubs for lazy-loaded configs to help mypy
     from .llms.bedrock.chat.converse_transformation import (

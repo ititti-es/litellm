@@ -37,6 +37,7 @@ from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
 )
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
+from litellm.sessions import Forbidden, Item, Resolution, Resolved, SessionManager
 from litellm.types.integrations.custom_logger import converted_stream_requested
 from litellm.types.llms.openai import (
     PART_UNION_TYPES,
@@ -2375,6 +2376,11 @@ _MANAGED_WS_SKIP_KWARGS: Final[frozenset[str]] = frozenset(
 _WARMUP_RESPONSE_ID_PREFIX: Final = "resp_warmup_"
 
 
+def _provider_response_id(response_id: str) -> str:
+    decoded: Final = ResponsesAPIRequestUtils._decode_responses_api_response_id(response_id)  # pyright: ignore[reportPrivateUsage]  # the handler keys history by the decoded provider id
+    return str(decoded.get("response_id") or response_id)
+
+
 class ManagedResponsesWebSocketHandler:
     """
     Handles Responses API WebSocket mode for providers that do not expose a
@@ -2405,9 +2411,13 @@ class ManagedResponsesWebSocketHandler:
         custom_llm_provider: str | None = None,
         first_message: str | None = None,
         quota_callbacks: Sequence[ProjectQuotaCallback] | None = None,
+        session_manager: SessionManager | None = None,
         **kwargs: object,
     ) -> None:
         self.websocket = websocket
+        self.session_manager = session_manager
+        token: Final = getattr(user_api_key_dict, "token", None)
+        self.session_owner: str = token if isinstance(token, str) else ""
         self.model = model
         self.logging_obj = logging_obj
         self.user_api_key_dict = user_api_key_dict
@@ -2465,8 +2475,7 @@ class ManagedResponsesWebSocketHandler:
         The key is the *decoded* response ID (the raw provider response ID before
         LiteLLM base64-encodes it into the ``resp_...`` format).
         """
-        decoded: Final = ResponsesAPIRequestUtils._decode_responses_api_response_id(previous_response_id)
-        raw_id: Final = decoded.get("response_id", previous_response_id)
+        raw_id: Final = _provider_response_id(previous_response_id)
         return list(self._session_history.get(raw_id, []))
 
     def _store_history(self, response_id: str, messages: list[dict[str, object]]) -> None:
@@ -2489,8 +2498,7 @@ class ManagedResponsesWebSocketHandler:
         encoded_id: Final[str | None] = raw_id if isinstance(raw_id, str) else None
         if not encoded_id:
             return None
-        decoded: Final = ResponsesAPIRequestUtils._decode_responses_api_response_id(encoded_id)
-        return decoded.get("response_id", encoded_id)
+        return _provider_response_id(encoded_id)
 
     @staticmethod
     def _extract_output_messages(
@@ -2528,6 +2536,37 @@ class ManagedResponsesWebSocketHandler:
             elif item_type == "function_call":
                 messages.append(item)
         return messages
+
+    @staticmethod
+    def _extract_output_items(completed_event: _MutableJsonObject | None) -> tuple[Item, ...]:
+        resp_obj: Final = completed_event.get("response") if completed_event is not None else None
+        output: Final = resp_obj.get("output") if _is_json_object(resp_obj) else None
+        return tuple(item for item in output if _is_json_object(item)) if _is_json_array(output) else ()
+
+    def _resolve_session(self, previous_response_id: str | None) -> Resolution | None:
+        if self.session_manager is None or not previous_response_id:
+            return None
+        if self._is_warmup_response_id(previous_response_id):
+            return None
+        return self.session_manager.resolve(_provider_response_id(previous_response_id), self.session_owner)
+
+    def _commit_turn(
+        self,
+        completed_event: _MutableJsonObject | None,
+        resolution: Resolution | None,
+        current_messages: list[dict[str, object]],
+    ) -> None:
+        response_id: Final = self._extract_response_id(completed_event) if completed_event is not None else None
+        if self.session_manager is None or response_id is None:
+            return
+        self.session_manager.commit(
+            owner=self.session_owner,
+            prior=resolution if isinstance(resolution, Resolved) else None,
+            turn_input=tuple(current_messages),
+            output=self._extract_output_items(completed_event),
+            response_id=response_id,
+            now=time.time(),
+        )
 
     @staticmethod
     def _input_to_messages(input_val: object) -> list[dict[str, object]]:
@@ -2575,8 +2614,7 @@ class ManagedResponsesWebSocketHandler:
         """Return True for synthetic warmup IDs that only exist on this connection."""
         if not response_id:
             return False
-        decoded: Final = ResponsesAPIRequestUtils._decode_responses_api_response_id(response_id)
-        raw_id: Final = decoded.get("response_id", response_id)
+        raw_id: Final = _provider_response_id(response_id)
         return str(raw_id).startswith(_WARMUP_RESPONSE_ID_PREFIX)
 
     @staticmethod
@@ -2850,8 +2888,17 @@ class ManagedResponsesWebSocketHandler:
         previous_response_id: Final[str | None] = _optional_str(call_kwargs.pop("previous_response_id", None))
         current_messages: Final = self._input_to_messages(call_kwargs.get("input"))
 
-        # Fetch history once; reused in both _apply_history and _save_turn_history
-        prior_history: Final = self._get_history_messages(previous_response_id) if previous_response_id else []
+        resolution: Final = self._resolve_session(previous_response_id)
+        if isinstance(resolution, Forbidden):
+            await self._send_error(f"Previous response {previous_response_id} not found", "invalid_request_error")
+            return
+        prior_history: Final = (
+            list(resolution.history)  # mutable-ok: _apply_history and _save_turn_history take the legacy list contract
+            if isinstance(resolution, Resolved)
+            else self._get_history_messages(previous_response_id)
+            if previous_response_id
+            else []  # mutable-ok: same legacy list contract as above
+        )
 
         self._apply_history(call_kwargs, previous_response_id, current_messages, prior_history)
         self._inject_credentials(call_kwargs, model=model)
@@ -2865,6 +2912,9 @@ class ManagedResponsesWebSocketHandler:
             await self._send_error(str(exc))
             return
 
+        if self.session_manager is not None:
+            self._commit_turn(completed_event, resolution, current_messages)
+            return
         self._save_turn_history(completed_event, prior_history, current_messages)
 
     # ------------------------------------------------------------------

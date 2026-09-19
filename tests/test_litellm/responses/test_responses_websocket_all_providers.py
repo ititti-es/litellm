@@ -3334,3 +3334,97 @@ class TestNativeWebSocketEncryptedContentAffinity:
         )
 
         assert await handler.bidirectional_forward() is None
+
+
+class TestManagedHandlerWithSessionManager:
+    """Continuation through a shared SessionManager instead of per-connection history"""
+
+    @staticmethod
+    def _handler(manager, token, websocket=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.responses.streaming_iterator import ManagedResponsesWebSocketHandler
+
+        ws = websocket or MagicMock()
+        ws.send_text = AsyncMock()
+        return ManagedResponsesWebSocketHandler(
+            websocket=ws,
+            model="xai/grok-4",
+            logging_obj=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(token=token),
+            session_manager=manager,
+        )
+
+    @staticmethod
+    def _fake_aresponses(calls):
+        async def fake(*args, **kwargs):
+            calls.append(kwargs["input"])
+            n = len(calls)
+
+            async def stream():
+                yield {
+                    "type": "response.completed",
+                    "response": {
+                        "id": f"resp_{n}",
+                        "output": [
+                            {"type": "reasoning", "id": f"rs_{n}", "summary": []},
+                            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": f"a{n}"}]},
+                        ],
+                    },
+                }
+
+            return stream()
+
+        return fake
+
+    @pytest.mark.asyncio
+    async def test_a_new_connection_continues_a_session_started_on_another(self, monkeypatch):
+        import json
+
+        import litellm
+        from litellm.sessions import Resolved, SessionManager
+
+        calls: list = []
+        monkeypatch.setattr(litellm, "aresponses", self._fake_aresponses(calls))
+        manager = SessionManager()
+
+        first = self._handler(manager, "key-a")
+        await first._process_response_create(json.dumps({"type": "response.create", "input": "one"}))
+        second = self._handler(manager, "key-a")
+        await second._process_response_create(
+            json.dumps({"type": "response.create", "previous_response_id": "resp_1", "input": "two"})
+        )
+
+        texts = [
+            part["text"] if item.get("role") == "user" else item["content"][0]["text"]
+            for item in calls[1]
+            for part in item["content"][:1]
+        ]
+        assert texts == ["one", "a1", "two"]
+        stored = manager.resolve("resp_2", "key-a")
+        assert isinstance(stored, Resolved)
+        assert {"type": "reasoning", "id": "rs_2", "summary": []} in stored.session.items
+
+    @pytest.mark.asyncio
+    async def test_another_key_cannot_continue_the_session(self, monkeypatch):
+        import json
+
+        import litellm
+        from litellm.sessions import SessionManager
+
+        calls: list = []
+        monkeypatch.setattr(litellm, "aresponses", self._fake_aresponses(calls))
+        manager = SessionManager()
+
+        await self._handler(manager, "key-a")._process_response_create(
+            json.dumps({"type": "response.create", "input": "one"})
+        )
+        intruder = self._handler(manager, "key-b")
+        await intruder._process_response_create(
+            json.dumps({"type": "response.create", "previous_response_id": "resp_1", "input": "steal"})
+        )
+
+        assert len(calls) == 1
+        sent = json.loads(intruder.websocket.send_text.call_args.args[0])
+        assert sent["type"] == "error" and sent["error"]["type"] == "invalid_request_error"
