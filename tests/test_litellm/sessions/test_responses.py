@@ -64,3 +64,24 @@ async def test_aresponses_keeps_nothing_when_the_client_asks_not_to_store(manage
         model="openai/gpt-4.1", input="hi", store=False, mock_response="yo", litellm_metadata={"user_api_key_hash": "k"}
     )
     assert manager.stats().commits == 0
+
+
+def test_cache_affinity_keys_openai_and_xai_but_never_overrides_the_client():
+    from litellm.sessions.responses import cache_affinity
+
+    assert cache_affinity("xai", "s1", {}) == {"prompt_cache_key": "s1"}
+    assert cache_affinity("openai", "s1", {}) == {"prompt_cache_key": "s1"}
+    assert cache_affinity("anthropic", "s1", {}) == {}
+    assert cache_affinity("xai", "s1", {"prompt_cache_key": "mine"}) == {}
+
+
+async def test_calls_made_by_a_session_aware_caller_are_not_tracked_twice(manager):
+    from litellm.sessions.responses import MANAGED_BY_CALLER
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="hi",
+        mock_response="yo",
+        litellm_metadata={"user_api_key_hash": "k", MANAGED_BY_CALLER: True},
+    )
+    assert manager.stats().commits == 0

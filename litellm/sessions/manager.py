@@ -58,6 +58,10 @@ class SessionManager:
         self._forks = 0
         self._evictions = 0
 
+    @property
+    def budget_bytes(self) -> int:
+        return self._budget
+
     def resolve(self, response_id: str, owner: str) -> Resolution:
         session_id: Final = self._by_response.get(response_id)
         session: Final = self._sessions.get(session_id) if session_id is not None else None
@@ -77,8 +81,9 @@ class SessionManager:
         output: Sequence[Item],
         response_id: str,
         now: float,
+        new_session_id: str | None = None,
     ) -> Session:
-        session: Final = self._next_session(owner, prior, turn_input, output, response_id, now)
+        session: Final = self._next_session(owner, prior, turn_input, output, response_id, now, new_session_id)
         self._sessions[session.id] = session
         self._sessions.move_to_end(session.id)
         self._sizes[session.id] = session.size()
@@ -104,10 +109,20 @@ class SessionManager:
         output: Sequence[Item],
         response_id: str,
         now: float,
+        new_session_id: str | None,
     ) -> Session:
         if prior is None:
             return _built(
-                uuid.uuid4().hex, owner, (), frozenset(), MappingProxyType({}), 0, turn_input, output, response_id, now
+                new_session_id or uuid.uuid4().hex,
+                owner,
+                (),
+                frozenset(),
+                MappingProxyType({}),
+                0,
+                turn_input,
+                output,
+                response_id,
+                now,
             )
         base: Final = self._sessions.get(prior.session.id, prior.session)
         end: Final = prior.session.responses[prior.response_id]

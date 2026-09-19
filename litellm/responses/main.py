@@ -69,7 +69,7 @@ else:
     MCPTool = Any
 
 from litellm.sessions import Forbidden
-from litellm.sessions.responses import PendingTurn, begin_turn
+from litellm.sessions.responses import MANAGED_BY_CALLER, PendingTurn, begin_turn, turn_affinity
 
 from .streaming_iterator import BaseResponsesAPIStreamingIterator
 
@@ -737,6 +737,7 @@ async def aresponses(
             service_tier=service_tier,
             safety_identifier=safety_identifier,
             **kwargs,
+            **turn_affinity(session_turn, custom_llm_provider, kwargs),
         )
 
         ctx: Final = contextvars.copy_context()
@@ -785,6 +786,8 @@ def _begin_session_turn(
     if manager is None:
         return None
     metadata: Final = kwargs.get("litellm_metadata")
+    if isinstance(metadata, dict) and metadata.get(MANAGED_BY_CALLER):
+        return None
     owner: Final = metadata.get("user_api_key_hash") if isinstance(metadata, dict) else None
     return begin_turn(manager, previous_response_id, turn_input, owner if isinstance(owner, str) else "")
 

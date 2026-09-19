@@ -694,6 +694,7 @@ from litellm.proxy.response_api_endpoints.endpoints import router as response_ro
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.route_priority import hot_routes_first
 from litellm.proxy.search_endpoints.endpoints import router as search_router
+from litellm.proxy.sessions import configured_session_manager
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
 from litellm.proxy.spend_tracking.daily_global_spend_rollup import (
@@ -6224,6 +6225,9 @@ class ProxyConfig:
 
             log_once_if_budget_reservation_disabled(
                 disabled=general_settings.get("disable_budget_reservation") is True,
+            )
+            litellm.session_manager = configured_session_manager(
+                general_settings.get("session_manager"), litellm.session_manager
             )
 
             custom_key_generate: Final = general_settings.get("custom_key_generate", None)

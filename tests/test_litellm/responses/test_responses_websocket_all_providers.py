@@ -3357,9 +3357,11 @@ class TestManagedHandlerWithSessionManager:
         )
 
     @staticmethod
-    def _fake_aresponses(calls):
+    def _fake_aresponses(calls, keys=None):
+        keys = [] if keys is None else keys
         async def fake(*args, **kwargs):
             calls.append(kwargs["input"])
+            keys.append(kwargs.get("prompt_cache_key"))
             n = len(calls)
 
             async def stream():
@@ -3428,3 +3430,25 @@ class TestManagedHandlerWithSessionManager:
         assert len(calls) == 1
         sent = json.loads(intruder.websocket.send_text.call_args.args[0])
         assert sent["type"] == "error" and sent["error"]["type"] == "invalid_request_error"
+
+
+    @pytest.mark.asyncio
+    async def test_every_turn_of_a_session_uses_one_upstream_cache_key(self, monkeypatch):
+        import json
+
+        import litellm
+        from litellm.sessions import Resolved, SessionManager
+
+        calls: list = []
+        keys: list = []
+        monkeypatch.setattr(litellm, "aresponses", self._fake_aresponses(calls, keys))
+        manager = SessionManager()
+        handler = self._handler(manager, "key-a")
+        await handler._process_response_create(json.dumps({"type": "response.create", "input": "one"}))
+        await handler._process_response_create(
+            json.dumps({"type": "response.create", "previous_response_id": "resp_1", "input": "two"})
+        )
+
+        stored = manager.resolve("resp_2", "key-a")
+        assert isinstance(stored, Resolved)
+        assert keys == [stored.session.id, stored.session.id]

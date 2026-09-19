@@ -2566,6 +2566,13 @@ class ScheduledJobStaggerSettings(LiteLLMPydanticObjectBase):
     )
 
 
+class SessionManagerSettings(LiteLLMPydanticObjectBase):
+    enabled: bool = False
+    budget_mb: int = Field(
+        256, ge=1, description="Memory held by live sessions before the least recently used are evicted"
+    )
+
+
 class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     """
     Documents all the fields supported by `general_settings` in config.yaml
@@ -3018,6 +3025,13 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "before enabling, or nobody can sign in to the UI. A locked-out admin can still "
             "administer the proxy over the API with the master key, and can unset this setting "
             "and restart the proxy to restore env-credential login. Default is False."
+        ),
+    )
+    session_manager: SessionManagerSettings | None = Field(
+        None,
+        description=(
+            "Gateway-owned Responses API sessions: previous_response_id resolves to history the proxy holds, "
+            "for every provider, bound to the key that created it"
         ),
     )
     disable_budget_reservation: bool | None = Field(

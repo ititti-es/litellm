@@ -38,7 +38,7 @@ from litellm.responses.litellm_completion_transformation.transformation import (
 )
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
 from litellm.sessions import Forbidden, Item, Resolution, Resolved, SessionManager
-from litellm.sessions.responses import provider_response_id
+from litellm.sessions.responses import MANAGED_BY_CALLER, cache_affinity, provider_response_id
 from litellm.types.integrations.custom_logger import converted_stream_requested
 from litellm.types.llms.openai import (
     PART_UNION_TYPES,
@@ -2560,6 +2560,7 @@ class ManagedResponsesWebSocketHandler:
         completed_event: _MutableJsonObject | None,
         resolution: Resolution | None,
         current_messages: list[dict[str, object]],
+        session_key: str,
     ) -> None:
         response_id: Final = self._extract_response_id(completed_event) if completed_event is not None else None
         if self.session_manager is None or response_id is None:
@@ -2571,6 +2572,7 @@ class ManagedResponsesWebSocketHandler:
             output=self._extract_output_items(completed_event),
             response_id=response_id,
             now=time.time(),
+            new_session_id=session_key,
         )
 
     @staticmethod
@@ -2758,6 +2760,11 @@ class ManagedResponsesWebSocketHandler:
             call_kwargs["custom_llm_provider"] = self.custom_llm_provider
         if self.litellm_metadata:
             call_kwargs["litellm_metadata"] = dict(self.litellm_metadata)
+        if self.session_manager is not None:
+            call_kwargs["litellm_metadata"] = {  # mutable-ok: litellm_metadata travels to litellm.aresponses as a dict
+                **self.litellm_metadata,
+                MANAGED_BY_CALLER: True,
+            }
 
     @staticmethod
     def _update_proxy_request(call_kwargs: dict[str, Any], model: str) -> None:
@@ -2905,8 +2912,11 @@ class ManagedResponsesWebSocketHandler:
             else []  # mutable-ok: same legacy list contract as above
         )
 
+        session_key: Final = resolution.session.id if isinstance(resolution, Resolved) else uuid.uuid4().hex
         self._apply_history(call_kwargs, previous_response_id, current_messages, prior_history)
         self._inject_credentials(call_kwargs, model=model)
+        if self.session_manager is not None:
+            call_kwargs.update(cache_affinity(self._resolve_provider(model), session_key, call_kwargs))
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
         call_kwargs.update(self.extra_kwargs)
 
@@ -2918,7 +2928,7 @@ class ManagedResponsesWebSocketHandler:
             return
 
         if self.session_manager is not None:
-            self._commit_turn(completed_event, resolution, current_messages)
+            self._commit_turn(completed_event, resolution, current_messages, session_key)
             return
         self._save_turn_history(completed_event, prior_history, current_messages)
 
