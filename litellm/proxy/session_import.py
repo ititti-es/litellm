@@ -2,6 +2,7 @@
 
     python -m litellm.proxy.session_import opencode [--source ~/.local/share/opencode/opencode.db] [--owner-key sk-...]
     python -m litellm.proxy.session_import openclaw [--source ~/.openclaw] [--owner-key sk-...]
+    python -m litellm.proxy.session_import claude-code [--source ~/.claude/projects] [--owner-key sk-...]
     python -m litellm.proxy.session_import pin|unpin SESSION_ID
 
 Sources are read from a private copy, never written. Re-running is safe: a session that grew since the last
@@ -32,6 +33,7 @@ from litellm.repositories.conversation_session_repository import (
     StoredTranscript,
     jsonb_text,
 )
+from litellm.sessions.importers.claude_code import DEFAULT_PROJECTS_DIR, read_claude_code
 from litellm.sessions.importers.common import ImportedSession
 from litellm.sessions.importers.openclaw import read_openclaw
 from litellm.sessions.importers.opencode import read_opencode
@@ -41,7 +43,14 @@ _DEFAULT_SOURCES: Final = MappingProxyType(
     {
         "opencode": Path.home() / ".local" / "share" / "opencode" / "opencode.db",
         "openclaw": Path(os.environ.get("OPENCLAW_STATE_DIR", Path.home() / ".openclaw")),
+        "claude-code": Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects"
+        if os.environ.get("CLAUDE_CONFIG_DIR")
+        else DEFAULT_PROJECTS_DIR,
     }
+)
+
+_READERS: Final = MappingProxyType(
+    {"opencode": read_opencode, "openclaw": read_openclaw, "claude-code": read_claude_code}
 )
 
 
@@ -164,7 +173,7 @@ async def _main(args: argparse.Namespace) -> int:
             return 0 if found else 1
         source: Final = Path(args.source).expanduser() if args.source else _DEFAULT_SOURCES[args.command]
         owner: Final = hash_token(args.owner_key) if args.owner_key else f"archive:{args.command}"
-        reader: Final = read_opencode if args.command == "opencode" else read_openclaw
+        reader: Final = _READERS[args.command]
         scratch: Final = Path(args.scratch_dir).expanduser() if args.scratch_dir else None
         for line in await run_import(reader(source, scratch), owner, repository):
             sys.stdout.write(line + "\n")
@@ -177,7 +186,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--database-url", help="defaults to $DATABASE_URL")
     commands: Final = parser.add_subparsers(dest="command", required=True)
-    for name in ("opencode", "openclaw"):
+    for name in _READERS:
         sub = commands.add_parser(name, help=f"import {name} sessions")  # rebind-ok: one subcommand per iteration
         sub.add_argument("--source", help=f"defaults to {_DEFAULT_SOURCES[name]}")
         sub.add_argument("--owner-key", help="the virtual key that may continue these sessions")

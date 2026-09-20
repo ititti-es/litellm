@@ -38,7 +38,8 @@ from .common_utils import (
     is_missing_session,
     session_uuid,
 )
-from .transformation import parse_cli_output, render_prompt, system_prompt_of, to_model_response
+from .sync import SyncRequest, sync_transcript
+from .transformation import CliResult, parse_cli_output, render_prompt, system_prompt_of, to_model_response
 
 
 class CommandRunner(Protocol):
@@ -282,6 +283,32 @@ def _plan(
     )
 
 
+def _projects_dir(params: Mapping[str, object]) -> str | None:
+    config_dir: Final = params.get("claude_cli_config_dir")
+    return (
+        os.path.join(os.path.expanduser(config_dir), "projects") if isinstance(config_dir, str) and config_dir else None
+    )
+
+
+def _record_transcript(result: CliResult, session: str | None, params: Mapping[str, object]) -> None:
+    """Hand the finished turn to the transcript store, which reads it from Claude Code's own record.
+
+    The CLI reports the session it actually used, which is the one we asked for on a resumed conversation and
+    one of its own choosing on a single-shot call; either way it is what the transcript is filed under.
+    """
+    session_id: Final = result.get("session_id") or session
+    if not session_id:
+        return
+    sync_transcript(
+        SyncRequest(
+            session_id=session_id,
+            owner=_owner(params),
+            client_session_id=_session_key(params),
+            projects_dir=_projects_dir(params),
+        )
+    )
+
+
 def _finish(
     returncode: int,
     stdout: str,
@@ -289,12 +316,14 @@ def _finish(
     session: str | None,
     model: str,
     model_response: ModelResponse,
+    params: Mapping[str, object] = _NO_PARAMS,
 ) -> ModelResponse:
     if returncode != 0:
         raise ClaudeCLIError(f"Claude CLI exited {returncode}: {(stderr or stdout).strip()[:400]}")
     result: Final = parse_cli_output(stdout)
     if session:
         _STARTED_SESSIONS.add(session)
+    _record_transcript(result, session, params)
     return to_model_response(result, model, model_response)
 
 
@@ -347,7 +376,7 @@ class ClaudeCLIHandler(CustomLLM):
             )
             returncode, stdout, stderr = self._run(command, env, token, wait)
 
-        return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse())
+        return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
 
     async def acompletion(  # pyright: ignore[reportIncompatibleMethodOverride]  # see completion
         self,
@@ -384,7 +413,7 @@ class ClaudeCLIHandler(CustomLLM):
             )
             returncode, stdout, stderr = await self._run_async(command, env, token, wait)
 
-        return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse())
+        return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
 
 
 claude_cli_handler: Final = ClaudeCLIHandler()

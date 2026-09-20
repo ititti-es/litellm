@@ -328,3 +328,81 @@ async def test_the_async_path_behaves_like_the_sync_one():
     assert response.choices[0].message.content == "ok"
     assert runner.flag("--session-id") == session_uuid("anonymous", "s-async")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in runner.calls[0]["env"]
+
+
+# --- reporting the turn to the transcript store -----------------------------------------------------
+
+
+@pytest.fixture
+def reported():
+    """Whatever the provider hands the transcript sync, if anything."""
+    from litellm.llms.claude_cli.sync import set_transcript_sync
+
+    collected = []
+    set_transcript_sync(collected.append)
+    yield collected
+    set_transcript_sync(None)
+
+
+def test_a_finished_turn_is_reported_for_storing(reported):
+    handler = ClaudeCLIHandler(run=_Runner())
+
+    _complete(
+        handler,
+        _messages(("user", "hi")),
+        litellm_session_id="s-store",
+        metadata={"user_api_key_hash": "hashed-key"},
+        api_key="sk-ant-oat01-x",
+    )
+
+    assert len(reported) == 1
+    assert reported[0].session_id == "4f0af742-dddb-4b02-95f1-ae56834c6cb2"
+    assert reported[0].owner == "hashed-key"
+    assert reported[0].client_session_id == "s-store"
+    assert reported[0].projects_dir is None
+
+
+def test_a_deployments_own_claude_home_is_where_its_transcripts_are(reported):
+    handler = ClaudeCLIHandler(run=_Runner())
+
+    _complete(handler, _messages(("user", "hi")), claude_cli_config_dir="/srv/claude", api_key="sk-ant-oat01-x")
+
+    assert reported[0].projects_dir == "/srv/claude/projects"
+
+
+def test_a_failed_turn_has_no_transcript_to_report(reported):
+    handler = ClaudeCLIHandler(run=_Runner((1, "", "boom")))
+
+    with pytest.raises(ClaudeCLIError):
+        _complete(handler, _messages(("user", "hi")), api_key="sk-ant-oat01-x")
+
+    assert reported == []
+
+
+def test_storing_the_transcript_cannot_break_the_answer(reported):
+    """A turn the caller paid for is not failed by a problem writing it down."""
+    from litellm.llms.claude_cli.sync import set_transcript_sync
+
+    def explode(request):
+        raise RuntimeError("no database today")
+
+    set_transcript_sync(explode)
+    handler = ClaudeCLIHandler(run=_Runner())
+
+    response = _complete(handler, _messages(("user", "hi")), api_key="sk-ant-oat01-x")
+
+    assert response.choices[0].message.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_the_async_path_reports_its_turn_too(reported):
+    handler = ClaudeCLIHandler(run_async=_AsyncRunner())
+
+    await handler.acompletion(
+        model="claude_cli/claude-sonnet-5",
+        messages=_messages(("user", "hi")),
+        model_response=ModelResponse(),
+        litellm_params={"litellm_session_id": "s-async", "api_key": "sk-ant-oat01-x"},
+    )
+
+    assert [request.client_session_id for request in reported] == ["s-async"]

@@ -36,7 +36,9 @@ Checked against LiteLLM's Responses API documentation and this tree.
 - **`cache_clock.py`** – learned warm-window estimate per provider and model.
 - **`compaction*.py`** – compaction just before predicted expiry, its policies and size thresholds
   (see `COMPACTION.md`).
-- **`importers/`** – opencode and openclaw histories as neutral Responses items (see `../proxy/session_import.py`).
+- **`importers/`** – opencode, openclaw and Claude Code histories as neutral Responses items
+  (see `../proxy/session_import.py`). The Claude Code reader is also what keeps the store level with the
+  `claude_cli` provider, whose conversation lives in Claude Code rather than in anything the proxy saw.
 - **`MEMORY_DESIGN.md`** – direction only; nothing built.
 
 Proxy wiring lives in `litellm/proxy/sessions.py`, storage in

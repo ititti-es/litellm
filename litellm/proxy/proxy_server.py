@@ -691,6 +691,7 @@ from litellm.proxy.public_endpoints.public_v1 import router as public_v1_router
 from litellm.proxy.rag_endpoints.endpoints import router as rag_router
 from litellm.proxy.rerank_endpoints.endpoints import router as rerank_router
 from litellm.proxy.response_api_endpoints.endpoints import router as response_router
+from litellm.proxy.claude_cli_sync import attach_claude_cli_sync, drain_claude_cli_sync
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.oauth_credential_store import use_database_oauth_credentials
 from litellm.proxy.route_priority import hot_routes_first
@@ -1415,6 +1416,8 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     if transcript_repository is not None:
         asyncio.create_task(sweep_expired_transcripts(transcript_repository))
+    # Claude Code owns the transcript of a `claude_cli` conversation, so its record is read from there.
+    attach_claude_cli_sync(transcript_repository)
     compaction_task: Final = start_compaction(  # held so the loop is not garbage collected mid-run
         litellm.session_manager, general_settings.get("session_manager"), transcript_repository, lambda: llm_router
     )
@@ -1457,6 +1460,7 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
         compaction_task.cancel()
     if litellm.session_manager is not None:
         await litellm.session_manager.flush()
+    await drain_claude_cli_sync()
 
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:

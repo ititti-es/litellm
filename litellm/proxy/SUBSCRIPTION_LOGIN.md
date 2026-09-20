@@ -256,10 +256,30 @@ tokens per conversation and, with tools disabled, makes the model emit tool-call
 
 Two consequences worth knowing:
 
-- **The session manager does not apply to this provider.** Claude Code owns the transcript, its caching and
-  its own compaction. Layering the gateway's transcript on top would be two owners for one conversation,
-  which is the duplication this fork exists to remove.
+- **The session manager does not drive this provider.** Claude Code owns the transcript, its caching and its
+  own compaction. Layering the gateway's transcript on top would be two owners for one conversation, which
+  is the duplication this fork exists to remove. The gateway still keeps a *record* of it; see below.
 - **A subprocess per request** costs process startup and rules out streaming today.
+
+### Where the transcript goes
+
+Because only the newest message passes through the proxy, a stored transcript built from what the gateway
+saw would hold a conversation's last exchange and nothing else -- no history, and nothing Claude Code did to
+produce the answer. So the record is read from where it actually exists.
+
+After each turn the provider reports the session; `litellm/proxy/claude_cli_sync.py` reads Claude Code's own
+transcript (`~/.claude/projects/<project>/<session-id>.jsonl`) and imports it through the same path as any
+other harness history, as `source = claude_code`. Re-importing appends only what is new, so a turn costs one
+read of a file the harness has just written. The session row carries the caller's `litellm_session_id`, so
+the stored transcript lines up with their own session identity, and the owner is the key that was billed.
+
+This is on wherever the session manager already stores transcripts (`session_manager.store_transcripts` with
+a database), and off everywhere else -- a library call or a CLI login stores nothing. It runs after the
+answer has gone back, and a failure to store is logged, never raised: a gap in the record is not a failed
+request.
+
+The same reader backs `python -m litellm.proxy.session_import claude-code`, which archives sessions Claude
+Code ran outside the proxy entirely.
 
 ## What this deliberately does not do
 
