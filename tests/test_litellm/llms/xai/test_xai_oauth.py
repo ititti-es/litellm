@@ -786,7 +786,7 @@ def test_proxy_cli_xai_oauth_login_uses_single_authenticator(monkeypatch):
         def __init__(self):
             instances.append(self)
 
-        def login(self):
+        def login(self, force=False, no_browser=False):
             return {"expires_at": 1234567890}
 
     monkeypatch.setattr(
@@ -798,4 +798,6 @@ def test_proxy_cli_xai_oauth_login_uses_single_authenticator(monkeypatch):
     assert result.exit_code == 0
     assert len(instances) == 1
     assert "Credentials saved to /tmp/xai-oauth-auth.json" in result.output
-    assert "Access token expires at 1234567890" in result.output
+    # The expiry is now rendered for a reader instead of printed as a raw unix timestamp.
+    assert "Access token expires at 2009-" in result.output
+    assert "(expired)" in result.output

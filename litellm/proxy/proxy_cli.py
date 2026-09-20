@@ -1005,14 +1005,9 @@ def run_server(
     prometheus_metrics_port: int | None,
 ):
     if cli_args:
-        if cli_args == ("xai-oauth", "login"):
-            from litellm.llms.xai.oauth import XAIOAuthAuthenticator
+        from litellm.proxy.oauth_cli import handle_oauth_command
 
-            authenticator: Final = XAIOAuthAuthenticator()
-            auth_data: Final = authenticator.login()
-            click.echo(f"xAI OAuth login successful. Credentials saved to {authenticator.auth_file}.")
-            if auth_data.get("expires_at"):
-                click.echo(f"Access token expires at {auth_data['expires_at']}.")
+        if handle_oauth_command(cli_args):
             return
         raise click.UsageError(f"Unknown command: {' '.join(cli_args)}")
 

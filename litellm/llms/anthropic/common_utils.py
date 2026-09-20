@@ -232,6 +232,30 @@ def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tup
     return headers, api_key
 
 
+def _optional_anthropic_oauth_token(litellm_params: dict, model: str) -> str | None:
+    """Return a Claude Pro/Max OAuth access token when the deployment asks for one.
+
+    Only consulted once no API key has been resolved, so an explicit key always wins. The token carries the
+    `sk-ant-oat` prefix, so header construction downstream already treats it as OAuth.
+    """
+    from litellm.llms.anthropic.oauth import (
+        AnthropicOAuthAuthenticator,
+        AnthropicOAuthError,
+        should_use_anthropic_oauth,
+    )
+
+    if not should_use_anthropic_oauth(litellm_params):
+        return None
+    try:
+        return AnthropicOAuthAuthenticator().get_access_token()
+    except AnthropicOAuthError as exc:
+        raise litellm.AuthenticationError(
+            message=str(exc),
+            llm_provider="anthropic",
+            model=model,
+        ) from exc
+
+
 class _EagerInputStreamingFunction(BaseModel):
     eager_input_streaming: StrictBool | None = None
 
@@ -960,6 +984,8 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         # Check for Anthropic OAuth token in headers
         headers, api_key = optionally_handle_anthropic_oauth(headers=headers, api_key=api_key)
         api_key = AnthropicModelInfo.get_api_key(api_key)
+        if api_key is None:
+            api_key = _optional_anthropic_oauth_token(litellm_params, model)
         # Resolve auth_token from ANTHROPIC_AUTH_TOKEN if api_key is not set
         auth_token: str | None = None
         if api_key is None:

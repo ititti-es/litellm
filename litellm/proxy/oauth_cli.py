@@ -1,0 +1,170 @@
+"""`litellm <provider> login|logout|status` for subscription-backed providers.
+
+A gateway must not discover that it needs a login in the middle of serving a request: the ChatGPT device
+flow, for instance, prints a code and blocks for up to fifteen minutes. These commands move every login to
+an explicit, interactive step an operator runs before the proxy starts.
+
+The provider modules own the flows; this only dispatches to them and reports what happened. Stored records
+are read as plain JSON rather than through each authenticator, so this stays clear of their internals.
+"""
+
+import json
+import os
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import Final
+
+import click
+
+ACTIONS: Final = ("login", "logout", "status")
+
+
+class _OAuthCommandError(Exception):
+    """A login command failed for a reason worth printing without a traceback."""
+
+
+def _read_record(path: str) -> Mapping[str, object] | None:
+    try:
+        with open(path, "r") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _delete_record(path: str) -> bool:
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def _fmt_expiry(expires_at: object) -> str:
+    if not isinstance(expires_at, (int, float)):
+        return "unknown"
+    remaining: Final = float(expires_at) - time.time()
+    stamp: Final = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(expires_at)))
+    if remaining <= 0:
+        return f"{stamp} (expired)"
+    return f"{stamp} (in {int(remaining // 60)}m)"
+
+
+def _report_login(name: str, auth_file: str, expires_at: object) -> None:
+    click.echo(f"{name} OAuth login successful. Credentials saved to {auth_file}.")
+    if expires_at is not None:
+        click.echo(f"Access token expires at {_fmt_expiry(expires_at)}.")
+
+
+def _report_status(name: str, auth_file: str, login_command: str) -> None:
+    record: Final = _read_record(auth_file)
+    if not record or not record.get("access_token"):
+        click.echo(f"{name}: not logged in. Run `{login_command}`.")
+        return
+    click.echo(f"{name}: logged in ({auth_file}).")
+    click.echo(f"  access token expires at {_fmt_expiry(record.get('expires_at'))}")
+    for label, key in (("scope", "scope"), ("account", "account_id")):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            click.echo(f"  {label}: {value}")
+
+
+def _report_logout(name: str, removed: bool) -> None:
+    click.echo(f"{name}: credentials removed." if removed else f"{name}: no stored credentials.")
+
+
+def _prompt_for_code(authorize_url: str) -> str:
+    click.echo("Open this URL in a browser on any machine, then paste the result below:")
+    click.echo(authorize_url)
+    return click.prompt("Authorization code (or the full redirect URL)", type=str)
+
+
+def _anthropic(action: str, flags: Sequence[str]) -> None:
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator, AnthropicOAuthError
+
+    authenticator: Final = AnthropicOAuthAuthenticator()
+    name: Final = "Anthropic (Claude Pro/Max)"
+    if action == "status":
+        _report_status(name, authenticator.auth_file, "litellm anthropic-oauth login")
+        return
+    if action == "logout":
+        _report_logout(name, authenticator.logout())
+        return
+    manual: Final = "--manual" in flags
+    try:
+        record: Final = authenticator.login(
+            force="--force" in flags,
+            no_browser=manual or "--no-browser" in flags,
+            prompt_for_code=_prompt_for_code if manual else None,
+        )
+    except AnthropicOAuthError as exc:
+        raise _OAuthCommandError(str(exc)) from exc
+    _report_login(name, authenticator.auth_file, record.get("expires_at"))
+
+
+def _xai(action: str, flags: Sequence[str]) -> None:
+    from litellm.llms.xai.oauth import XAIOAuthAuthenticator, XAIOAuthError
+
+    authenticator: Final = XAIOAuthAuthenticator()
+    name: Final = "xAI (SuperGrok)"
+    if action == "status":
+        _report_status(name, authenticator.auth_file, "litellm xai-oauth login")
+        return
+    if action == "logout":
+        _report_logout(name, _delete_record(authenticator.auth_file))
+        return
+    try:
+        record: Final = authenticator.login(force="--force" in flags, no_browser="--no-browser" in flags)
+    except XAIOAuthError as exc:
+        raise _OAuthCommandError(str(exc)) from exc
+    _report_login(name, authenticator.auth_file, record.get("expires_at"))
+
+
+def _chatgpt(action: str, flags: Sequence[str]) -> None:
+    from litellm.llms.chatgpt.authenticator import Authenticator
+    from litellm.llms.chatgpt.common_utils import GetAccessTokenError, GetDeviceCodeError
+
+    authenticator: Final = Authenticator()
+    name: Final = "ChatGPT (Codex subscription)"
+    if action == "status":
+        _report_status(name, authenticator.auth_file, "litellm chatgpt login")
+        return
+    if action == "logout":
+        _report_logout(name, _delete_record(authenticator.auth_file))
+        return
+    if "--force" in flags:
+        _delete_record(authenticator.auth_file)
+    try:
+        authenticator.get_access_token()
+    except (GetAccessTokenError, GetDeviceCodeError) as exc:
+        raise _OAuthCommandError(str(exc)) from exc
+    stored: Final = _read_record(authenticator.auth_file)
+    _report_login(name, authenticator.auth_file, stored.get("expires_at") if stored else None)
+
+
+_PROVIDERS: Final[Mapping[str, Callable[[str, Sequence[str]], None]]] = {  # mutable-ok: dispatch table constant
+    "anthropic-oauth": _anthropic,
+    "xai-oauth": _xai,
+    "chatgpt": _chatgpt,
+}
+
+
+def handle_oauth_command(cli_args: Sequence[str]) -> bool:
+    """Run `<provider> <action> [flags]` if that is what was asked for.
+
+    Returns True when the arguments were handled, so the caller can fall through to starting the proxy for
+    anything else.
+    """
+    if len(cli_args) < 2:
+        return False
+    provider, action = cli_args[0], cli_args[1]
+    runner: Final = _PROVIDERS.get(provider)
+    if runner is None:
+        return False
+    if action not in ACTIONS:
+        raise click.UsageError(f"Unknown action '{action}' for {provider}. Expected one of: {', '.join(ACTIONS)}.")
+    try:
+        runner(action, tuple(cli_args[2:]))
+    except _OAuthCommandError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return True
