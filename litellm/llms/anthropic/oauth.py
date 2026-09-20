@@ -66,7 +66,7 @@ def _default_token_dir() -> str:
     return os.path.expanduser("~/.config/litellm/anthropic_oauth")
 
 
-def _json_headers() -> dict[str, str]:
+def _json_headers() -> dict[str, str]:  # mutable-ok: httpx's post() requires a dict for headers
     return {"Accept": "application/json", "Content-Type": "application/json"}  # mutable-ok: fresh per request
 
 
@@ -324,7 +324,7 @@ class AnthropicOAuthAuthenticator:
         }
         return f"{ANTHROPIC_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
-    def _post_token(self, body: dict[str, str]) -> _TokenPayload:
+    def _post_token(self, body: dict[str, str]) -> _TokenPayload:  # mutable-ok: passed as httpx's json=
         try:
             response: Final = self._client().post(
                 ANTHROPIC_OAUTH_TOKEN_URL,

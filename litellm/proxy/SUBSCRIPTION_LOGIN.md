@@ -157,8 +157,76 @@ The ChatGPT provider forwards `litellm_session_id` upstream as a `session_id` he
 identity the session manager keys a session's `prompt_cache_key` on — so a compacted session and the Codex
 backend agree on what the session is without any extra wiring.
 
+## Anthropic: why the login alone is not enough
+
+A Claude Pro/Max OAuth token is accepted by Anthropic's account endpoints but refused for inference on
+`/v1/messages`, which answers a generic `rate_limit_error` with quota to spare. Measured here: the same
+token returned 200 from `api.anthropic.com/api/oauth/usage` (five-hour utilisation 77%, seven-day 51%)
+while every `/v1/messages` call was rejected. Anthropic issues these tokens to Claude Code and appears to
+serve inference only to it.
+
+So a Claude subscription is spent by **running Claude Code**, which is what openclaw does and what the
+`claude_cli` provider does here. It uses Claude Code's documented headless mode (`claude --print`); it does
+not imitate Claude Code to the API.
+
+```yaml
+litellm_settings:
+  custom_provider_map:
+    - provider: claude_cli
+      custom_handler: litellm.llms.claude_cli.handler.claude_cli_handler
+
+model_list:
+  - model_name: claude-sub
+    litellm_params:
+      model: claude_cli/claude-sonnet-5
+```
+
+It registers through `custom_provider_map`, so no core dispatch code changes and the fork stays easy to
+rebase. `litellm anthropic-oauth login` supplies the credential; `ANTHROPIC_API_KEY` or an explicit
+`api_key` is used instead when present.
+
+| setting | default | meaning |
+|---|---|---|
+| `claude_cli_allowed_tools` | none | tools to permit, e.g. `["Read", "Grep"]` |
+| `claude_cli_timeout` | 600 | seconds before the subprocess is killed |
+| `claude_cli_config_dir` | Claude Code's own | `CLAUDE_CONFIG_DIR` for the subprocess |
+| `CLAUDE_CLI_PATH` (env) | `claude` | where the binary lives |
+
+**Tools are off unless a deployment names them.** Claude Code can read files and run shell commands, so a
+gateway serving requests with tools enabled would hand every caller code execution on the proxy host. Enable
+them only where every caller is trusted.
+
+The credential goes to the subprocess on file descriptor 3, never in its environment or argv, both of which
+are readable through `/proc`. `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are scrubbed from the child
+environment so an ambient one cannot be used by accident.
+
+### How a conversation continues
+
+Claude Code owns the transcript. The first turn opens a session with `--session-id`; later turns pass
+`--resume` and send only the newest message, so Claude Code keeps its own prefix warm — a second turn costs
+a handful of input tokens rather than the whole history. The session id is a UUID derived from the owner and
+`litellm_session_id`, so nothing is stored to map between them and a gateway restart resumes the same
+conversation. Two API keys cannot collide: the owner is part of the derivation.
+
+If Claude Code no longer has the session, the turn is retried once as a new session carrying the whole
+conversation, so a cleared history costs a cache miss rather than an error.
+
+Claude Code's own system prompt is **replaced** rather than appended to. Left in place it costs about 3,700
+tokens per conversation and, with tools disabled, makes the model emit tool-call syntax as plain text
+(`<invoke name="Write">…`) because the prompt still advertises tools.
+
+Two consequences worth knowing:
+
+- **The session manager does not apply to this provider.** Claude Code owns the transcript, its caching and
+  its own compaction. Layering the gateway's transcript on top would be two owners for one conversation,
+  which is the duplication this fork exists to remove.
+- **A subprocess per request** costs process startup and rules out streaming today.
+
 ## What this deliberately does not do
 
+- **No impersonation.** Getting a Pro/Max token accepted on `/v1/messages` would mean presenting the
+  gateway as Claude Code. That is circumventing an access control Anthropic put there deliberately, so the
+  provider runs the real client instead.
 - **No credential pool.** Hermes keeps several credentials per provider and fails over between them on rate
   limits. LiteLLM's router already does multi-deployment failover, so a pool here would be a second
   mechanism for the same thing.
