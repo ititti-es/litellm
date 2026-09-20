@@ -122,6 +122,12 @@ model_list:
 The ChatGPT provider is subscription-only and needs no flag; it reaches `chatgpt.com/backend-api/codex`
 rather than the public API.
 
+**An API key in the environment wins over the flag.** `use_xai_oauth` and `use_anthropic_oauth` are only
+consulted once no key has been resolved, and resolution includes `XAI_API_KEY` / `ANTHROPIC_API_KEY` from the
+environment. A deployment carrying the flag will therefore bill to the key, silently, wherever one is set —
+which looks exactly like the subscription working. To check which was used, unset the environment variable
+and confirm the deployment still answers, or watch for the provider's OAuth base URL in a debug log.
+
 ## Where credentials are stored
 
 By default, on disk:
