@@ -1,18 +1,12 @@
-from litellm.sessions.cache_clock import (
-    CacheClock,
-    CacheSample,
-    classify,
-    estimate_ttl,
-    prior_ttl,
-    retention_hint,
-)
+from litellm.sessions.cache_clock import CacheClock, CacheSample, classify, estimate_ttl, prior_ttl, retention_hint
 
 
 def test_a_turn_counts_as_a_hit_or_miss_only_when_its_usage_can_tell():
-    assert classify(prefix_tokens=10_000, cached_tokens=9_000) is True
-    assert classify(prefix_tokens=10_000, cached_tokens=0) is False
-    assert classify(prefix_tokens=10_000, cached_tokens=2_000) is None
-    assert classify(prefix_tokens=500, cached_tokens=0) is None
+    assert classify(prefix_tokens=10_000, cached_tokens=9_000, min_cacheable=1024) is True
+    assert classify(prefix_tokens=10_000, cached_tokens=0, min_cacheable=1024) is False
+    assert classify(prefix_tokens=10_000, cached_tokens=2_000, min_cacheable=1024) is None
+    assert classify(prefix_tokens=500, cached_tokens=0, min_cacheable=1024) is None
+    assert classify(prefix_tokens=2_000, cached_tokens=0, min_cacheable=4096) is None
 
 
 def test_without_evidence_the_estimate_stays_inside_the_documented_ttl():
@@ -59,12 +53,16 @@ def test_the_fit_never_credits_a_gap_past_the_first_confident_miss():
 
 
 def test_explicit_retention_raises_the_prior():
-    one_hour = retention_hint({}, ({"content": [{"type": "input_text", "cache_control": {"ttl": "1h"}}]},))
-    assert one_hour == 3600.0
-    assert retention_hint({"prompt_cache_retention": "24h"}, ()) == 86_400.0
-    assert retention_hint({}, ({"type": "message"},)) is None
-    assert prior_ttl("anthropic", one_hour) == 3600.0
+    assert retention_hint({"prompt_cache_retention": "24h"}) == 86_400.0
+    assert retention_hint({}) is None
+    assert prior_ttl("openai", 86_400.0) == 86_400.0
     assert prior_ttl("anthropic") == 300.0
+
+
+def test_the_model_decides_what_counts_as_cacheable():
+    from litellm.sessions.cache_clock import min_cacheable_tokens
+
+    assert min_cacheable_tokens("openai/gpt-4.1") > 0
 
 
 def test_old_evidence_fades_so_the_estimate_follows_current_load():

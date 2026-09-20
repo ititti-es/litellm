@@ -239,9 +239,7 @@ class SessionManager:
         session: Final = self._sessions.get(session_id)
         if record is None or record.replay is None or session is None:
             return None
-        return self._clock.estimate(
-            record.replay.provider, record.replay.model, retention_hint(record.replay.params, session.items)
-        )
+        return self._clock.estimate(record.replay.provider, record.replay.model, retention_hint(record.replay.params))
 
     def warm_until(self, session_id: str) -> float | None:
         """When this session's cached prefix is predicted to go cold"""

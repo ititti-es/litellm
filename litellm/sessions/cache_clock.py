@@ -33,8 +33,6 @@ _PRIOR_TTL: Final = MappingProxyType(
     }
 )
 _DEFAULT_PRIOR_TTL: Final = 300.0
-# Providers cache nothing shorter than this, so a smaller prefix says nothing about the cache's lifetime
-MIN_CACHEABLE_TOKENS: Final = 1024
 _HIT_FRACTION: Final = 0.5
 _MISS_FRACTION: Final = 0.05
 _PRIOR_WEIGHT: Final = 4.0
@@ -59,9 +57,13 @@ class CacheEstimate:
     hits: int
 
 
-def classify(prefix_tokens: int, cached_tokens: int) -> bool | None:
-    """Whether a turn found the previous request's prefix cached; None when the usage cannot tell"""
-    if prefix_tokens < MIN_CACHEABLE_TOKENS:
+def classify(prefix_tokens: int, cached_tokens: int, min_cacheable: int) -> bool | None:
+    """Whether a turn found the previous request's prefix cached; None when the usage cannot tell
+
+    A prefix below what the model will cache at all (litellm.utils.get_prompt_cache_min_tokens) says
+    nothing about how long the cache lives
+    """
+    if prefix_tokens < min_cacheable:
         return None
     if cached_tokens >= prefix_tokens * _HIT_FRACTION:
         return True
@@ -76,22 +78,13 @@ def prior_ttl(provider: str, retention_hint: float | None = None, priors: Mappin
     return max(base, retention_hint) if retention_hint is not None else base
 
 
-def retention_hint(params: Mapping[str, object], items: Sequence[Mapping[str, object]]) -> float | None:
-    """The retention a request asked for explicitly, if any"""
-    if params.get("prompt_cache_retention") == "24h":
-        return 86_400.0
-    return 3_600.0 if _asks_for_hour(params.get("tools")) or _asks_for_hour(items) else None
+def retention_hint(params: Mapping[str, object]) -> float | None:
+    """Longer retention a request asked for explicitly
 
-
-def _asks_for_hour(value: object) -> bool:
-    if isinstance(value, Mapping):
-        control: Final = value.get("cache_control")
-        if isinstance(control, Mapping) and control.get("ttl") == "1h":
-            return True
-        return any(_asks_for_hour(child) for child in value.values() if isinstance(child, list | tuple | Mapping))
-    if isinstance(value, list | tuple):
-        return any(_asks_for_hour(child) for child in value)
-    return False
+    Only what the Responses request itself carries. Anthropic's `cache_control` breakpoints and their
+    5m/1h TTLs are parsed by litellm.llms.anthropic.prompt_cache_prediction, which owns that reading.
+    """
+    return 86_400.0 if params.get("prompt_cache_retention") == "24h" else None
 
 
 def estimate_ttl(samples: Sequence[CacheSample], prior_seconds: float, target: float) -> float:
@@ -125,6 +118,13 @@ def _nonincreasing_fit(samples: Sequence[CacheSample]) -> tuple[float, ...]:
     return tuple(rate for rate, _, count in blocks for _ in range(count))
 
 
+def min_cacheable_tokens(model: str) -> int:
+    """The smallest prefix this model caches at all, from LiteLLM's per-model cost map"""
+    from litellm.utils import get_prompt_cache_min_tokens
+
+    return get_prompt_cache_min_tokens(model=model)
+
+
 class CacheClock:
     """Recent cache observations per (provider, model), and the warm window they imply"""
 
@@ -150,7 +150,7 @@ class CacheClock:
         cached_tokens: int,
         observed_at: float | None = None,
     ) -> None:
-        hit: Final = classify(prefix_tokens, cached_tokens)
+        hit: Final = classify(prefix_tokens, cached_tokens, min_cacheable_tokens(model))
         if hit is None or gap_seconds < 0:
             return
         window: Final = self._samples.setdefault((provider, model), deque(maxlen=_WINDOW))  # mutable-ok: bounded window

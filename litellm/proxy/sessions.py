@@ -22,7 +22,7 @@ from litellm.repositories.conversation_session_repository import (
 )
 from litellm.repositories.prisma_protocols import DatabaseClient
 from litellm.sessions import CompactionJob, Item, ReplayBase, Session, SessionManager
-from litellm.sessions.cache_clock import MIN_CACHEABLE_TOKENS, CacheClock
+from litellm.sessions.cache_clock import CacheClock
 from litellm.sessions.compaction import CallUpstream, CompactionReply, compact, reply_from
 from litellm.sessions.compaction_policy import CompactionPolicy, policy_from
 from litellm.sessions.compaction_presets import DEFAULT, PRESETS
@@ -185,6 +185,8 @@ def _passthrough(source: Mapping[str, object]) -> Mapping[str, object]:
 
 
 _NO_CAP: Final[Mapping[str, int]] = MappingProxyType({})
+# Size is decided per job by the layered thresholds, not when candidates are gathered
+_ANY_SIZE: Final = 0
 
 
 def _output_cap(max_output_tokens: int | None) -> Mapping[str, int]:
@@ -245,7 +247,7 @@ async def _start_due(
     now: float,
     context_window: Callable[[str], int | None] | None = None,
 ) -> tuple[asyncio.Task[Session | None], ...]:
-    jobs: Final = manager.due_compactions(now, MIN_CACHEABLE_TOKENS, settings.lead_seconds)
+    jobs: Final = manager.due_compactions(now, _ANY_SIZE, settings.lead_seconds)
     if not jobs:
         return ()
     policies: Final = await asyncio.gather(
