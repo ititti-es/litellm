@@ -71,7 +71,14 @@ else:
 from litellm.sessions import Forbidden
 from litellm.sessions.compaction import replay_params
 from litellm.sessions.manager import ReplayBase
-from litellm.sessions.responses import MANAGED_BY_CALLER, PendingTurn, begin_turn, requested_policy, turn_affinity
+from litellm.sessions.responses import (
+    MANAGED_BY_CALLER,
+    PendingTurn,
+    begin_turn,
+    client_session_id_of,
+    requested_policy,
+    turn_affinity,
+)
 
 from .streaming_iterator import BaseResponsesAPIStreamingIterator
 
@@ -842,7 +849,13 @@ async def _begin_session_turn(
     if isinstance(metadata, dict) and metadata.get(MANAGED_BY_CALLER):
         return None
     owner: Final = metadata.get("user_api_key_hash") if isinstance(metadata, dict) else None
-    return await begin_turn(manager, previous_response_id, turn_input, owner if isinstance(owner, str) else "")
+    return await begin_turn(
+        manager,
+        previous_response_id,
+        turn_input,
+        owner if isinstance(owner, str) else "",
+        client_session_id_of(kwargs.get("litellm_session_id"), metadata),
+    )
 
 
 def _resolve_prompt_swapped_provider(

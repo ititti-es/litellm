@@ -23,7 +23,7 @@ Checked against LiteLLM's Responses API documentation and this tree.
 | Per-model minimum cacheable prefix | `litellm.utils.get_prompt_cache_min_tokens` | Used directly. A local 1024-token constant was retired in favour of it. |
 | Anthropic prompt-cache prediction: `cache_control` parsing, 5m/1h TTLs, observed-hit records, `/cache/prediction` | `llms/anthropic/prompt_cache_prediction.py`, `proxy/hooks/prompt_cache_prediction.py` | Owns Anthropic's *declared* TTL, for `/v1/messages`. `cache_clock` answers a different question on the Responses path — how long a prefix *actually* stays warm for a provider and model that declares nothing — and no longer parses `cache_control` itself. |
 | Prompt compression guardrails (`headroom`, `compresr`, `typesafe`) | `proxy/guardrails/` | Per-request prompt shrinking by a third party. Compaction instead rewrites the stored session once, while its cache is warm, and the result is what later turns replay. |
-| Session ids from client headers (`litellm_session_id`, e.g. opencode's `x-session-id`) | `proxy/litellm_pre_call_utils.py` | Not duplicated deliberately: see "Open" below. |
+| Session ids from client headers (`litellm_session_id`, e.g. opencode's `x-session-id`, Codex's `session-id`) | `proxy/litellm_pre_call_utils.py` | Adopted, not duplicated. It is recorded on the session (`client_session_id`, persisted in the session row's metadata) and it, not a gateway-invented id, keys the upstream cache: `prompt_cache_key = affinity_key(owner, litellm_session_id)`. The manager's own id stays opaque; see "Session identity" below. |
 | WebSocket per-connection history | `ManagedResponsesWebSocketHandler` | Still the fallback. With the manager enabled, the connection's own transcript is bypassed so a session survives reconnects and restarts. |
 | Response retrieve/delete (`GET`/`DELETE /v1/responses/{id}`) | provider passthrough | Untouched. |
 
@@ -42,10 +42,22 @@ Checked against LiteLLM's Responses API documentation and this tree.
 Proxy wiring lives in `litellm/proxy/sessions.py`, storage in
 `litellm/repositories/conversation_session_repository.py`.
 
+## Session identity
+
+There is one client-facing session identity, LiteLLM's `litellm_session_id`, and the gateway does not invent a
+second one for anything the client or the provider can see:
+
+- **Upstream cache key**: `sess_<sha256(owner + "\0" + litellm_session_id)[:32]>`. Hashed because the value is
+  client-chosen — two API keys must never share a cache key — and so the client's own id never travels upstream.
+  It is stable across gateway restarts, so a session that outlives the process still lands on a warm cache.
+- **Correlation**: the session row records `litellm_session_id` in its metadata, so stored transcripts line up
+  with spend logs and traces.
+- **Internal id**: the manager keeps minting an opaque id, and resolution stays keyed on the response ids the
+  gateway returned. A client-chosen id must not address stored history: ids are guessable, and a turn arriving
+  with no `previous_response_id` would otherwise overwrite a live session's transcript (or, for a harness that
+  resends its whole history every turn, write a new version per turn). Ownership is checked on every resolve
+  regardless.
+
 ## Open
 
-- **One session identity.** LiteLLM already derives `litellm_session_id` from client headers; the manager still
-  mints its own id. Adopting the client's (namespaced per key, since clients choose it) would remove the second
-  identity and keep a cache key stable across restarts. It needs care: a new turn arriving with no
-  `previous_response_id` on an existing session id must not overwrite that session's history.
 - Compaction calls are attributed to the session's key in metadata but may not appear in per-key spend tracking.

@@ -125,3 +125,70 @@ async def test_a_client_can_name_its_compaction_policy_in_request_metadata(manag
     assert isinstance(resolved, Resolved)
     record = manager.last_turn(resolved.session.id)
     assert record is not None and record.replay is not None and record.replay.compaction_policy == "opencode"
+
+
+def test_the_cache_key_is_the_clients_own_session_id_namespaced_per_key():
+    from litellm.sessions.responses import affinity_key
+
+    mine = affinity_key("hash-a", "ses_01ABC")
+    assert mine == affinity_key("hash-a", "ses_01ABC")
+    assert mine != affinity_key("hash-b", "ses_01ABC")
+    assert mine != affinity_key("hash-a", "ses_other")
+    assert "ses_01ABC" not in mine and mine.startswith("sess_")
+
+
+async def test_a_clients_session_id_keys_the_upstream_cache_and_is_recorded(manager):
+    from litellm.sessions.responses import affinity_key
+
+    async def turn(previous=None):
+        return await litellm.aresponses(
+            model="openai/gpt-4.1",
+            input="hi",
+            previous_response_id=previous,
+            mock_response="yo",
+            litellm_metadata={"user_api_key_hash": "key-a"},
+            litellm_session_id="ses_client_1",
+        )
+
+    first = await turn()
+    resolved = manager.resolve(_provider_id(first.id), "key-a")
+    assert isinstance(resolved, Resolved)
+    expected = affinity_key("key-a", "ses_client_1")
+    record = manager.last_turn(resolved.session.id)
+    assert record is not None and record.replay is not None
+    assert record.replay.params["prompt_cache_key"] == expected
+    assert resolved.session.client_session_id == "ses_client_1"
+
+    second = await turn(first.id)
+    continued = manager.resolve(_provider_id(second.id), "key-a")
+    assert isinstance(continued, Resolved)
+    assert continued.session.id == resolved.session.id
+    assert manager.last_turn(continued.session.id).replay.params["prompt_cache_key"] == expected
+
+
+async def test_a_restarted_gateway_keeps_the_same_upstream_cache_key(manager):
+    from litellm.sessions.responses import affinity_key
+    from litellm.sessions import SessionManager
+
+    first = await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="one",
+        mock_response="a",
+        litellm_metadata={"user_api_key_hash": "key-a"},
+        litellm_session_id="ses_client_2",
+    )
+    before = manager.last_turn(manager.resolve(_provider_id(first.id), "key-a").session.id).replay.params
+
+    litellm.session_manager = SessionManager()
+    after_restart = await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="two",
+        mock_response="b",
+        litellm_metadata={"user_api_key_hash": "key-a"},
+        litellm_session_id="ses_client_2",
+    )
+    fresh = litellm.session_manager
+    session = fresh.resolve(_provider_id(after_restart.id), "key-a").session
+    assert session.id != manager.resolve(_provider_id(first.id), "key-a").session.id
+    assert fresh.last_turn(session.id).replay.params["prompt_cache_key"] == before["prompt_cache_key"]
+    assert before["prompt_cache_key"] == affinity_key("key-a", "ses_client_2")

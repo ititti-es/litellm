@@ -315,3 +315,31 @@ async def test_sessions_below_the_bars_keep_their_history():
     settings = SessionCompactionSettings(enabled=True)
     assert await _start_due(manager, settings, call, None, manager.warm_until("s1") - 5, lambda model: 256_000) == ()
     assert called == []
+
+
+async def test_the_clients_session_id_is_stored_and_read_back():
+    import json
+    from types import MappingProxyType, SimpleNamespace
+
+    from litellm.proxy.sessions import PrismaTranscriptStore
+    from litellm.sessions import Session
+
+    repository = FakeRepository()
+    session = Session(
+        id="s1",
+        owner="k",
+        items=({"role": "user", "content": "a"},),
+        outputs=frozenset(),
+        responses=MappingProxyType({"r1": 1}),
+        version=0,
+        last_upstream_at=0.0,
+        client_session_id="ses_client_9",
+    )
+    await PrismaTranscriptStore(repository, retention=None).save(session, first_new=0, response_id="r1")
+    (write,) = repository.writes
+    assert json.loads(write.metadata) == {"litellm_session_id": "ses_client_9"}
+
+    stored = _stored([0])
+    with_metadata = stored.__class__(**{**_fields(stored), "metadata": write.metadata})
+    loaded = await PrismaTranscriptStore(FakeRepository(with_metadata), None).load("r1")
+    assert loaded is not None and loaded.client_session_id == "ses_client_9"

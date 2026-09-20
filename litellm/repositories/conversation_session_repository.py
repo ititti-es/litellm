@@ -69,6 +69,7 @@ class TurnWrite:
     items: tuple[ItemRow, ...]
     response_id: str
     item_count: int
+    metadata: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,7 @@ class StoredSession:
     last_upstream_at: datetime
     items: tuple["prisma_models.LiteLLM_ConversationItem", ...]
     responses: tuple["prisma_models.LiteLLM_ConversationResponse", ...]
+    metadata: object = None
 
 
 class _BatchWriteTable(Protocol):
@@ -127,12 +129,14 @@ class ConversationSessionRepository:
     async def save_turn(self, write: TurnWrite) -> None:
         """One committed turn, atomically: the session row, its new items, and the response that addresses them"""
         batch: Final = self._db.batch_()
-        session_fields: Final = {  # mutable-ok: Prisma payload must be a dict
+        fields: Final = {  # mutable-ok: Prisma payload must be a dict
             "owner": write.owner,
             "version": write.version,
             "last_upstream_at": write.last_upstream_at,
             "expires_at": write.expires_at,
         }
+        # mutable-ok: Prisma payload must be a dict
+        session_fields: Final = {**fields, "metadata": write.metadata} if write.metadata is not None else fields
         batch.litellm_conversationsession.upsert(
             where={"session_id": write.session_id},  # mutable-ok: Prisma where filter must be a dict
             data={  # mutable-ok: Prisma upsert payload must be a dict
@@ -234,6 +238,7 @@ class ConversationSessionRepository:
             owner=session.owner,
             version=session.version,
             last_upstream_at=session.last_upstream_at,
+            metadata=session.metadata,
             items=tuple(items),
             responses=tuple(responses),
         )

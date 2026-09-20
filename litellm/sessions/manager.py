@@ -176,8 +176,11 @@ class SessionManager:
         started_at: float | None = None,
         usage: TurnUsage | None = None,
         replay: ReplayBase | None = None,
+        client_session_id: str | None = None,
     ) -> Session:
-        session: Final = self._next_session(owner, prior, turn_input, output, response_id, now, new_session_id)
+        session: Final = self._next_session(
+            owner, prior, turn_input, output, response_id, now, new_session_id, client_session_id
+        )
         held: Final = self._sessions.get(session.id)
         first_new: Final = len(held.items) if held is not None and held.version == session.version else 0
         started: Final = started_at if started_at is not None else now
@@ -313,6 +316,7 @@ class SessionManager:
             version=live.version + 1,
             last_upstream_at=now,
             annotations=_rebased_annotations(live.annotations, job.tail_start, head, summary_at, summary_meta),
+            client_session_id=live.client_session_id,
         )
         self._hold(compacted)
         record: Final = self._turns.get(live.id)
@@ -377,6 +381,7 @@ class SessionManager:
         response_id: str,
         now: float,
         new_session_id: str | None,
+        client_session_id: str | None,
     ) -> Session:
         if prior is None:
             return _built(
@@ -390,6 +395,7 @@ class SessionManager:
                 output,
                 response_id,
                 now,
+                client_session_id=client_session_id,
             )
         base: Final = self._sessions.get(prior.session.id, prior.session)
         end: Final = prior.session.responses[prior.response_id]
@@ -406,6 +412,7 @@ class SessionManager:
                 response_id,
                 now,
                 base.annotations,
+                client_session_id or base.client_session_id,
             )
         self._forks += 1
         return _built(
@@ -420,6 +427,7 @@ class SessionManager:
             response_id,
             now,
             MappingProxyType({index: meta for index, meta in base.annotations.items() if index < end}),
+            client_session_id or base.client_session_id,
         )
 
     def _evict_over_budget(self, keep: str) -> None:
@@ -452,6 +460,7 @@ def _built(
     response_id: str,
     now: float,
     annotations: Mapping[int, Meta] | None = None,
+    client_session_id: str | None = None,
 ) -> Session:
     new_items: Final = (*items, *turn_input, *output)
     first_output: Final = len(items) + len(turn_input)
@@ -464,6 +473,7 @@ def _built(
         version=version,
         last_upstream_at=now,
         annotations=annotations if annotations is not None else MappingProxyType({}),
+        client_session_id=client_session_id,
     )
 
 

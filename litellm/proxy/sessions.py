@@ -82,6 +82,11 @@ class PrismaTranscriptStore:
                 ),
                 response_id=response_id,
                 item_count=session.responses[response_id],
+                metadata=(
+                    jsonb_text(MappingProxyType({"litellm_session_id": session.client_session_id}))
+                    if session.client_session_id is not None
+                    else None
+                ),
             )
         )
 
@@ -114,7 +119,14 @@ def _session_from(stored: StoredSession) -> Session | None:
         version=stored.version,
         last_upstream_at=stored.last_upstream_at.timestamp(),
         annotations=annotations,
+        client_session_id=_client_session_id(getattr(stored, "metadata", None)),
     )
+
+
+def _client_session_id(metadata: object) -> str | None:
+    decoded: Final = _decoded(metadata) if metadata is not None else None
+    value: Final = decoded.get("litellm_session_id") if isinstance(decoded, Mapping) else None
+    return value if isinstance(value, str) else None
 
 
 def _decoded(content: object) -> object:

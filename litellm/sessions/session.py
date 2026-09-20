@@ -28,6 +28,8 @@ class Session:
     last_upstream_at: float
     annotations: Mapping[int, Meta] = field(default_factory=_no_annotations)
     """Item meta by position (e.g. what a compaction summary covers); stored beside the item, never replayed"""
+    client_session_id: str | None = None
+    """LiteLLM's `litellm_session_id` for this conversation, so the store shares the client's own identity"""
 
     def replayable_at(self, response_id: str) -> tuple[Item, ...]:
         """History up to *response_id*, with model output reduced to what a stateless upstream accepts back"""

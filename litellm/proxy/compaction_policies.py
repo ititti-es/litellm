@@ -44,7 +44,7 @@ _BlockDumper.add_representer(str, _represent_text)
 
 
 def to_yaml(policy: CompactionPolicy) -> str:
-    return yaml.dump(dict(policy.document()), Dumper=_BlockDumper, sort_keys=False, allow_unicode=True, width=120)
+    return yaml.dump(policy.document(), Dumper=_BlockDumper, sort_keys=False, allow_unicode=True, width=120)
 
 
 def from_text(text: str) -> CompactionPolicy:

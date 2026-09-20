@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from collections.abc import Mapping
@@ -30,6 +31,17 @@ MANAGED_BY_CALLER: Final = "litellm_session_managed"
 _NO_AFFINITY: Final[Mapping[str, str]] = MappingProxyType({})
 
 
+def affinity_key(owner: str, client_session_id: str) -> str:
+    """The upstream cache key for a client's session
+
+    LiteLLM already derives `litellm_session_id` from the client's own headers, so the gateway does not invent a
+    second identity for the cache: it keys on that one. Hashed with the owner because the value is client-chosen
+    (two keys must not share a cache key, and the id itself must not travel upstream).
+    """
+    digest: Final = hashlib.sha256(f"{owner}\0{client_session_id}".encode()).hexdigest()
+    return f"sess_{digest[:32]}"
+
+
 def cache_affinity(custom_llm_provider: str | None, key: str, request: Mapping[str, object]) -> Mapping[str, str]:
     """Route every turn of a session to the same upstream prompt cache, unless the client chose a key itself"""
     if custom_llm_provider not in _CACHE_KEYED_PROVIDERS or request.get("prompt_cache_key") is not None:
@@ -38,7 +50,9 @@ def cache_affinity(custom_llm_provider: str | None, key: str, request: Mapping[s
 
 
 def turn_affinity(turn: object, custom_llm_provider: str | None, request: Mapping[str, object]) -> Mapping[str, str]:
-    return cache_affinity(custom_llm_provider, turn.key, request) if isinstance(turn, PendingTurn) else _NO_AFFINITY
+    return (
+        cache_affinity(custom_llm_provider, turn.cache_key, request) if isinstance(turn, PendingTurn) else _NO_AFFINITY
+    )
 
 
 POLICY_METADATA_KEY: Final = "compaction_policy"
@@ -76,6 +90,12 @@ class PendingTurn:
     key: str
     started_at: float = 0.0
     replay: ReplayBase | None = None
+    client_session_id: str | None = None
+
+    @property
+    def cache_key(self) -> str:
+        """Stable across gateway restarts when the client names its session, so the upstream cache stays warm"""
+        return affinity_key(self.owner, self.client_session_id) if self.client_session_id else self.key
 
     def replaying(self, replay: ReplayBase) -> PendingTurn:
         return replace(self, replay=replay)
@@ -98,6 +118,7 @@ class PendingTurn:
             started_at=self.started_at or None,
             usage=turn_usage(response.usage),
             replay=self.replay,
+            client_session_id=self.client_session_id,
         )
 
 
@@ -108,15 +129,37 @@ def _as_item(item: object) -> Item | None:
 
 
 async def begin_turn(
-    manager: SessionManager, previous_response_id: str | None, turn_input: object, owner: str
+    manager: SessionManager,
+    previous_response_id: str | None,
+    turn_input: object,
+    owner: str,
+    client_session_id: str | None = None,
 ) -> PendingTurn | Forbidden | None:
     """None leaves the request to the existing continuation paths: the id predates the manager or was evicted"""
     items: Final = input_items(turn_input)
     started_at: Final = time.time()
+    client: Final = client_session_id or None
     if not previous_response_id:
-        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at)
+        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at, client_session_id=client)
     resolution: Final = await manager.resolve_async(provider_response_id(previous_response_id), owner)
     if isinstance(resolution, Resolved):
         manager.begin(resolution.session.id, started_at)
-        return PendingTurn(manager, owner, resolution, items, resolution.session.id, started_at)
+        return PendingTurn(
+            manager,
+            owner,
+            resolution,
+            items,
+            resolution.session.id,
+            started_at,
+            client_session_id=client or resolution.session.client_session_id,
+        )
     return resolution if isinstance(resolution, Forbidden) else None
+
+
+def client_session_id_of(*sources: object) -> str | None:
+    """The session id LiteLLM derived for this request (headers, body or baggage), first found wins"""
+    for source in sources:
+        value = source.get("litellm_session_id") if isinstance(source, Mapping) else source  # rebind-ok: per source
+        if isinstance(value, str) and value:
+            return value
+    return None

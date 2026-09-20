@@ -40,7 +40,14 @@ from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequest
 from litellm.sessions import Forbidden, Item, Resolution, Resolved, SessionManager
 from litellm.sessions.compaction import replay_params, turn_usage
 from litellm.sessions.manager import ReplayBase
-from litellm.sessions.responses import MANAGED_BY_CALLER, cache_affinity, provider_response_id, requested_policy
+from litellm.sessions.responses import (
+    MANAGED_BY_CALLER,
+    affinity_key,
+    cache_affinity,
+    client_session_id_of,
+    provider_response_id,
+    requested_policy,
+)
 from litellm.types.integrations.custom_logger import converted_stream_requested
 from litellm.types.llms.openai import (
     PART_UNION_TYPES,
@@ -2566,6 +2573,7 @@ class ManagedResponsesWebSocketHandler:
         durable: bool,
         started_at: float | None = None,
         replay: ReplayBase | None = None,
+        client_session_id: str | None = None,
     ) -> None:
         response_id: Final = self._extract_response_id(completed_event) if completed_event is not None else None
         if self.session_manager is None or response_id is None:
@@ -2583,6 +2591,7 @@ class ManagedResponsesWebSocketHandler:
             started_at=started_at,
             usage=turn_usage(resp_obj.get("usage")) if _is_json_object(resp_obj) else None,
             replay=replay,
+            client_session_id=client_session_id,
         )
 
     def _deployment_id(self) -> str | None:
@@ -2932,8 +2941,12 @@ class ManagedResponsesWebSocketHandler:
         self._inject_credentials(call_kwargs, model=model)
         provider: Final = self._resolve_provider(model) or self._connection_provider
         started_at: Final = time.time()
+        client_session_id: Final = client_session_id_of(
+            call_kwargs.get("litellm_session_id"), self.litellm_metadata
+        ) or (resolution.session.client_session_id if isinstance(resolution, Resolved) else None)
         if self.session_manager is not None:
-            call_kwargs.update(cache_affinity(provider, session_key, call_kwargs))
+            cache_key: Final = affinity_key(self.session_owner, client_session_id) if client_session_id else session_key
+            call_kwargs.update(cache_affinity(provider, cache_key, call_kwargs))
             if isinstance(resolution, Resolved):
                 self.session_manager.begin(resolution.session.id, started_at)
         replay: Final = ReplayBase(
@@ -2941,7 +2954,9 @@ class ManagedResponsesWebSocketHandler:
             model=model,
             params=replay_params(call_kwargs),
             deployment=self._deployment_id() if model == self.model else self.model_group,
-            compaction_policy=requested_policy(call_kwargs.get("metadata"), self.litellm_metadata.get("requester_metadata")),
+            compaction_policy=requested_policy(
+                call_kwargs.get("metadata"), self.litellm_metadata.get("requester_metadata")
+            ),
             model_group=self.model_group,
         )
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
@@ -2963,6 +2978,7 @@ class ManagedResponsesWebSocketHandler:
                 durable=call_kwargs.get("store") is not False,
                 started_at=started_at,
                 replay=replay,
+                client_session_id=client_session_id,
             )
             return
         self._save_turn_history(completed_event, prior_history, current_messages)
