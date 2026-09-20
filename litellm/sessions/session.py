@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Final, TypeAlias
@@ -49,6 +49,55 @@ class Session:
 
 def canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode()
+
+
+Form: TypeAlias = tuple[str, ...]
+
+
+def comparable(items: Sequence[Item]) -> tuple[tuple[int, Form], ...]:
+    """Each item's position and what it says, so two renderings of one history can be compared.
+
+    A client that keeps its own history resends the whole conversation every turn, and its rendering is not
+    byte-identical to what the gateway stored: ids, annotations, status fields and the exact shape of a
+    message all differ between a harness and a provider. What has to match is what was said, and in what
+    order. Reasoning is left out of the comparison entirely -- it is dropped on replay unless it is sealed,
+    and a harness is free not to echo it back.
+    """
+    return tuple((index, form) for index, item in enumerate(items) if (form := _form(item)) is not None)
+
+
+def _form(item: Item) -> Form | None:
+    kind: Final = item.get("type", "message")
+    if kind == "reasoning":
+        return None
+    if kind == "function_call":
+        return ("function_call", _string(item, "call_id"), _string(item, "name"), _string(item, "arguments"))
+    if kind == "function_call_output":
+        return ("function_call_output", _string(item, "call_id"), _text_of(item.get("output")))
+    return ("message", _string(item, "role"), _text_of(item.get("content")))
+
+
+def _string(item: Item, key: str) -> str:
+    value: Final = item.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _text_of(content: JsonValue) -> str:
+    """What a message says, however the harness wrapped it; a part carrying no text is named, not ignored."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(_part_text(part) for part in content)
+
+
+def _part_text(part: JsonValue) -> str:
+    if isinstance(part, str):
+        return part
+    if not isinstance(part, dict):
+        return ""
+    text: Final = part.get("text")
+    return text if isinstance(text, str) else f"[{part.get('type')}]"
 
 
 def _replay_output(item: Item) -> Item | None:

@@ -1,4 +1,5 @@
 from litellm.sessions import Forbidden, Resolved, SessionManager, Unknown
+from litellm.sessions.manager import client_session_key
 
 USER = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
 ASSISTANT = {
@@ -111,6 +112,9 @@ class MemoryStore:
     async def load(self, response_id):
         return self.sessions.get(response_id)
 
+    async def load_session(self, session_id):
+        return next((s for s in self.sessions.values() if s.id == session_id), None)
+
 
 async def test_durable_commits_write_only_the_new_items_in_order():
     store = MemoryStore()
@@ -149,3 +153,91 @@ async def test_a_failing_store_never_fails_the_turn():
     await manager.flush()
     assert isinstance(manager.resolve("r1", "key-a"), Resolved)
     assert manager.stats().unpersisted == 1
+
+
+# --- clients that name the session rather than the turn ------------------------------------------------
+
+
+RESENT = (USER, {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]})
+NEXT = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "and again"}]}
+
+
+def _named_turn(manager: SessionManager, owner: str = "key-a", session: str = "thread-1"):
+    key = client_session_key(owner, session)
+    return manager.commit(
+        owner=owner,
+        prior=None,
+        turn_input=(USER,),
+        output=(ASSISTANT,),
+        response_id="r1",
+        now=1.0,
+        new_session_id=key,
+        client_session_id=session,
+    )
+
+
+async def test_a_resent_history_continues_the_session_it_reproduces():
+    manager = SessionManager()
+    first = _named_turn(manager)
+
+    continuation = await manager.continue_client_session("key-a", "thread-1", (*RESENT, NEXT))
+
+    assert continuation.session_id == first.id
+    assert continuation.prior is not None and continuation.prior.session.id == first.id
+    assert continuation.turn_input == (NEXT,)
+
+
+async def test_the_first_turn_of_a_named_session_lands_where_the_next_will_look():
+    manager = SessionManager()
+
+    continuation = await manager.continue_client_session("key-a", "thread-1", (USER,))
+
+    assert continuation.prior is None
+    assert continuation.session_id == client_session_key("key-a", "thread-1")
+    assert continuation.turn_input == (USER,)
+
+
+async def test_input_that_does_not_reproduce_the_stored_history_starts_its_own_session():
+    manager = SessionManager()
+    first = _named_turn(manager)
+    elsewhere = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "different"}]}
+
+    continuation = await manager.continue_client_session("key-a", "thread-1", (elsewhere, NEXT))
+
+    assert continuation.prior is None and continuation.session_id != first.id
+
+
+async def test_a_resend_with_nothing_new_is_not_a_continuation():
+    """Two identical turns must not append an empty one to the transcript."""
+    manager = SessionManager()
+    _named_turn(manager)
+
+    continuation = await manager.continue_client_session("key-a", "thread-1", RESENT)
+
+    assert continuation.prior is None
+
+
+async def test_one_key_cannot_reach_another_keys_session_by_naming_it():
+    manager = SessionManager()
+    _named_turn(manager, owner="key-a")
+
+    continuation = await manager.continue_client_session("key-b", "thread-1", (*RESENT, NEXT))
+
+    assert continuation.prior is None
+    assert continuation.session_id == client_session_key("key-b", "thread-1")
+
+
+async def test_a_named_session_is_found_again_after_a_restart():
+    store = MemoryStore()
+    manager = SessionManager()
+    manager.attach_store(store)
+    first = _named_turn(manager)
+    await manager.flush()
+
+    restarted = SessionManager()
+    restarted.attach_store(store)
+    continuation = await restarted.continue_client_session("key-a", "thread-1", (*RESENT, NEXT))
+
+    assert continuation.session_id == first.id
+    assert continuation.prior is not None and continuation.turn_input == (NEXT,)
+    assert restarted.stats().rehydrations == 1

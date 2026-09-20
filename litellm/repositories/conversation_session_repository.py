@@ -228,6 +228,16 @@ class ConversationSessionRepository:
         )
         if session is None or session.version != response.version:
             return None
+        return await self._transcript(session)
+
+    async def load_session(self, session_id: str) -> StoredSession | None:
+        """A session by its own id, for a client that names the conversation rather than the turn it follows"""
+        session: Final = await self._db.litellm_conversationsession.find_unique(
+            where={"session_id": session_id}  # mutable-ok: Prisma where filter must be a dict
+        )
+        return await self._transcript(session) if session is not None else None
+
+    async def _transcript(self, session: "prisma_models.LiteLLM_ConversationSession") -> StoredSession:
         scope: Final = {  # mutable-ok: Prisma where filter must be a dict
             "session_id": session.session_id,
             "version": session.version,

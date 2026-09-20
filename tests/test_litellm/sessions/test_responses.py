@@ -189,6 +189,109 @@ async def test_a_restarted_gateway_keeps_the_same_upstream_cache_key(manager):
     )
     fresh = litellm.session_manager
     session = fresh.resolve(_provider_id(after_restart.id), "key-a").session
-    assert session.id != manager.resolve(_provider_id(first.id), "key-a").session.id
+    # The row a client-named session lives at is derived from the same two values as the cache key, so a
+    # restart finds the conversation as well as the warm prefix rather than beginning a new one.
+    assert session.id == manager.resolve(_provider_id(first.id), "key-a").session.id
     assert fresh.last_turn(session.id).replay.params["prompt_cache_key"] == before["prompt_cache_key"]
     assert before["prompt_cache_key"] == affinity_key("key-a", "ses_client_2")
+
+
+# --- a client that keeps its own history -------------------------------------------------------------
+
+
+def _resent(*exchanges: tuple[str, str], then: str) -> list:
+    """What a harness with its own checkpointer sends: the whole conversation, every turn."""
+    history = []
+    for prompt, reply in exchanges:
+        history.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]})
+        history.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_x",
+                "content": [{"type": "output_text", "text": reply, "annotations": []}],
+            }
+        )
+    return [*history, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": then}]}]
+
+
+async def test_a_resent_history_continues_its_session_instead_of_starting_another():
+    """LangGraph and anything else on a local checkpointer sends no previous_response_id, only a session id."""
+    manager = SessionManager()
+    first = await begin_turn(manager, None, "one", "key-a", "thread-1")
+    assert isinstance(first, PendingTurn)
+    first.finish(completed("resp_1", "a1"))
+
+    second = await begin_turn(manager, None, _resent(("one", "a1"), then="two"), "key-a", "thread-1")
+
+    assert isinstance(second, PendingTurn) and isinstance(second.prior, Resolved)
+    assert second.key == first.key
+    assert [item["content"][0]["text"] for item in second.turn_input] == ["two"]
+    assert [item["content"][0]["text"] for item in second.upstream_input()] == ["one", "a1", "two"]
+
+
+async def test_the_whole_thread_ends_up_in_one_session():
+    manager = SessionManager()
+    turn = await begin_turn(manager, None, "one", "key-a", "thread-1")
+    assert isinstance(turn, PendingTurn)
+    turn.finish(completed("resp_1", "a1"))
+    for index, (sent, reply) in enumerate(
+        ((_resent(("one", "a1"), then="two"), "a2"), (_resent(("one", "a1"), ("two", "a2"), then="three"), "a3"))
+    ):
+        turn = await begin_turn(manager, None, sent, "key-a", "thread-1")
+        assert isinstance(turn, PendingTurn)
+        turn.finish(completed(f"resp_{index + 2}", reply))
+
+    assert manager.stats().sessions == 1
+    resolved = manager.resolve("resp_3", "key-a")
+    assert isinstance(resolved, Resolved)
+    assert [item["content"][0]["text"] for item in resolved.session.items] == ["one", "a1", "two", "a2", "three", "a3"]
+
+
+async def test_a_session_id_alone_never_reaches_another_keys_history():
+    """The id is client-chosen and guessable; the owner is part of what it derives from."""
+    manager = SessionManager()
+    first = await begin_turn(manager, None, "one", "key-a", "thread-1")
+    assert isinstance(first, PendingTurn)
+    first.finish(completed("resp_1", "a1"))
+
+    theirs = await begin_turn(manager, None, _resent(("one", "a1"), then="two"), "key-b", "thread-1")
+
+    assert isinstance(theirs, PendingTurn) and theirs.prior is None and theirs.key != first.key
+
+
+async def test_a_different_conversation_under_a_reused_id_does_not_overwrite_the_stored_one():
+    """Only input that reproduces the stored history may extend it; anything else is its own conversation."""
+    manager = SessionManager()
+    first = await begin_turn(manager, None, "one", "key-a", "thread-1")
+    assert isinstance(first, PendingTurn)
+    first.finish(completed("resp_1", "a1"))
+
+    other = await begin_turn(manager, None, _resent(("something else", "b1"), then="two"), "key-a", "thread-1")
+
+    assert isinstance(other, PendingTurn) and other.prior is None and other.key != first.key
+    resolved = manager.resolve("resp_1", "key-a")
+    assert isinstance(resolved, Resolved) and len(resolved.session.items) == 2
+
+
+async def test_a_client_that_names_its_session_and_its_turn_is_unaffected():
+    """previous_response_id still decides; the session id only says which cache and which row."""
+    manager = SessionManager()
+    first = await begin_turn(manager, None, "one", "key-a", "thread-1")
+    assert isinstance(first, PendingTurn)
+    first.finish(completed("resp_1", "a1"))
+
+    second = await begin_turn(manager, "resp_1", "two", "key-a", "thread-1")
+
+    assert isinstance(second, PendingTurn) and isinstance(second.prior, Resolved)
+    assert [item["content"][0]["text"] for item in second.turn_input] == ["two"]
+
+
+async def test_an_unnamed_session_still_gets_a_fresh_one_every_turn():
+    """Without a session id there is nothing to continue from, so nothing changes for those callers."""
+    manager = SessionManager()
+    first = await begin_turn(manager, None, "one", "key-a")
+    second = await begin_turn(manager, None, "two", "key-a")
+
+    assert isinstance(first, PendingTurn) and isinstance(second, PendingTurn)
+    assert first.key != second.key and second.prior is None

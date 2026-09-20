@@ -12,7 +12,7 @@ from pydantic import BaseModel, JsonValue
 
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.sessions.compaction import turn_usage
-from litellm.sessions.manager import Forbidden, ReplayBase, Resolved, SessionManager
+from litellm.sessions.manager import Continuation, Forbidden, ReplayBase, Resolved, SessionManager
 from litellm.sessions.session import Item
 
 if TYPE_CHECKING:
@@ -139,8 +139,11 @@ async def begin_turn(
     items: Final = input_items(turn_input)
     started_at: Final = time.time()
     client: Final = client_session_id or None
+    if not previous_response_id and client is None:
+        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at)
     if not previous_response_id:
-        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at, client_session_id=client)
+        continuation: Final = await manager.continue_client_session(owner, client or "", items)
+        return _continuing(manager, owner, client, continuation, started_at)
     resolution: Final = await manager.resolve_async(provider_response_id(previous_response_id), owner)
     if isinstance(resolution, Resolved):
         manager.begin(resolution.session.id, started_at)
@@ -154,6 +157,27 @@ async def begin_turn(
             client_session_id=client or resolution.session.client_session_id,
         )
     return resolution if isinstance(resolution, Forbidden) else None
+
+
+def _continuing(
+    manager: SessionManager,
+    owner: str,
+    client: str | None,
+    continuation: Continuation,
+    started_at: float,
+) -> PendingTurn:
+    """The turn a client-named session resolved to, whether it continues one or starts it"""
+    if continuation.prior is not None:
+        manager.begin(continuation.session_id, started_at)
+    return PendingTurn(
+        manager,
+        owner,
+        continuation.prior,
+        continuation.turn_input,
+        continuation.session_id,
+        started_at,
+        client_session_id=client,
+    )
 
 
 def client_session_id_of(*sources: object) -> str | None:

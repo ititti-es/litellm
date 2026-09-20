@@ -54,11 +54,32 @@ second one for anything the client or the provider can see:
   It is stable across gateway restarts, so a session that outlives the process still lands on a warm cache.
 - **Correlation**: the session row records `litellm_session_id` in its metadata, so stored transcripts line up
   with spend logs and traces.
-- **Internal id**: the manager keeps minting an opaque id, and resolution stays keyed on the response ids the
-  gateway returned. A client-chosen id must not address stored history: ids are guessable, and a turn arriving
-  with no `previous_response_id` would otherwise overwrite a live session's transcript (or, for a harness that
-  resends its whole history every turn, write a new version per turn). Ownership is checked on every resolve
-  regardless.
+- **Internal id**: resolution stays keyed on the response ids the gateway returned, and a turn that names one
+  is answered from that alone. A turn that names only a session lands at
+  `cs_<sha256("session" + owner + litellm_session_id)[:32]>` — derived, so the next turn and a restarted
+  gateway find the same row with no index to keep, and owner-hashed, so one key cannot guess its way to
+  another's. A client-chosen id still never *addresses* stored history on its own: see below.
+
+## Clients that keep their own history
+
+A harness with its own checkpointer — LangGraph, and most agent frameworks — sends the whole conversation
+every turn and no `previous_response_id`. Taken at face value every turn is a new conversation, and the store
+fills with one session per turn, each a superset of the last: measured, three turns of one LangGraph thread
+produced three sessions of 2, 4 and 6 items.
+
+Such a turn is accepted as a continuation only when what arrived **reproduces what is stored**. The arriving
+input is compared against the session's own transcript on what was said rather than how it was wrapped (roles
+and text, tool calls and their results; reasoning is left out, since it is dropped on replay unless sealed and
+a harness need not echo it). If the stored history is a prefix of what arrived, the remainder is the new turn
+and the rest is replayed from the gateway's own copy. If it is not, the turn begins a conversation of its own
+and the stored one is untouched.
+
+That keeps the property the identity rules are there for. A guessable id reaches nothing by itself: the id is
+namespaced by owner, and extending a transcript requires already being able to reproduce it. What it buys is
+that a thread is one session — one row, one set of response ids, and a history long enough for compaction to
+be worth doing.
+
+Nothing changes for a client that sends `previous_response_id`, or for one that sends no session id at all.
 
 ## Open
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -10,7 +11,7 @@ from typing import Final, Protocol, TypeAlias
 
 from litellm._logging import verbose_logger
 from litellm.sessions.cache_clock import CacheClock, CacheEstimate, retention_hint
-from litellm.sessions.session import Item, Meta, Session
+from litellm.sessions.session import Item, Meta, Session, comparable
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,31 @@ class Forbidden:
 
 
 Resolution: TypeAlias = Resolved | Unknown | Forbidden
+
+
+@dataclass(frozen=True, slots=True)
+class Continuation:
+    """Where the next turn of a client that keeps its own history belongs.
+
+    `prior` is the stored conversation this turn continues, or None when it begins one; `turn_input` is what
+    is actually new, which for a client that resends everything is the tail of what it sent.
+    """
+
+    session_id: str
+    prior: Resolved | None
+    turn_input: tuple[Item, ...]
+
+
+def client_session_key(owner: str, client_session_id: str) -> str:
+    """The session id a client-named conversation is stored at.
+
+    Derived rather than looked up, so the next turn finds the conversation with no index to keep and no id to
+    hand back, and a gateway restart finds it too. Hashed with the owner because the client chooses the value:
+    two API keys naming the same session must land on different rows, and one key must not be able to guess
+    its way to another's. Distinct from the upstream cache key, which is derived separately from the same two.
+    """
+    digest: Final = hashlib.sha256(f"session\0{owner}\0{client_session_id}".encode()).hexdigest()
+    return f"cs_{digest[:32]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +124,10 @@ class TranscriptStore(Protocol):
 
     async def load(self, response_id: str) -> Session | None: ...
 
+    async def load_session(self, session_id: str) -> Session | None:
+        """The conversation stored under this id, for a client that names its session rather than its turn"""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingWrite:
@@ -151,6 +181,42 @@ class SessionManager:
         self._hold(loaded)
         self._rehydrations += 1
         return self.resolve(response_id, owner)
+
+    async def continue_client_session(self, owner: str, client_session_id: str, items: Sequence[Item]) -> Continuation:
+        """Where a turn belongs that names its session but not the turn it follows.
+
+        A harness that keeps its own history (LangGraph, and anything else built on a local checkpointer)
+        sends the whole conversation every turn and no `previous_response_id`. Taken at face value each turn
+        is a new conversation, and the store fills with one session per turn, each a superset of the last.
+
+        So the session is found from the client's own id, and the turn is accepted as its continuation only
+        when what arrived actually extends what is stored: the gateway replays its own copy of the history,
+        and a caller can only ever extend a transcript it can already reproduce. Anything else starts a
+        conversation of its own rather than overwriting one.
+        """
+        key: Final = client_session_key(owner, client_session_id)
+        stored: Final = await self._client_session(key)
+        if stored is None:
+            return Continuation(key, None, tuple(items))
+        continued: Final = _continues(stored, items)
+        if continued is None or stored.owner != owner:
+            return Continuation(uuid.uuid4().hex, None, tuple(items))
+        response_id, tail = continued
+        return Continuation(stored.id, Resolved(stored, response_id), tuple(items)[tail:])
+
+    async def _client_session(self, session_id: str) -> Session | None:
+        held: Final = self._sessions.get(session_id)
+        if held is not None:
+            self._sessions.move_to_end(session_id)
+            return held
+        if self._store is None:
+            return None
+        loaded: Final = await self._store.load_session(session_id)
+        if loaded is None:
+            return None
+        self._hold(loaded)
+        self._rehydrations += 1
+        return loaded
 
     def resolve(self, response_id: str, owner: str) -> Resolution:
         session_id: Final = self._by_response.get(response_id)
@@ -446,6 +512,25 @@ class SessionManager:
         for response_id in session.responses:
             if self._by_response.get(response_id) == session_id:
                 del self._by_response[response_id]
+
+
+def _continues(session: Session, items: Sequence[Item]) -> tuple[str, int] | None:
+    """The response this input continues from and where its new items start, or None if it is another story"""
+    latest: Final = _latest_response(session)
+    if latest is None:
+        return None
+    response_id, end = latest
+    stored: Final = tuple(form for _, form in comparable(session.items[:end]))
+    arrived: Final = comparable(items)
+    if len(arrived) <= len(stored) or tuple(form for _, form in arrived[: len(stored)]) != stored:
+        return None
+    return response_id, arrived[len(stored)][0]
+
+
+def _latest_response(session: Session) -> tuple[str, int] | None:
+    """The turn that ends the stored history; a session mid-fork has none that covers all of it"""
+    complete: Final = tuple(rid for rid, end in session.responses.items() if end == len(session.items))
+    return (complete[0], len(session.items)) if complete else None
 
 
 def _built(
