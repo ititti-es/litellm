@@ -57,6 +57,8 @@ class ImportWrite:
 class StoredTranscript:
     version: int
     contents: tuple[object, ...]
+    owner: str | None = None
+    """Who holds it now; an import must not take a session away from the key that is using it"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +213,9 @@ class ConversationSessionRepository:
             where={"session_id": session_id, "version": session.version},  # mutable-ok: Prisma where filter
             order={"seq": "asc"},  # mutable-ok: Prisma order clause must be a dict
         )
-        return StoredTranscript(version=session.version, contents=tuple(item.content for item in items))
+        return StoredTranscript(
+            version=session.version, contents=tuple(item.content for item in items), owner=session.owner
+        )
 
     async def load_by_response(self, response_id: str) -> StoredSession | None:
         response: Final = await self._db.litellm_conversationresponse.find_unique(

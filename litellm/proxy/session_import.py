@@ -6,7 +6,8 @@
     python -m litellm.proxy.session_import pin|unpin SESSION_ID
 
 Sources are read from a private copy, never written. Re-running is safe: a session that grew since the last
-import is appended to, and one whose history the harness rewrote is stored as a new version beside the old.
+import is appended to, and one whose history the harness rewrote is stored as a new version beside the old,
+and a session a key is already using keeps that owner rather than being handed to the importer's.
 Without --owner-key, imports are archive-only: stored, but continuable by no key.
 """
 
@@ -72,6 +73,22 @@ class Planned:
     action: str
 
 
+ARCHIVE_OWNER_PREFIX: Final = "archive:"
+
+
+def holder(requested: str, stored: StoredTranscript | None) -> str:
+    """Who owns the session after this import.
+
+    An import never takes a session away from the key already using it: the `claude_cli` provider stores a
+    conversation under the key it was billed to, and archiving the same session later must not leave that
+    caller forbidden from their own history. An archive placeholder owns nothing and is adopted freely.
+    """
+    held: Final = stored.owner if stored is not None else None
+    if not held or held.startswith(ARCHIVE_OWNER_PREFIX):
+        return requested
+    return held
+
+
 def plan_import(session: ImportedSession, owner: str, stored: StoredTranscript | None) -> Planned:
     """Append when the stored transcript is a prefix of the source, otherwise store the source as a new version"""
     contents: Final = tuple(canonical(json.loads(jsonb_text(item.item))) for item in session.items)
@@ -83,7 +100,7 @@ def plan_import(session: ImportedSession, owner: str, stored: StoredTranscript |
     session_id: Final = imported_session_id(session.source, session.source_id)
     write: Final = ImportWrite(
         session_id=session_id,
-        owner=owner,
+        owner=holder(owner, stored),
         version=version,
         source=session.source,
         source_id=session.source_id,
@@ -106,10 +123,11 @@ def plan_import(session: ImportedSession, owner: str, stored: StoredTranscript |
             for turn, end in enumerate(session.turn_ends)
         ),
     )
-    action: Final = (
+    change: Final = (
         "new" if stored is None else "unchanged" if unchanged else "appended" if extends else f"new version {version}"
     )
-    return Planned(write, action)
+    kept: Final = "" if write.owner == owner else " (kept owner)"
+    return Planned(write, change + kept)
 
 
 def _decoded(content: object) -> object:
@@ -172,7 +190,7 @@ async def _main(args: argparse.Namespace) -> int:
             sys.stdout.write(f"{args.session_id}: {args.command + 'ned' if found else 'not found'}\n")
             return 0 if found else 1
         source: Final = Path(args.source).expanduser() if args.source else _DEFAULT_SOURCES[args.command]
-        owner: Final = hash_token(args.owner_key) if args.owner_key else f"archive:{args.command}"
+        owner: Final = hash_token(args.owner_key) if args.owner_key else f"{ARCHIVE_OWNER_PREFIX}{args.command}"
         reader: Final = _READERS[args.command]
         scratch: Final = Path(args.scratch_dir).expanduser() if args.scratch_dir else None
         for line in await run_import(reader(source, scratch), owner, repository):

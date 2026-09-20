@@ -45,3 +45,23 @@ def test_nul_is_stored_as_the_replacement_character_and_still_compares_equal():
     planned = plan_import(_session("a\x00b"), "o", None)
     assert json.loads(planned.write.items[0].content)["content"] == "a�b"
     assert plan_import(_session("a\x00b"), "o", _stored(0, "a�b")).action == "unchanged"
+
+
+def test_an_import_does_not_take_a_session_from_the_key_using_it():
+    """The claude_cli provider stores a live conversation; archiving it later must not forbid its caller."""
+    live = StoredTranscript(version=0, contents=(), owner="hashed-live-key")
+
+    assert plan_import(_session("a"), "hashed-archive-key", live).write.owner == "hashed-live-key"
+    assert "kept owner" in plan_import(_session("a"), "hashed-archive-key", live).action
+
+
+def test_an_archive_only_session_can_be_adopted_by_a_key():
+    archived = StoredTranscript(version=0, contents=(), owner="archive:claude-code")
+
+    planned = plan_import(_session("a"), "hashed-key", archived)
+
+    assert planned.write.owner == "hashed-key" and "kept owner" not in planned.action
+
+
+def test_a_session_nobody_owns_yet_goes_to_the_importer():
+    assert plan_import(_session("a"), "hashed-key", None).write.owner == "hashed-key"
