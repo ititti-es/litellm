@@ -778,6 +778,12 @@ def test_responses_config_wraps_flagged_oauth_errors_as_authentication_error(
 def test_proxy_cli_xai_oauth_login_uses_single_authenticator(monkeypatch):
     from litellm.proxy.proxy_cli import run_server
 
+    # The CLI picks the loopback or the paste flow from the environment, so pin it to a local desktop:
+    # otherwise this test would take a different path when the suite itself runs over SSH.
+    for name in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
+
     instances = []
 
     class FakeAuthenticator:
@@ -786,7 +792,7 @@ def test_proxy_cli_xai_oauth_login_uses_single_authenticator(monkeypatch):
         def __init__(self):
             instances.append(self)
 
-        def login(self, force=False, no_browser=False):
+        def login(self, force=False, no_browser=False, prompt_for_code=None):
             return {"expires_at": 1234567890}
 
     monkeypatch.setattr(

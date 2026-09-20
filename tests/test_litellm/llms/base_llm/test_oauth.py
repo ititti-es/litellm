@@ -11,7 +11,9 @@ import pytest
 
 from litellm.llms.base_llm.oauth import (
     TokenFile,
+    is_remote_session,
     new_state,
+    parse_authorization_input,
     pkce_pair,
     start_callback_server,
     wait_for_callback,
@@ -204,3 +206,61 @@ def test_concurrent_writers_never_leave_a_partial_record(tmp_path):
 
     assert errors == []
     assert store.read() is not None
+
+
+# --- remote sessions ------------------------------------------------------------------------------
+
+
+def _clear_session_env(monkeypatch):
+    for name in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT", "DISPLAY", "WAYLAND_DISPLAY"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize("variable", ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"])
+def test_ssh_environment_counts_as_remote(variable, monkeypatch):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv(variable, "something")
+    assert is_remote_session() is True
+
+
+def test_a_local_desktop_session_is_not_remote(monkeypatch):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert is_remote_session() is False
+
+
+def test_a_headless_linux_box_counts_as_remote(monkeypatch):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setattr("sys.platform", "linux")
+    assert is_remote_session() is True
+
+
+def test_wayland_counts_as_a_usable_display(monkeypatch):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    assert is_remote_session() is False
+
+
+# --- pasted authorization input -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("abc123#state-1", ("abc123", "state-1")),
+        ("  abc123#state-1  ", ("abc123", "state-1")),
+        ("abc123", ("abc123", None)),
+        ("http://127.0.0.1:56121/callback?code=abc123&state=state-1", ("abc123", "state-1")),
+        ("http://127.0.0.1:56121/callback?code=abc123", ("abc123", None)),
+        ("http://127.0.0.1:56121/callback?state=state-1&code=abc123", ("abc123", "state-1")),
+    ],
+)
+def test_parse_authorization_input(value, expected):
+    assert parse_authorization_input(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "http://127.0.0.1:56121/callback?state=only"])
+def test_parse_authorization_input_rejects_unusable_values(value):
+    with pytest.raises(ValueError):
+        parse_authorization_input(value)

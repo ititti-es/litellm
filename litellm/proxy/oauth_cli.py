@@ -16,6 +16,8 @@ from typing import Final
 
 import click
 
+from litellm.llms.base_llm.oauth import is_remote_session
+
 ACTIONS: Final = ("login", "logout", "status")
 
 
@@ -75,8 +77,24 @@ def _report_logout(name: str, removed: bool) -> None:
 
 def _prompt_for_code(authorize_url: str) -> str:
     click.echo("Open this URL in a browser on any machine, then paste the result below:")
+    click.echo("")
     click.echo(authorize_url)
+    click.echo("")
+    click.echo("The browser will land on a 127.0.0.1 address that fails to load. That is expected:")
+    click.echo("copy the whole address bar, or just the code after `code=`.")
     return click.prompt("Authorization code (or the full redirect URL)", type=str)
+
+
+def _wants_paste(flags: Sequence[str]) -> bool:
+    """Whether to ask the user for the code instead of waiting on a loopback redirect.
+
+    A remote session is the default case for this: the redirect would arrive at the machine running the
+    browser, not this one, so the wait could only ever time out. `--browser` forces the loopback flow back
+    on, for when the port is forwarded.
+    """
+    if "--browser" in flags:
+        return False
+    return "--manual" in flags or is_remote_session()
 
 
 def _anthropic(action: str, flags: Sequence[str]) -> None:
@@ -90,12 +108,12 @@ def _anthropic(action: str, flags: Sequence[str]) -> None:
     if action == "logout":
         _report_logout(name, authenticator.logout())
         return
-    manual: Final = "--manual" in flags
+    paste: Final = _wants_paste(flags)
     try:
         record: Final = authenticator.login(
             force="--force" in flags,
-            no_browser=manual or "--no-browser" in flags,
-            prompt_for_code=_prompt_for_code if manual else None,
+            no_browser=paste or "--no-browser" in flags,
+            prompt_for_code=_prompt_for_code if paste else None,
         )
     except AnthropicOAuthError as exc:
         raise _OAuthCommandError(str(exc)) from exc
@@ -113,8 +131,13 @@ def _xai(action: str, flags: Sequence[str]) -> None:
     if action == "logout":
         _report_logout(name, _delete_record(authenticator.auth_file))
         return
+    paste: Final = _wants_paste(flags)
     try:
-        record: Final = authenticator.login(force="--force" in flags, no_browser="--no-browser" in flags)
+        record: Final = authenticator.login(
+            force="--force" in flags,
+            no_browser=paste or "--no-browser" in flags,
+            prompt_for_code=_prompt_for_code if paste else None,
+        )
     except XAIOAuthError as exc:
         raise _OAuthCommandError(str(exc)) from exc
     _report_login(name, authenticator.auth_file, record.get("expires_at"))

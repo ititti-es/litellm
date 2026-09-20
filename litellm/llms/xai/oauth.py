@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Final
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -18,6 +18,7 @@ from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm._logging import verbose_logger
 from litellm.constants import XAI_API_BASE
+from litellm.llms.base_llm.oauth import parse_authorization_input
 from litellm.llms.custom_httpx.http_handler import HTTPHandler, _get_httpx_client
 from litellm.secret_managers.main import get_secret_str
 
@@ -151,7 +152,17 @@ class XAIOAuthAuthenticator:
             refreshed: Final = self._refresh_tokens(locked_auth_data)
             return refreshed["access_token"]
 
-    def login(self, force: bool = False, no_browser: bool = False) -> XAIOAuthRecord:
+    def login(
+        self,
+        force: bool = False,
+        no_browser: bool = False,
+        prompt_for_code: Callable[[str], str] | None = None,
+    ) -> XAIOAuthRecord:
+        """Run the authorization-code flow and store the result.
+
+        `prompt_for_code` is for a host with no reachable browser, such as one reached over SSH: it is handed
+        the authorize URL and returns what the user pasted back, and no loopback server is started.
+        """
         existing: Final = self._read_auth_file()
         if existing and not force and existing.get("access_token"):
             if not self._is_expired(existing):
@@ -166,6 +177,35 @@ class XAIOAuthAuthenticator:
         verifier, challenge = self._pkce_pair()
         state: Final = uuid.uuid4().hex
         nonce: Final = uuid.uuid4().hex
+
+        if prompt_for_code is not None:
+            code, redirect_uri = self._code_by_paste(discovery, challenge, state, nonce, prompt_for_code)
+        else:
+            code, redirect_uri = self._code_by_loopback(discovery, challenge, state, nonce, no_browser)
+
+        token_payload: Final = self._exchange_token(
+            discovery["token_endpoint"],
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": XAI_OAUTH_CLIENT_ID,
+                "code_verifier": verifier,
+            },
+        )
+        auth_data: Final = self._build_auth_record(token_payload, discovery["token_endpoint"])
+        self._write_auth_file(auth_data)
+        return auth_data
+
+    def _code_by_loopback(
+        self,
+        discovery: dict[str, str],
+        challenge: str,
+        state: str,
+        nonce: str,
+        no_browser: bool,
+    ) -> tuple[str, str]:
+        """Take the authorization code from a redirect to a loopback port on this host."""
         server, redirect_uri = self._start_callback_server(state)
         authorize_url: Final = self._build_authorize_url(
             authorization_endpoint=discovery["authorization_endpoint"],
@@ -188,20 +228,36 @@ class XAIOAuthAuthenticator:
         code: Final = result.get("code")
         if not code:
             raise XAIOAuthError("xAI authorization failed: no code returned")
+        return code, redirect_uri
 
-        token_payload: Final = self._exchange_token(
-            discovery["token_endpoint"],
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": XAI_OAUTH_CLIENT_ID,
-                "code_verifier": verifier,
-            },
+    def _code_by_paste(
+        self,
+        discovery: dict[str, str],
+        challenge: str,
+        state: str,
+        nonce: str,
+        prompt_for_code: Callable[[str], str],
+    ) -> tuple[str, str]:
+        """Take the authorization code from the user, for a host whose loopback port is unreachable.
+
+        The redirect URI still has to be the registered one, because the authorization server checks it and
+        it is signed into the code; the browser simply fails to reach it, and the user copies it back.
+        """
+        redirect_uri: Final = f"http://{XAI_OAUTH_REDIRECT_HOST}:{XAI_OAUTH_REDIRECT_PORT}{XAI_OAUTH_REDIRECT_PATH}"
+        authorize_url: Final = self._build_authorize_url(
+            authorization_endpoint=discovery["authorization_endpoint"],
+            redirect_uri=redirect_uri,
+            challenge=challenge,
+            state=state,
+            nonce=nonce,
         )
-        auth_data: Final = self._build_auth_record(token_payload, discovery["token_endpoint"])
-        self._write_auth_file(auth_data)
-        return auth_data
+        try:
+            code, returned_state = parse_authorization_input(prompt_for_code(authorize_url))
+        except ValueError as exc:
+            raise XAIOAuthError(str(exc)) from exc
+        if returned_state is not None and returned_state != state:
+            raise XAIOAuthError("xAI OAuth state mismatch")
+        return code, redirect_uri
 
     def _client(self) -> httpx.Client | HTTPHandler:
         return self.http_client or _get_httpx_client()

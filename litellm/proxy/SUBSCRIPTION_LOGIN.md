@@ -23,8 +23,43 @@ Flags on `login`:
 | flag | effect |
 |---|---|
 | `--force` | ignore a stored token and log in again |
-| `--no-browser` | print the authorization URL instead of opening a browser |
-| `--manual` | print the URL and prompt for the code, for a host whose browser cannot reach its loopback port (Anthropic only) |
+| `--manual` | print the URL and prompt for the code, instead of waiting on a loopback redirect |
+| `--browser` | force the loopback flow even in a session detected as remote |
+| `--no-browser` | print the authorization URL rather than opening a browser, but still wait on the loopback |
+
+## Logging in over SSH
+
+Anthropic and xAI receive their authorization code on a loopback port. Over SSH that port is on the
+*client's* machine, where nothing is listening, so the redirect never arrives and `webbrowser.open` can
+report success having done nothing.
+
+`login` therefore detects a remote session — `SSH_CONNECTION`, `SSH_TTY`, `SSH_CLIENT`, or a Linux host
+with neither `DISPLAY` nor `WAYLAND_DISPLAY` — and switches to asking for the code:
+
+```
+$ litellm anthropic-oauth login
+Open this URL in a browser on any machine, then paste the result below:
+
+https://claude.ai/oauth/authorize?code=true&client_id=...
+
+The browser will land on a 127.0.0.1 address that fails to load. That is expected:
+copy the whole address bar, or just the code after `code=`.
+Authorization code (or the full redirect URL):
+```
+
+The failed page *is* the success case: the code is in its URL. Paste the address bar, or just the `code=`
+value.
+
+If you would rather use the browser flow, forward the port when you connect and pass `--browser`:
+
+```sh
+ssh -L 53692:localhost:53692 <host>     # Anthropic
+ssh -L 56121:localhost:56121 <host>     # xAI
+litellm anthropic-oauth login --browser
+```
+
+ChatGPT needs none of this: its device-code flow prints a code you enter on any device, so it works over
+SSH unchanged.
 
 **Log in before starting the proxy.** Left to itself, a provider logs in lazily on the first request that
 needs a token — and the ChatGPT device flow prints a code to stdout and blocks for up to fifteen minutes. On
@@ -89,8 +124,9 @@ Refresh happens inside `get_access_token()` on the request path, under a lock so
 one refresh rather than several, with a skew so a token is replaced before it expires mid-request rather than
 after a request has already failed.
 
-`llms/base_llm/oauth.py` holds what these share: PKCE, the loopback callback server, and the credential file.
-`llms/xai/oauth.py` predates it and keeps its own copies; it can adopt the shared helpers unchanged.
+`llms/base_llm/oauth.py` holds what these share: PKCE, the loopback callback server, the credential file,
+remote-session detection and the pasted-code parser. `llms/xai/oauth.py` predates it and still keeps its own
+callback server and credential file, but now uses the shared parser; it can adopt the rest unchanged.
 
 ## Interaction with the session manager
 

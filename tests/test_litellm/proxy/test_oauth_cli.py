@@ -146,3 +146,98 @@ def test_login_failure_becomes_a_click_exception(isolated_credentials, monkeypat
 
     with pytest.raises(click.ClickException, match="authorization server said no"):
         handle_oauth_command(("anthropic-oauth", "login"))
+
+
+# --- remote sessions choose the paste flow ------------------------------------------------------------
+
+
+@pytest.fixture
+def local_desktop(monkeypatch):
+    for name in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
+
+
+@pytest.fixture
+def over_ssh(monkeypatch):
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22")
+
+
+def _capture_login(monkeypatch, provider_module):
+    """Record the keyword arguments the CLI passes to a provider's login()."""
+    calls: list[dict] = []
+
+    def fake_login(self, **kwargs):
+        calls.append(kwargs)
+        return {"expires_at": time.time() + 3600}
+
+    monkeypatch.setattr(provider_module, "login", fake_login)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "provider,module_path",
+    [
+        ("anthropic-oauth", "litellm.llms.anthropic.oauth.AnthropicOAuthAuthenticator"),
+        ("xai-oauth", "litellm.llms.xai.oauth.XAIOAuthAuthenticator"),
+    ],
+)
+def test_ssh_session_asks_for_a_pasted_code(provider, module_path, isolated_credentials, over_ssh, monkeypatch):
+    import importlib
+
+    module_name, _, class_name = module_path.rpartition(".")
+    cls = getattr(importlib.import_module(module_name), class_name)
+    calls = _capture_login(monkeypatch, cls)
+
+    handle_oauth_command((provider, "login"))
+
+    assert calls[0]["prompt_for_code"] is not None, "over SSH the loopback redirect can never arrive"
+    assert calls[0]["no_browser"] is True
+
+
+@pytest.mark.parametrize(
+    "provider,module_path",
+    [
+        ("anthropic-oauth", "litellm.llms.anthropic.oauth.AnthropicOAuthAuthenticator"),
+        ("xai-oauth", "litellm.llms.xai.oauth.XAIOAuthAuthenticator"),
+    ],
+)
+def test_local_desktop_uses_the_loopback_flow(provider, module_path, isolated_credentials, local_desktop, monkeypatch):
+    import importlib
+
+    module_name, _, class_name = module_path.rpartition(".")
+    cls = getattr(importlib.import_module(module_name), class_name)
+    calls = _capture_login(monkeypatch, cls)
+
+    handle_oauth_command((provider, "login"))
+
+    assert calls[0]["prompt_for_code"] is None
+    assert calls[0]["no_browser"] is False
+
+
+def test_browser_flag_overrides_remote_detection(isolated_credentials, over_ssh, monkeypatch):
+    """`--browser` is for when the loopback port has been forwarded back over SSH."""
+    from litellm.llms.xai.oauth import XAIOAuthAuthenticator
+
+    calls = _capture_login(monkeypatch, XAIOAuthAuthenticator)
+    handle_oauth_command(("xai-oauth", "login", "--browser"))
+
+    assert calls[0]["prompt_for_code"] is None
+
+
+def test_manual_flag_forces_the_paste_flow_on_a_desktop(isolated_credentials, local_desktop, monkeypatch):
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    calls = _capture_login(monkeypatch, AnthropicOAuthAuthenticator)
+    handle_oauth_command(("anthropic-oauth", "login", "--manual"))
+
+    assert calls[0]["prompt_for_code"] is not None
+
+
+def test_force_flag_is_passed_through(isolated_credentials, over_ssh, monkeypatch):
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    calls = _capture_login(monkeypatch, AnthropicOAuthAuthenticator)
+    handle_oauth_command(("anthropic-oauth", "login", "--force"))
+
+    assert calls[0]["force"] is True

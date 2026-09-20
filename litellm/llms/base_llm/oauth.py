@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -53,6 +54,38 @@ def new_state() -> str:
 def _first(params: Mapping[str, Sequence[str]], key: str) -> str | None:
     values: Final = params.get(key)
     return values[0] if values else None
+
+
+def is_remote_session() -> bool:
+    """Whether this process has no browser it could usefully open.
+
+    Over SSH a loopback redirect would arrive at the *client's* machine, where nothing is listening, and
+    `webbrowser.open` can report success having done nothing. Callers use this to print the URL instead.
+    """
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY") or os.environ.get("SSH_CLIENT"):
+        return True
+    return sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
+
+
+def parse_authorization_input(value: str) -> tuple[str, str | None]:
+    """Parse what a user pastes back when no browser can reach the loopback redirect.
+
+    Providers show the code as `<code>#<state>`, and a user may equally paste the whole redirect URL out of
+    the browser's address bar, so both are accepted. Raises ValueError for anything else.
+    """
+    text: Final = value.strip()
+    if not text:
+        raise ValueError("No authorization code provided")
+    if text.startswith("http://") or text.startswith("https://"):
+        params: Final = parse_qs(urlparse(text).query)
+        code: Final = _first(params, "code")
+        if not code:
+            raise ValueError("Redirect URL contained no authorization code")
+        return code.split("#")[0], _first(params, "state")
+    if "#" in text:
+        raw_code, _, raw_state = text.partition("#")
+        return raw_code, raw_state or None
+    return text, None
 
 
 def _page(heading: str) -> bytes:

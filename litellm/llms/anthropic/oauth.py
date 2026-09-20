@@ -19,7 +19,7 @@ import webbrowser
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Final, TypedDict
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import urlencode
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
@@ -33,6 +33,7 @@ from litellm.llms.base_llm.oauth import (
     start_callback_server,
     wait_for_callback,
 )
+from litellm.llms.base_llm.oauth import parse_authorization_input as _parse_authorization_input
 from litellm.llms.custom_httpx.http_handler import HTTPHandler, _get_httpx_client
 from litellm.secret_managers.main import get_secret_str
 
@@ -94,25 +95,11 @@ def _login_hint(reason: str) -> AnthropicOAuthLoginRequiredError:
 
 
 def parse_authorization_input(value: str) -> tuple[str, str | None]:
-    """Parse what a user pastes back when no browser can reach the loopback redirect.
-
-    Anthropic shows the code as `<code>#<state>`, and a user may equally paste the whole redirect URL, so
-    both are accepted.
-    """
-    text: Final = value.strip()
-    if not text:
-        raise AnthropicOAuthError("No authorization code provided")
-    if text.startswith("http://") or text.startswith("https://"):
-        params: Final = parse_qs(urlparse(text).query)
-        codes: Final = params.get("code")
-        if not codes or not codes[0]:
-            raise AnthropicOAuthError("Redirect URL contained no authorization code")
-        states: Final = params.get("state")
-        return codes[0].split("#")[0], states[0] if states else None
-    if "#" in text:
-        raw_code, _, raw_state = text.partition("#")
-        return raw_code, raw_state or None
-    return text, None
+    """Parse a pasted authorization code or redirect URL, as an Anthropic error."""
+    try:
+        return _parse_authorization_input(value)
+    except ValueError as exc:
+        raise AnthropicOAuthError(str(exc)) from exc
 
 
 class AnthropicOAuthAuthenticator:
