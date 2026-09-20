@@ -16,6 +16,8 @@ litellm chatgpt login             # ChatGPT Plus/Pro (Codex)
 
 litellm <provider> status         # logged in? when does the token expire?
 litellm <provider> logout         # forget the stored credentials
+litellm <provider> push           # copy the local credentials into the database
+litellm <provider> pull           # copy them back out
 ```
 
 Flags on `login`:
@@ -122,6 +124,8 @@ rather than the public API.
 
 ## Where credentials are stored
 
+By default, on disk:
+
 | provider | path | override |
 |---|---|---|
 | Anthropic | `~/.config/litellm/anthropic_oauth/auth.json` | `ANTHROPIC_OAUTH_TOKEN_DIR` |
@@ -129,11 +133,40 @@ rather than the public API.
 | ChatGPT | `~/.config/litellm/chatgpt/auth.json` | `CHATGPT_TOKEN_DIR` |
 
 Each file holds a refresh token, which is a long-lived credential: the directory is `0700`, the file `0600`,
-and writes go to a temporary file that is renamed over the target so a reader never sees a half-written
-record. `status` never prints the tokens themselves.
+and writes go to a temporary file renamed over the target so a reader never sees a half-written record.
+`status` never prints the tokens themselves.
 
-These are files on one host, so they do not survive a container without a mounted volume and are not shared
-between replicas. Each replica must log in, or share the directory.
+### In the database
+
+A file on one host is wrong for a gateway: it does not survive a container without a mounted volume, and
+replicas each have their own, so each has to log in separately and each refreshes independently.
+
+Where the proxy has a `DATABASE_URL`, credentials are read from and written to it instead — no configuration
+needed. Set `general_settings.store_oauth_credentials_in_db: false` to keep using files.
+
+Move an existing login in, then remove the local copy:
+
+```sh
+litellm anthropic-oauth push      # local file -> database
+litellm xai-oauth push
+rm ~/.config/litellm/anthropic_oauth/auth.json
+
+litellm anthropic-oauth pull      # database -> local file, to debug or take away
+```
+
+Records live in `LiteLLM_CredentialsTable` — the table the proxy already uses for provider credentials — as
+`oauth/<provider>`, so there is no new table and no migration. **Every field is encrypted** with LiteLLM's
+own helper, so tokens at rest are protected by `LITELLM_SALT_KEY` (or the master key) like any other stored
+credential; a row read directly from Postgres contains only ciphertext. Set `LITELLM_SALT_KEY` before
+pushing, and keep it: without it the records decrypt to nothing and every provider reads as logged out.
+
+Refresh tokens rotate, so two replicas refreshing from one record would each invalidate the other's. A
+refresh therefore takes a Postgres advisory lock for the length of its read-refresh-write, keyed per
+provider so unrelated providers do not queue behind each other, and released by the transaction ending —
+including if the process dies. Reads are cached for a few seconds so a burst of requests is one query.
+
+If the database is unreachable, a read falls back to the local file where one exists, so a blip degrades
+rather than taking every model offline.
 
 ## How each provider works
 

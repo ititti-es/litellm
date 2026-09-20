@@ -19,7 +19,7 @@ import click
 
 from litellm.llms.base_llm.oauth import is_remote_session
 
-ACTIONS: Final = ("login", "logout", "status")
+ACTIONS: Final = ("login", "logout", "status", "push", "pull")
 
 
 class _OAuthCommandError(Exception):
@@ -70,6 +70,32 @@ def _report_status(name: str, auth_file: str, login_command: str) -> None:
         value = record.get(key)
         if isinstance(value, str) and value:
             click.echo(f"  {label}: {value}")
+
+
+def _database_url() -> str:
+    url: Final = os.getenv("DATABASE_URL") or ""
+    if not url:
+        raise _OAuthCommandError("DATABASE_URL is not set, so there is no database to move credentials to.")
+    return url
+
+
+def _move(provider: str, name: str, auth_file: str, to_database: bool) -> None:
+    """Copy one provider's credentials between the local file and the database."""
+    from litellm.llms.base_llm.oauth import TokenFile
+    from litellm.proxy.oauth_credential_store import DatabaseCredentialStore
+
+    database: Final = DatabaseCredentialStore(provider, _database_url())
+    local: Final = TokenFile(auth_file)
+    source, target, where = (local, database, "database") if to_database else (database, local, auth_file)
+
+    record: Final = source.read()
+    if not isinstance(record, dict) or not record.get("access_token"):
+        origin = auth_file if to_database else "the database"
+        raise _OAuthCommandError(f"No {name} credentials found in {origin}.")
+    target.write(record)
+    click.echo(f"{name}: credentials copied to {where}.")
+    if to_database:
+        click.echo(f"  The local file is left in place. Remove it with: rm {auth_file}")
 
 
 def _report_logout(name: str, removed: bool) -> None:
@@ -162,6 +188,9 @@ def _anthropic(action: str, flags: Sequence[str]) -> None:
     if action == "status":
         _report_status(name, authenticator.auth_file, "litellm anthropic-oauth login")
         return
+    if action in ("push", "pull"):
+        _move("anthropic", name, authenticator.auth_file, to_database=action == "push")
+        return
     if action == "logout":
         _report_logout(name, authenticator.logout())
         return
@@ -195,6 +224,9 @@ def _xai(action: str, flags: Sequence[str]) -> None:
     name: Final = "xAI (SuperGrok)"
     if action == "status":
         _report_status(name, authenticator.auth_file, "litellm xai-oauth login")
+        return
+    if action in ("push", "pull"):
+        _move("xai", name, authenticator.auth_file, to_database=action == "push")
         return
     if action == "logout":
         _report_logout(name, _delete_record(authenticator.auth_file))
@@ -230,6 +262,9 @@ def _chatgpt(action: str, flags: Sequence[str]) -> None:
     name: Final = "ChatGPT (Codex subscription)"
     if action == "status":
         _report_status(name, authenticator.auth_file, "litellm chatgpt login")
+        return
+    if action in ("push", "pull"):
+        _move("chatgpt", name, authenticator.auth_file, to_database=action == "push")
         return
     if action == "logout":
         _report_logout(name, _delete_record(authenticator.auth_file))

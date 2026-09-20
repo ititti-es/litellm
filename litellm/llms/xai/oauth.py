@@ -1,6 +1,5 @@
 import base64
 import hashlib
-import json
 import os
 import secrets
 import sys
@@ -19,8 +18,10 @@ from typing_extensions import NotRequired, ReadOnly, TypedDict
 from litellm._logging import verbose_logger
 from litellm.constants import XAI_API_BASE
 from litellm.llms.base_llm.oauth import (
+    CredentialStore,
     PendingLogin,
     TokenFile,
+    credential_store_for,
     parse_authorization_input,
     pending_is_fresh,
 )
@@ -59,10 +60,6 @@ class _TokenPayload(TypedDict):
 class _DiscoveryDocument(TypedDict):
     authorization_endpoint: NotRequired[ReadOnly[str]]
     token_endpoint: NotRequired[ReadOnly[str]]
-
-
-class _AuthFileView(TypedDict):
-    record: ReadOnly[XAIOAuthRecord | None]
 
 
 class _TokenPayloadView(TypedDict):
@@ -127,10 +124,15 @@ class _CallbackServer(HTTPServer):
 
 
 class XAIOAuthAuthenticator:
-    def __init__(self, http_client: httpx.Client | HTTPHandler | None = None) -> None:
+    def __init__(
+        self,
+        http_client: httpx.Client | HTTPHandler | None = None,
+        store: CredentialStore | None = None,
+    ) -> None:
         self.token_dir = get_secret_str("XAI_OAUTH_TOKEN_DIR") or os.path.expanduser("~/.config/litellm/xai_oauth")
         self.auth_file = os.path.join(self.token_dir, get_secret_str("XAI_OAUTH_AUTH_FILE") or "auth.json")
         self.http_client = http_client
+        self._store = store or credential_store_for("xai", self.auth_file)
 
     def get_api_base(self) -> str:
         return get_secret_str("XAI_OAUTH_API_BASE") or get_secret_str("XAI_API_BASE") or XAI_API_BASE
@@ -148,7 +150,8 @@ class XAIOAuthAuthenticator:
         if not refresh_token:
             raise XAIOAuthLoginRequiredError("xAI OAuth refresh token missing. Run `litellm xai-oauth login`.")
 
-        with _XAI_OAUTH_REFRESH_LOCK:
+        with _XAI_OAUTH_REFRESH_LOCK, self._store.guard():
+            # Another thread, or another replica, may have refreshed while this one waited.
             locked_auth_data: Final = self._read_auth_file() or auth_data
             access_token = locked_auth_data.get("access_token")
             if access_token and not self._is_expired(locked_auth_data):
@@ -319,44 +322,11 @@ class XAIOAuthAuthenticator:
             verbose_logger.debug("Could not chmod xAI OAuth token directory")
 
     def _read_auth_file(self) -> XAIOAuthRecord | None:
-        try:
-            with open(self.auth_file, "r") as f:
-                loaded: Final[_AuthFileView] = {"record": json.load(f)}
-            data: Final = loaded["record"]
-            return data if isinstance(data, dict) else None
-        except (OSError, json.JSONDecodeError):
-            return None
+        data: Final = self._store.read()
+        return data if isinstance(data, dict) else None
 
     def _write_auth_file(self, data: XAIOAuthRecord) -> None:
-        self._ensure_token_dir()
-        tmp_file: Final = os.path.join(
-            self.token_dir,
-            f".{os.path.basename(self.auth_file)}.{uuid.uuid4().hex}.tmp",
-        )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd: Final = os.open(tmp_file, flags, 0o600)
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_file, self.auth_file)
-            try:
-                os.chmod(self.auth_file, 0o600)
-            except OSError:
-                verbose_logger.debug("Could not chmod xAI OAuth auth file")
-        except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.unlink(tmp_file)
-            except OSError:
-                pass
-            raise
+        self._store.write(data)
 
     def _is_expired(self, auth_data: XAIOAuthRecord) -> bool:
         expires_at: Final = auth_data.get("expires_at")

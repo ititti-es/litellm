@@ -692,6 +692,7 @@ from litellm.proxy.rag_endpoints.endpoints import router as rag_router
 from litellm.proxy.rerank_endpoints.endpoints import router as rerank_router
 from litellm.proxy.response_api_endpoints.endpoints import router as response_router
 from litellm.proxy.route_llm_request import route_request
+from litellm.proxy.oauth_credential_store import use_database_oauth_credentials
 from litellm.proxy.route_priority import hot_routes_first
 from litellm.proxy.search_endpoints.endpoints import router as search_router
 from litellm.proxy.sessions import (
@@ -6247,6 +6248,7 @@ class ProxyConfig:
             litellm.session_manager = configured_session_manager(
                 general_settings.get("session_manager"), litellm.session_manager
             )
+            use_database_oauth_credentials(general_settings.get("store_oauth_credentials_in_db"))
 
             custom_key_generate: Final = general_settings.get("custom_key_generate", None)
             if custom_key_generate is not None:

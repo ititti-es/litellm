@@ -331,7 +331,9 @@ def test_a_completion_failure_is_reported_cleanly(isolated_credentials, monkeypa
 # --- the instructions match where each provider actually puts the code ---------------------------------
 
 
-def test_anthropic_is_told_the_code_appears_on_the_page(isolated_credentials, over_ssh, no_terminal, monkeypatch, capsys):
+def test_anthropic_is_told_the_code_appears_on_the_page(
+    isolated_credentials, over_ssh, no_terminal, monkeypatch, capsys
+):
     """Anthropic is asked for `code=true`, so it prints the code rather than redirecting."""
     from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
 
@@ -445,3 +447,97 @@ def test_proxy_options_before_a_subcommand_still_parse(isolated_credentials, mon
     result = _invoke(["--host", "0.0.0.0", "anthropic-oauth", "login", "--code", "X"])
 
     assert result.exit_code == 0, result.output
+
+
+# --- moving credentials between the file and the database ---------------------------------------------
+
+
+@pytest.fixture
+def fake_database(monkeypatch):
+    """Stand in for the database store, so these tests need no database."""
+    written = {}
+
+    class _Store:
+        def __init__(self, provider, database_url, fallback_path=None):
+            self.provider = provider
+
+        def read(self):
+            return written.get(self.provider)
+
+        def write(self, data):
+            written[self.provider] = dict(data)
+
+        def delete(self):
+            return written.pop(self.provider, None) is not None
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@localhost:5432/db")
+    monkeypatch.setattr("litellm.proxy.oauth_credential_store.DatabaseCredentialStore", _Store)
+    return written
+
+
+def test_push_copies_the_local_credentials_into_the_database(isolated_credentials, fake_database, capsys):
+    _write(
+        isolated_credentials,
+        "anthropic_oauth_token_dir",
+        {"access_token": "sk-ant-oat01-x", "refresh_token": "r", "expires_at": time.time() + 3600},
+    )
+
+    assert handle_oauth_command(("anthropic-oauth", "push")) is True
+
+    assert fake_database["anthropic"]["access_token"] == "sk-ant-oat01-x"
+    out = capsys.readouterr().out
+    assert "copied to database" in out
+    assert "sk-ant-oat01-x" not in out
+
+
+def test_push_leaves_the_local_file_and_says_so(isolated_credentials, fake_database, capsys):
+    """Deleting it silently would strand anyone whose database is not yet reachable."""
+    path = _write(isolated_credentials, "anthropic_oauth_token_dir", {"access_token": "t", "refresh_token": "r"})
+
+    handle_oauth_command(("anthropic-oauth", "push"))
+
+    assert path.exists()
+    assert "left in place" in capsys.readouterr().out
+
+
+def test_pull_copies_the_database_credentials_to_the_local_file(isolated_credentials, fake_database, capsys):
+    fake_database["anthropic"] = {"access_token": "sk-ant-oat01-from-db", "refresh_token": "r"}
+
+    assert handle_oauth_command(("anthropic-oauth", "pull")) is True
+
+    handle_oauth_command(("anthropic-oauth", "status"))
+    assert "logged in" in capsys.readouterr().out
+
+
+def test_pushing_nothing_is_an_error_rather_than_a_silent_success(isolated_credentials, fake_database):
+    with pytest.raises(click.ClickException, match="No .* credentials found"):
+        handle_oauth_command(("anthropic-oauth", "push"))
+
+
+def test_pulling_nothing_is_an_error(isolated_credentials, fake_database):
+    with pytest.raises(click.ClickException, match="No .* credentials found"):
+        handle_oauth_command(("anthropic-oauth", "pull"))
+
+
+def test_moving_without_a_database_says_which_variable_is_missing(isolated_credentials, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    _write(isolated_credentials, "anthropic_oauth_token_dir", {"access_token": "t", "refresh_token": "r"})
+
+    with pytest.raises(click.ClickException, match="DATABASE_URL"):
+        handle_oauth_command(("anthropic-oauth", "push"))
+
+
+@pytest.mark.parametrize(
+    "provider,key,env_dir",
+    [
+        ("anthropic-oauth", "anthropic", "anthropic_oauth_token_dir"),
+        ("xai-oauth", "xai", "xai_oauth_token_dir"),
+        ("chatgpt", "chatgpt", "chatgpt_token_dir"),
+    ],
+)
+def test_every_provider_can_be_pushed(provider, key, env_dir, isolated_credentials, fake_database):
+    _write(isolated_credentials, env_dir, {"access_token": f"token-{key}", "refresh_token": "r"})
+
+    handle_oauth_command((provider, "push"))
+
+    assert fake_database[key]["access_token"] == f"token-{key}"

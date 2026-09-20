@@ -9,6 +9,7 @@ import httpx
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from litellm._logging import verbose_logger
+from litellm.llms.base_llm.oauth import CredentialStore, credential_store_for
 from litellm.llms.custom_httpx.http_handler import _get_httpx_client
 
 from .common_utils import (
@@ -41,13 +42,14 @@ def _optional_str(value: JsonValue | None) -> str | None:
 
 
 class Authenticator:
-    def __init__(self) -> None:
+    def __init__(self, store: "CredentialStore | None" = None) -> None:
         self.token_dir = os.getenv(
             "CHATGPT_TOKEN_DIR",
             os.path.expanduser("~/.config/litellm/chatgpt"),
         )
         self.auth_file = os.path.join(self.token_dir, os.getenv("CHATGPT_AUTH_FILE", "auth.json"))
         self._ensure_token_dir()
+        self._store = store or credential_store_for("chatgpt", self.auth_file)
 
     def get_api_base(self) -> str:
         return os.getenv("CHATGPT_API_BASE") or os.getenv("OPENAI_CHATGPT_API_BASE") or CHATGPT_API_BASE
@@ -94,21 +96,20 @@ class Authenticator:
             os.makedirs(self.token_dir, exist_ok=True)
 
     def _read_auth_file(self) -> JsonObject | None:
-        try:
-            with open(self.auth_file, "r") as f:
-                return _JSON_OBJECT_ADAPTER.validate_python(json.load(f))
-        except OSError:
+        data: Final = self._store.read()
+        if data is None:
             return None
-        except (json.JSONDecodeError, ValidationError) as exc:
-            verbose_logger.warning("Invalid ChatGPT auth file: %s", exc)
+        try:
+            return _JSON_OBJECT_ADAPTER.validate_python(data)
+        except ValidationError as exc:
+            verbose_logger.warning("Invalid ChatGPT auth record: %s", exc)
             return None
 
     def _write_auth_file(self, data: JsonObject) -> None:
         try:
-            with open(self.auth_file, "w") as f:
-                json.dump(data, f)
+            self._store.write(data)
         except OSError as exc:
-            verbose_logger.error("Failed to write ChatGPT auth file: %s", exc)
+            verbose_logger.error("Failed to write ChatGPT auth record: %s", exc)
 
     def _is_token_expired(self, auth_data: JsonObject, access_token: str) -> bool:
         stored_expires_at: Final = auth_data.get("expires_at")

@@ -27,8 +27,10 @@ from typing_extensions import NotRequired, ReadOnly
 
 from litellm._logging import verbose_logger
 from litellm.llms.base_llm.oauth import (
+    CredentialStore,
     PendingLogin,
     TokenFile,
+    credential_store_for,
     new_state,
     pending_is_fresh,
     pkce_pair,
@@ -113,13 +115,17 @@ def parse_authorization_input(value: str) -> tuple[str, str | None]:
 class AnthropicOAuthAuthenticator:
     """Obtains, stores and refreshes a Claude Pro/Max OAuth token."""
 
-    def __init__(self, http_client: httpx.Client | HTTPHandler | None = None) -> None:
+    def __init__(
+        self,
+        http_client: httpx.Client | HTTPHandler | None = None,
+        store: CredentialStore | None = None,
+    ) -> None:
         token_dir: Final = get_secret_str("ANTHROPIC_OAUTH_TOKEN_DIR") or _default_token_dir()
         auth_file_name: Final = get_secret_str("ANTHROPIC_OAUTH_AUTH_FILE") or "auth.json"
         self.token_dir = token_dir
         self.auth_file = os.path.join(token_dir, auth_file_name)
         self.http_client = http_client
-        self._store = TokenFile(self.auth_file)
+        self._store = store or credential_store_for("anthropic", self.auth_file)
 
     def get_access_token(self) -> str:
         """Return a usable access token, refreshing it first if it has expired."""
@@ -134,8 +140,8 @@ class AnthropicOAuthAuthenticator:
         if not auth_data.get("refresh_token"):
             raise _login_hint("Anthropic OAuth refresh token missing.")
 
-        with _ANTHROPIC_OAUTH_REFRESH_LOCK:
-            # Another thread may have refreshed while this one waited for the lock.
+        with _ANTHROPIC_OAUTH_REFRESH_LOCK, self._store.guard():
+            # Another thread, or another replica, may have refreshed while this one waited.
             locked_auth_data: Final = self._read_auth_file() or auth_data
             access_token = locked_auth_data.get("access_token")
             if access_token and not self._is_expired(locked_auth_data):

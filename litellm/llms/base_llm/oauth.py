@@ -17,9 +17,10 @@ import secrets
 import sys
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Final, TypedDict
+from typing import Final, Protocol, TypedDict
 from urllib.parse import parse_qs, urlparse
 
 from typing_extensions import ReadOnly
@@ -230,6 +231,57 @@ def pending_is_fresh(pending: PendingLogin, now: float | None = None) -> bool:
     return (now if now is not None else time.time()) - float(created) < PENDING_LOGIN_TTL_SECONDS
 
 
+class CredentialStore(Protocol):
+    """Where a provider's OAuth record lives.
+
+    A file is the default and is right for a workstation. A gateway wants the record somewhere its replicas
+    share and a container restart does not lose, which is what the proxy's database-backed store provides.
+    """
+
+    def read(self) -> object | None: ...
+
+    def write(self, data: object) -> None: ...
+
+    def delete(self) -> bool: ...
+
+    def guard(self) -> AbstractContextManager[None]:
+        """Hold exclusive access across the read-refresh-write of a token.
+
+        Refresh tokens rotate: two processes refreshing from the same record would each invalidate the
+        other's. In-process locking is enough for a single host; a shared store has to reach further.
+        """
+        ...
+
+
+@contextmanager
+def _no_guard() -> Generator[None]:
+    yield
+
+
+_STORE_FACTORY: list[Callable[[str, str], CredentialStore]] = []  # mutable-ok: single-slot registry
+
+
+def set_credential_store_factory(factory: Callable[[str, str], CredentialStore] | None) -> None:
+    """Choose where provider credentials are read and written.
+
+    The proxy calls this at startup when it has a database, so the authenticators keep their file default
+    everywhere else -- a CLI login on a workstation should not need a database.
+    """
+    _STORE_FACTORY.clear()
+    if factory is not None:
+        _STORE_FACTORY.append(factory)
+
+
+def credential_store_for(provider: str, path: str) -> CredentialStore:
+    """Return the store a provider should use: whatever was registered, else a file at `path`."""
+    if _STORE_FACTORY:
+        try:
+            return _STORE_FACTORY[0](provider, path)
+        except Exception as exc:  # noqa: BLE001  # any store failure must still leave a usable file login
+            verbose_logger.warning("Falling back to file credentials for %s: %s", provider, exc)
+    return TokenFile(path)
+
+
 class TokenFile:
     """A JSON credential file readable only by its owner.
 
@@ -279,6 +331,10 @@ class TokenFile:
             return True
         except OSError:
             return False
+
+    def guard(self) -> AbstractContextManager[None]:
+        """No-op: one host's processes are serialised by the authenticator's own lock."""
+        return _no_guard()
 
     def _ensure_dir(self) -> None:
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
