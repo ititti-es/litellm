@@ -359,6 +359,10 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
         default=False,
         description="Use stored xAI OAuth credentials when no xAI API key is configured.",
     )
+    use_anthropic_oauth: bool | None = Field(
+        default=False,
+        description="Use stored Claude Pro/Max OAuth credentials when no Anthropic API key is configured.",
+    )
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
     merge_reasoning_content_in_choices: bool | None = False
     model_info: dict | None = None

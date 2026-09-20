@@ -663,7 +663,13 @@ class ProxyInitializationHelpers:
         return multiproc_dir
 
 
-@click.command()
+@click.command(
+    # Stop parsing options once a positional argument appears, so a subcommand's own flags reach it intact:
+    # `litellm anthropic-oauth login --code X` must not be read as `--code` on the proxy itself. Options
+    # written before any positional, which is how the proxy is normally started, are unaffected -- including
+    # a mistyped one, which still errors rather than being silently swallowed.
+    context_settings={"allow_interspersed_args": False},  # mutable-ok: click reads this once at import
+)
 @click.argument("cli_args", nargs=-1)
 @click.option("--host", default="0.0.0.0", help="Host for the server to listen on.", envvar="HOST")
 @click.option("--port", default=4000, help="Port to bind the server to.", envvar="PORT")

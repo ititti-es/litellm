@@ -263,7 +263,7 @@ class XAIOAuthAuthenticator:
     ) -> XAIOAuthRecord:
         token_payload: Final = self._exchange_token(
             token_endpoint,
-            {
+            {  # mutable-ok: request body, handed straight to the client
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": redirect_uri,

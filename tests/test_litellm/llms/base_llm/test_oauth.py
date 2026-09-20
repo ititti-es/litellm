@@ -337,3 +337,27 @@ def test_an_old_pending_login_is_not_usable():
 def test_a_pending_login_without_a_timestamp_is_not_usable():
     assert pending_is_fresh(_pending(created_at=None)) is False
     assert pending_is_fresh(_pending(created_at="lunchtime")) is False
+
+
+# --- advertising a different host than the one bound --------------------------------------------------
+
+
+def test_the_redirect_host_can_differ_from_the_bound_address():
+    """A provider matches the redirect URI as a string; some register `localhost`, not `127.0.0.1`."""
+    server, redirect_uri = start_callback_server("state-1", 0, "/callback", "Test", redirect_host="localhost")
+    try:
+        assert redirect_uri.startswith("http://localhost:")
+        assert server.server_address[0] == "127.0.0.1", "the socket still binds the numeric loopback"
+    finally:
+        server.server_close()
+
+
+def test_a_busy_port_fails_when_no_other_port_would_be_accepted():
+    """Falling back to an arbitrary port would only produce a redirect URI the provider rejects."""
+    first, _ = start_callback_server("state-1", 0, "/callback", "Test")
+    busy_port = first.server_address[1]
+    try:
+        with pytest.raises(OSError, match=f"port {busy_port}"):
+            start_callback_server("state-2", busy_port, "/callback", "Test", allow_ephemeral=False)
+    finally:
+        first.server_close()

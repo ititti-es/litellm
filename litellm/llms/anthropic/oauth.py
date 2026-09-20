@@ -47,6 +47,12 @@ ANTHROPIC_OAUTH_SCOPE: Final = (
 )
 ANTHROPIC_OAUTH_REDIRECT_PORT: Final = 53692
 ANTHROPIC_OAUTH_REDIRECT_PATH: Final = "/callback"
+# The client is registered with the `localhost` spelling, and the provider matches the string, not the
+# address it resolves to. The callback socket still binds the numeric loopback.
+ANTHROPIC_OAUTH_REDIRECT_HOST: Final = "localhost"
+ANTHROPIC_OAUTH_REDIRECT_URI: Final = (
+    f"http://{ANTHROPIC_OAUTH_REDIRECT_HOST}:{ANTHROPIC_OAUTH_REDIRECT_PORT}{ANTHROPIC_OAUTH_REDIRECT_PATH}"
+)
 ANTHROPIC_OAUTH_EXPIRY_SKEW_SECONDS: Final = 300
 ANTHROPIC_OAUTH_CALLBACK_TIMEOUT_SECONDS: Final = 300
 ANTHROPIC_OAUTH_BRAND: Final = "Anthropic"
@@ -176,7 +182,7 @@ class AnthropicOAuthAuthenticator:
         """
         verifier, challenge = pkce_pair()
         state: Final = new_state()
-        redirect_uri: Final = f"http://127.0.0.1:{ANTHROPIC_OAUTH_REDIRECT_PORT}{ANTHROPIC_OAUTH_REDIRECT_PATH}"
+        redirect_uri: Final = ANTHROPIC_OAUTH_REDIRECT_URI
         pending: Final[PendingLogin] = {  # mutable-ok: written straight to the pending file
             "verifier": verifier,
             "state": state,
@@ -235,6 +241,9 @@ class AnthropicOAuthAuthenticator:
                 preferred_port=ANTHROPIC_OAUTH_REDIRECT_PORT,
                 callback_path=ANTHROPIC_OAUTH_REDIRECT_PATH,
                 brand=ANTHROPIC_OAUTH_BRAND,
+                redirect_host=ANTHROPIC_OAUTH_REDIRECT_HOST,
+                # Anthropic accepts only the one registered redirect URI, so another port cannot work.
+                allow_ephemeral=False,
             )
         except OSError as exc:
             raise AnthropicOAuthError(str(exc)) from exc

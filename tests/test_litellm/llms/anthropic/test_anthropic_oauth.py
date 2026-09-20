@@ -492,3 +492,62 @@ def test_logout_also_clears_a_pending_login(tmp_path, monkeypatch):
     authenticator.logout()
 
     assert not os.path.exists(os.path.join(authenticator.token_dir, "pending.json"))
+
+
+# --- the registered redirect URI ---------------------------------------------------------------------
+
+
+def test_the_redirect_uri_uses_the_registered_localhost_spelling(tmp_path, monkeypatch):
+    """Anthropic matches the redirect URI as a string and has only `localhost` registered.
+
+    Sending the numeric form is rejected outright with "Redirect URI ... is not supported by client".
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    from litellm.llms.anthropic.oauth import ANTHROPIC_OAUTH_REDIRECT_URI
+
+    assert ANTHROPIC_OAUTH_REDIRECT_URI == "http://localhost:53692/callback"
+
+    pending = _authenticator(tmp_path, monkeypatch).begin_login()
+    sent = parse_qs(urlparse(pending["authorize_url"]).query)["redirect_uri"][0]
+    assert sent == "http://localhost:53692/callback"
+    assert "127.0.0.1" not in sent
+
+
+def test_the_exchange_repeats_the_same_redirect_uri(tmp_path, monkeypatch):
+    """The token request must echo the redirect URI the code was issued against."""
+    client = _StubClient(_token_response())
+    authenticator = _authenticator(tmp_path, monkeypatch, client)
+    pending = authenticator.begin_login()
+
+    authenticator.complete_login(f"the-code#{pending['state']}")
+
+    assert client.requests[0]["json"]["redirect_uri"] == "http://localhost:53692/callback"
+
+
+# --- the deployment flag has to survive the call path -------------------------------------------------
+
+
+def test_the_oauth_flag_reaches_the_provider_handler():
+    """`litellm_params` is filtered against an allowlist on the way to a provider.
+
+    A flag missing from that list is silently dropped, and the deployment falls back to "no API key" --
+    which is how this first failed, with the login working and every request still rejected.
+    """
+    from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+
+    params = get_litellm_params(use_anthropic_oauth=True)
+    assert params.get("use_anthropic_oauth") is True
+
+
+def test_the_oauth_flag_is_accepted_on_a_deployment():
+    from litellm.types.router import GenericLiteLLMParams
+
+    params = GenericLiteLLMParams(model="anthropic/claude-sonnet-4-5", use_anthropic_oauth=True)
+    assert params.model_dump()["use_anthropic_oauth"] is True
+
+
+def test_the_oauth_flag_is_a_known_litellm_param():
+    from litellm.types.utils import all_litellm_params
+
+    assert "use_anthropic_oauth" in all_litellm_params

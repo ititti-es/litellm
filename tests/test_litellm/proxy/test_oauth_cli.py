@@ -326,3 +326,122 @@ def test_a_completion_failure_is_reported_cleanly(isolated_credentials, monkeypa
 
     with pytest.raises(click.ClickException, match="different login attempt"):
         handle_oauth_command(("anthropic-oauth", "login", "--code", "STALE"))
+
+
+# --- the instructions match where each provider actually puts the code ---------------------------------
+
+
+def test_anthropic_is_told_the_code_appears_on_the_page(isolated_credentials, over_ssh, no_terminal, monkeypatch, capsys):
+    """Anthropic is asked for `code=true`, so it prints the code rather than redirecting."""
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    monkeypatch.setattr(
+        AnthropicOAuthAuthenticator, "begin_login", lambda self: {"authorize_url": "https://claude.ai/x"}
+    )
+    handle_oauth_command(("anthropic-oauth", "login"))
+
+    out = capsys.readouterr().out
+    assert "shows you an authorization code" in out
+    assert "#" in out, "the displayed form is code#state, which the user needs to recognise"
+
+
+def test_xai_is_told_to_read_the_redirect_address(isolated_credentials, over_ssh, no_terminal, monkeypatch, capsys):
+    from litellm.llms.xai.oauth import XAIOAuthAuthenticator
+
+    monkeypatch.setattr(XAIOAuthAuthenticator, "begin_login", lambda self: {"authorize_url": "https://x.ai/y"})
+    handle_oauth_command(("xai-oauth", "login"))
+
+    out = capsys.readouterr().out
+    assert "FAILS TO LOAD" in out
+    assert "address bar" in out
+
+
+@pytest.mark.parametrize("provider", ["anthropic-oauth", "xai-oauth"])
+def test_every_provider_warns_against_pasting_the_request_back(
+    provider, isolated_credentials, over_ssh, no_terminal, monkeypatch, capsys
+):
+    import importlib
+
+    module = "anthropic" if provider.startswith("anthropic") else "xai"
+    cls_name = "AnthropicOAuthAuthenticator" if module == "anthropic" else "XAIOAuthAuthenticator"
+    cls = getattr(importlib.import_module(f"litellm.llms.{module}.oauth"), cls_name)
+    monkeypatch.setattr(cls, "begin_login", lambda self: {"authorize_url": "https://example.com/authorize"})
+
+    handle_oauth_command((provider, "login"))
+    assert "Do NOT paste the URL above back" in capsys.readouterr().out
+
+
+# --- through the real command line ---------------------------------------------------------------------
+#
+# These go through click rather than calling handle_oauth_command directly. Unit tests that skipped click
+# passed while every flag was in fact being eaten by the top-level command as an unknown option.
+
+
+def _invoke(args):
+    from click.testing import CliRunner
+
+    from litellm.proxy.proxy_cli import run_server
+
+    return CliRunner().invoke(run_server, args)
+
+
+def test_the_code_flag_survives_click(isolated_credentials, monkeypatch):
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    supplied: list[str] = []
+    monkeypatch.setattr(
+        AnthropicOAuthAuthenticator,
+        "complete_login",
+        lambda self, pasted: supplied.append(pasted) or {"expires_at": time.time() + 3600},
+    )
+
+    result = _invoke(["anthropic-oauth", "login", "--code", "THE-CODE"])
+
+    assert result.exit_code == 0, result.output
+    assert supplied == ["THE-CODE"]
+
+
+@pytest.mark.parametrize("flag", ["--force", "--manual", "--browser", "--no-browser"])
+def test_every_login_flag_survives_click(flag, isolated_credentials, monkeypatch):
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        AnthropicOAuthAuthenticator,
+        "login",
+        lambda self, **kwargs: seen.append(kwargs) or {"expires_at": time.time() + 3600},
+    )
+    monkeypatch.setattr(AnthropicOAuthAuthenticator, "begin_login", lambda self: {"authorize_url": "https://x/y"})
+
+    result = _invoke(["anthropic-oauth", "login", flag])
+
+    assert result.exit_code == 0, result.output
+    assert "No such option" not in result.output
+
+
+@pytest.mark.parametrize("provider", ["anthropic-oauth", "xai-oauth", "chatgpt"])
+def test_status_survives_click(provider, isolated_credentials):
+    result = _invoke([provider, "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "not logged in" in result.output
+
+
+def test_a_mistyped_proxy_option_is_still_rejected(isolated_credentials):
+    """Passing subcommand flags through must not turn typos into silently ignored arguments."""
+    result = _invoke(["--porrt", "4000"])
+
+    assert result.exit_code != 0
+    assert "No such option" in result.output
+
+
+def test_proxy_options_before_a_subcommand_still_parse(isolated_credentials, monkeypatch):
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    monkeypatch.setattr(
+        AnthropicOAuthAuthenticator, "complete_login", lambda self, pasted: {"expires_at": time.time() + 60}
+    )
+
+    result = _invoke(["--host", "0.0.0.0", "anthropic-oauth", "login", "--code", "X"])
+
+    assert result.exit_code == 0, result.output

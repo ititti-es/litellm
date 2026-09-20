@@ -86,19 +86,38 @@ def _flag_value(flags: Sequence[str], name: str) -> str | None:
     return None
 
 
-def _explain_url(authorize_url: str) -> None:
+# Where the authorization code ends up differs by provider, so the instructions do too. Anthropic is asked
+# for `code=true`, which makes it print the code on the page rather than redirect; xAI redirects to the
+# loopback address, which fails to load but carries the code in its URL.
+_SHOWN_ON_PAGE: Final = (
+    "3. Claude then shows you an authorization code on that page. It looks like `abcd...#efgh...`.",
+    "4. Copy that code. (If the browser instead lands on a 127.0.0.1 page that fails to load, copy",
+    "   that page's address -- the code is in it.)",
+)
+_AT_THE_REDIRECT: Final = (
+    "3. The browser then lands on a 127.0.0.1 page that FAILS TO LOAD. That is the success case.",
+    "4. Copy that failed page's address from the address bar -- the code is in it.",
+)
+
+
+def _explain_url(authorize_url: str, where_the_code_is: Sequence[str]) -> None:
     click.echo("1. Open this URL in a browser on any machine:")
     click.echo("")
     click.echo(f"   {authorize_url}")
     click.echo("")
     click.echo("2. Approve the request there.")
-    click.echo("3. The browser then lands on a 127.0.0.1 page that FAILS TO LOAD. That is the success case.")
-    click.echo("4. Copy that failed page's address (not the URL above) -- the code is in it.")
+    for line in where_the_code_is:
+        click.echo(line)
+    click.echo("")
+    click.echo("Do NOT paste the URL above back -- that is the request, not the result.")
 
 
-def _prompt_for_code(authorize_url: str) -> str:
-    _explain_url(authorize_url)
-    return click.prompt("Authorization code (or the full redirect URL)", type=str)
+def _code_prompter(where_the_code_is: Sequence[str]) -> Callable[[str], str]:
+    def prompt(authorize_url: str) -> str:
+        _explain_url(authorize_url, where_the_code_is)
+        return click.prompt("Authorization code (or the full redirect URL)", type=str)
+
+    return prompt
 
 
 def _can_prompt() -> bool:
@@ -125,9 +144,9 @@ def _wants_paste(flags: Sequence[str]) -> bool:
     return "--manual" in flags or is_remote_session()
 
 
-def _start_login(authorize_url: str, command: str) -> None:
+def _start_login(authorize_url: str, command: str, where_the_code_is: Sequence[str]) -> None:
     """Print the URL and how to finish, for a shell that cannot be prompted."""
-    _explain_url(authorize_url)
+    _explain_url(authorize_url, where_the_code_is)
     click.echo("")
     click.echo("Then finish the login with:")
     click.echo(f"  {command} --code '<the code>'")
@@ -153,12 +172,16 @@ def _anthropic(action: str, flags: Sequence[str]) -> None:
         else:
             paste = _wants_paste(flags)
             if paste and not _can_prompt():
-                _start_login(authenticator.begin_login()["authorize_url"], "litellm anthropic-oauth login")
+                _start_login(
+                    authenticator.begin_login()["authorize_url"],
+                    "litellm anthropic-oauth login",
+                    _SHOWN_ON_PAGE,
+                )
                 return
             record = authenticator.login(
                 force="--force" in flags,
                 no_browser=paste or "--no-browser" in flags,
-                prompt_for_code=_prompt_for_code if paste else None,
+                prompt_for_code=_code_prompter(_SHOWN_ON_PAGE) if paste else None,
             )
     except AnthropicOAuthError as exc:
         raise _OAuthCommandError(str(exc)) from exc
@@ -183,12 +206,16 @@ def _xai(action: str, flags: Sequence[str]) -> None:
         else:
             paste = _wants_paste(flags)
             if paste and not _can_prompt():
-                _start_login(authenticator.begin_login()["authorize_url"], "litellm xai-oauth login")
+                _start_login(
+                    authenticator.begin_login()["authorize_url"],
+                    "litellm xai-oauth login",
+                    _AT_THE_REDIRECT,
+                )
                 return
             record = authenticator.login(
                 force="--force" in flags,
                 no_browser=paste or "--no-browser" in flags,
-                prompt_for_code=_prompt_for_code if paste else None,
+                prompt_for_code=_code_prompter(_AT_THE_REDIRECT) if paste else None,
             )
     except XAIOAuthError as exc:
         raise _OAuthCommandError(str(exc)) from exc

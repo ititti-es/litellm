@@ -160,14 +160,21 @@ def start_callback_server(
     preferred_port: int,
     callback_path: str,
     brand: str,
+    redirect_host: str = LOOPBACK_HOST,
+    allow_ephemeral: bool = True,
 ) -> tuple[CallbackServer, str]:
-    """Bind a loopback callback server, returning it and the redirect URI to register.
+    """Bind a loopback callback server, returning it and the redirect URI to advertise.
 
-    The preferred port is tried first because some authorization servers only allow redirect URIs they
-    already know. An ephemeral port is the fallback for when that one is busy.
+    The socket always binds the numeric loopback address, but `redirect_host` is what goes into the
+    redirect URI, because a provider matches that string against what the client registered and some
+    register `localhost` rather than `127.0.0.1`.
+
+    `allow_ephemeral` falls back to any free port when the preferred one is busy. That only helps where the
+    provider accepts an arbitrary port; where it does not, failing is better than sending a redirect URI
+    that is certain to be rejected.
     """
     last_error: OSError | None = None
-    for port in (preferred_port, 0):
+    for port in (preferred_port, 0) if allow_ephemeral else (preferred_port,):
         try:
             server = CallbackServer((LOOPBACK_HOST, port), _CallbackHandler)
         except OSError as exc:
@@ -178,8 +185,8 @@ def start_callback_server(
         server.brand = brand
         server.callback_result = None
         actual_port = server.server_address[1]  # rebind-ok: one binding per loop iteration
-        return server, f"http://{LOOPBACK_HOST}:{actual_port}{callback_path}"
-    raise OSError(f"Could not start {brand} OAuth callback server: {last_error}")
+        return server, f"http://{redirect_host}:{actual_port}{callback_path}"
+    raise OSError(f"Could not start {brand} OAuth callback server on port {preferred_port}: {last_error}")
 
 
 def wait_for_callback(server: CallbackServer, timeout_seconds: float) -> CallbackResult | None:
