@@ -10,8 +10,10 @@ import urllib.request
 import pytest
 
 from litellm.llms.base_llm.oauth import (
+    PENDING_LOGIN_TTL_SECONDS,
     TokenFile,
     is_remote_session,
+    pending_is_fresh,
     new_state,
     parse_authorization_input,
     pkce_pair,
@@ -264,3 +266,74 @@ def test_parse_authorization_input(value, expected):
 def test_parse_authorization_input_rejects_unusable_values(value):
     with pytest.raises(ValueError):
         parse_authorization_input(value)
+
+
+# --- an authorization URL pasted back by mistake ----------------------------------------------------
+
+
+ANTHROPIC_AUTHORIZE_URL = (
+    "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    "&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A53692%2Fcallback"
+    "&scope=org%3Acreate_api_key+user%3Ainference&code_challenge=-xqMYIjx8znu"
+    "&code_challenge_method=S256&state=1234cd1d3bbb4411be56b98f49e9c54c"
+)
+
+XAI_AUTHORIZE_URL = (
+    "https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492"
+    "&redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcallback&scope=openid+profile"
+    "&code_challenge=PO8n&code_challenge_method=S256&state=6d1723b4&nonce=6287033b"
+)
+
+
+@pytest.mark.parametrize("url", [ANTHROPIC_AUTHORIZE_URL, XAI_AUTHORIZE_URL])
+def test_pasting_the_authorization_url_back_is_rejected(url):
+    """Anthropic's authorize URL carries a literal `code=true`, which would otherwise be read as the code."""
+    with pytest.raises(ValueError, match="authorization URL, not the result"):
+        parse_authorization_input(url)
+
+
+def test_the_rejection_names_what_to_copy_instead():
+    with pytest.raises(ValueError, match="127.0.0.1 page it then fails to load"):
+        parse_authorization_input(ANTHROPIC_AUTHORIZE_URL)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:53692/callback?code=REAL&state=st",
+        "http://127.0.0.1:56121/callback?code=REAL",
+        "http://localhost:53692/callback?state=st&code=REAL",
+    ],
+)
+def test_a_real_redirect_url_is_still_accepted(url):
+    code, _ = parse_authorization_input(url)
+    assert code == "REAL"
+
+
+# --- pending logins -------------------------------------------------------------------------------
+
+
+def _pending(**overrides):
+    record = {
+        "verifier": "v",
+        "state": "s",
+        "redirect_uri": "http://127.0.0.1:1/callback",
+        "authorize_url": "https://example.com/authorize",
+        "token_endpoint": "https://example.com/token",
+        "created_at": time.time(),
+    }
+    record.update(overrides)
+    return record
+
+
+def test_a_fresh_pending_login_is_usable():
+    assert pending_is_fresh(_pending()) is True
+
+
+def test_an_old_pending_login_is_not_usable():
+    assert pending_is_fresh(_pending(created_at=time.time() - PENDING_LOGIN_TTL_SECONDS - 1)) is False
+
+
+def test_a_pending_login_without_a_timestamp_is_not_usable():
+    assert pending_is_fresh(_pending(created_at=None)) is False
+    assert pending_is_fresh(_pending(created_at="lunchtime")) is False

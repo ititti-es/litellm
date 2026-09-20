@@ -254,7 +254,9 @@ def test_login_reuses_a_valid_stored_token(tmp_path, monkeypatch):
 
 def test_manual_login_rejects_a_mismatched_state(tmp_path, monkeypatch):
     authenticator = _authenticator(tmp_path, monkeypatch, _StubClient(_token_response()))
-    with pytest.raises(AnthropicOAuthError, match="state mismatch"):
+    # The message names the likely cause rather than reporting a bare state mismatch, because the usual
+    # way to reach it is pasting a code minted by an earlier run.
+    with pytest.raises(AnthropicOAuthError, match="different login attempt"):
         authenticator.login(prompt_for_code=lambda url: "the-code#not-the-state")
 
 
@@ -375,3 +377,118 @@ def test_oauth_is_not_consulted_without_the_flag(tmp_path, monkeypatch):
             optional_params={},
             litellm_params={},
         )
+
+
+# --- the two-step login ----------------------------------------------------------------------------
+
+
+def test_begin_login_persists_what_completion_needs(tmp_path, monkeypatch):
+    """The verifier must outlive the process that built the URL, or an aborted login is unrecoverable."""
+    import os
+    from urllib.parse import parse_qs, urlparse
+
+    authenticator = _authenticator(tmp_path, monkeypatch)
+    pending = authenticator.begin_login()
+
+    assert os.path.exists(os.path.join(authenticator.token_dir, "pending.json"))
+    params = parse_qs(urlparse(pending["authorize_url"]).query)
+    assert params["state"][0] == pending["state"]
+    assert params["code_challenge"][0] != pending["verifier"], "the challenge is a hash, not the verifier"
+
+
+def test_completion_in_a_separate_authenticator_sends_the_original_verifier(tmp_path, monkeypatch):
+    import base64
+    import hashlib
+    from urllib.parse import parse_qs, urlparse
+
+    pending = _authenticator(tmp_path, monkeypatch).begin_login()
+    challenge = parse_qs(urlparse(pending["authorize_url"]).query)["code_challenge"][0]
+
+    # A second CLI invocation builds its own authenticator.
+    client = _StubClient(_token_response())
+    record = _authenticator(tmp_path, monkeypatch, client).complete_login(
+        f"http://127.0.0.1:53692/callback?code=THE-CODE&state={pending['state']}"
+    )
+
+    sent = client.requests[0]["json"]["code_verifier"]
+    derived = base64.urlsafe_b64encode(hashlib.sha256(sent.encode()).digest()).rstrip(b"=").decode()
+    assert derived == challenge, "the verifier must still match the challenge that was in the URL"
+    assert record["access_token"] == "sk-ant-oat01-new"
+
+
+def test_completion_clears_the_pending_login(tmp_path, monkeypatch):
+    import os
+
+    authenticator = _authenticator(tmp_path, monkeypatch, _StubClient(_token_response()))
+    pending = authenticator.begin_login()
+    authenticator.complete_login(f"code-1#{pending['state']}")
+
+    assert not os.path.exists(os.path.join(authenticator.token_dir, "pending.json"))
+
+
+def test_a_failed_completion_keeps_the_pending_login(tmp_path, monkeypatch):
+    """A provider rejection must not force the user back through the browser."""
+    import os
+
+    client = _StubClient(
+        httpx.Response(400, json={"error": "server_error"}, request=httpx.Request("POST", ANTHROPIC_OAUTH_TOKEN_URL))
+    )
+    authenticator = _authenticator(tmp_path, monkeypatch, client)
+    pending = authenticator.begin_login()
+
+    with pytest.raises(AnthropicOAuthError):
+        authenticator.complete_login(f"code-1#{pending['state']}")
+
+    assert os.path.exists(os.path.join(authenticator.token_dir, "pending.json"))
+
+
+def test_completion_without_a_started_login_says_so(tmp_path, monkeypatch):
+    with pytest.raises(AnthropicOAuthError, match="No Anthropic login is in progress"):
+        _authenticator(tmp_path, monkeypatch).complete_login("some-code")
+
+
+def test_a_code_from_an_earlier_attempt_is_named_as_such(tmp_path, monkeypatch):
+    """The failure this replaces surfaced as an opaque 'PKCE verification failed' from the provider."""
+    authenticator = _authenticator(tmp_path, monkeypatch, _StubClient(_token_response()))
+    authenticator.begin_login()
+    authenticator.begin_login()  # the user re-ran; a new challenge is pending now
+
+    with pytest.raises(AnthropicOAuthError, match="different login attempt"):
+        authenticator.complete_login("old-code#the-first-state")
+
+
+def test_an_expired_pending_login_is_discarded(tmp_path, monkeypatch):
+    import json
+    import os
+    import time as time_module
+
+    from litellm.llms.base_llm.oauth import PENDING_LOGIN_TTL_SECONDS
+
+    authenticator = _authenticator(tmp_path, monkeypatch)
+    authenticator.begin_login()
+    path = os.path.join(authenticator.token_dir, "pending.json")
+    stale = json.loads(open(path).read())
+    stale["created_at"] = time_module.time() - PENDING_LOGIN_TTL_SECONDS - 1
+    open(path, "w").write(json.dumps(stale))
+
+    with pytest.raises(AnthropicOAuthError, match="expired"):
+        authenticator.complete_login("some-code")
+    assert not os.path.exists(path), "an expired login is cleared rather than left to confuse the next run"
+
+
+def test_pasting_the_authorize_url_back_is_rejected(tmp_path, monkeypatch):
+    authenticator = _authenticator(tmp_path, monkeypatch, _StubClient(_token_response()))
+    pending = authenticator.begin_login()
+
+    with pytest.raises(AnthropicOAuthError, match="authorization URL, not the result"):
+        authenticator.complete_login(pending["authorize_url"])
+
+
+def test_logout_also_clears_a_pending_login(tmp_path, monkeypatch):
+    import os
+
+    authenticator = _authenticator(tmp_path, monkeypatch)
+    authenticator.begin_login()
+    authenticator.logout()
+
+    assert not os.path.exists(os.path.join(authenticator.token_dir, "pending.json"))

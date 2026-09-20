@@ -10,6 +10,7 @@ are read as plain JSON rather than through each authenticator, so this stays cle
 
 import json
 import os
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Final
@@ -75,14 +76,41 @@ def _report_logout(name: str, removed: bool) -> None:
     click.echo(f"{name}: credentials removed." if removed else f"{name}: no stored credentials.")
 
 
+def _flag_value(flags: Sequence[str], name: str) -> str | None:
+    """Read `--name value` or `--name=value` out of the passthrough arguments."""
+    for index, flag in enumerate(flags):
+        if flag == name and index + 1 < len(flags):
+            return flags[index + 1]
+        if flag.startswith(f"{name}="):
+            return flag.split("=", 1)[1]
+    return None
+
+
+def _explain_url(authorize_url: str) -> None:
+    click.echo("1. Open this URL in a browser on any machine:")
+    click.echo("")
+    click.echo(f"   {authorize_url}")
+    click.echo("")
+    click.echo("2. Approve the request there.")
+    click.echo("3. The browser then lands on a 127.0.0.1 page that FAILS TO LOAD. That is the success case.")
+    click.echo("4. Copy that failed page's address (not the URL above) -- the code is in it.")
+
+
 def _prompt_for_code(authorize_url: str) -> str:
-    click.echo("Open this URL in a browser on any machine, then paste the result below:")
-    click.echo("")
-    click.echo(authorize_url)
-    click.echo("")
-    click.echo("The browser will land on a 127.0.0.1 address that fails to load. That is expected:")
-    click.echo("copy the whole address bar, or just the code after `code=`.")
+    _explain_url(authorize_url)
     return click.prompt("Authorization code (or the full redirect URL)", type=str)
+
+
+def _can_prompt() -> bool:
+    """Whether there is a terminal to read an answer from.
+
+    Run from a script, a pipe or a non-interactive shell, `click.prompt` gets EOF and aborts at once. The
+    login is then split in two: print the URL now, take the code in a second command.
+    """
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def _wants_paste(flags: Sequence[str]) -> bool:
@@ -97,6 +125,16 @@ def _wants_paste(flags: Sequence[str]) -> bool:
     return "--manual" in flags or is_remote_session()
 
 
+def _start_login(authorize_url: str, command: str) -> None:
+    """Print the URL and how to finish, for a shell that cannot be prompted."""
+    _explain_url(authorize_url)
+    click.echo("")
+    click.echo("Then finish the login with:")
+    click.echo(f"  {command} --code '<the code>'")
+    click.echo("")
+    click.echo("The link is valid for 15 minutes.")
+
+
 def _anthropic(action: str, flags: Sequence[str]) -> None:
     from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator, AnthropicOAuthError
 
@@ -108,13 +146,20 @@ def _anthropic(action: str, flags: Sequence[str]) -> None:
     if action == "logout":
         _report_logout(name, authenticator.logout())
         return
-    paste: Final = _wants_paste(flags)
+    supplied: Final = _flag_value(flags, "--code")
     try:
-        record: Final = authenticator.login(
-            force="--force" in flags,
-            no_browser=paste or "--no-browser" in flags,
-            prompt_for_code=_prompt_for_code if paste else None,
-        )
+        if supplied is not None:
+            record = authenticator.complete_login(supplied)
+        else:
+            paste = _wants_paste(flags)
+            if paste and not _can_prompt():
+                _start_login(authenticator.begin_login()["authorize_url"], "litellm anthropic-oauth login")
+                return
+            record = authenticator.login(
+                force="--force" in flags,
+                no_browser=paste or "--no-browser" in flags,
+                prompt_for_code=_prompt_for_code if paste else None,
+            )
     except AnthropicOAuthError as exc:
         raise _OAuthCommandError(str(exc)) from exc
     _report_login(name, authenticator.auth_file, record.get("expires_at"))
@@ -131,13 +176,20 @@ def _xai(action: str, flags: Sequence[str]) -> None:
     if action == "logout":
         _report_logout(name, _delete_record(authenticator.auth_file))
         return
-    paste: Final = _wants_paste(flags)
+    supplied: Final = _flag_value(flags, "--code")
     try:
-        record: Final = authenticator.login(
-            force="--force" in flags,
-            no_browser=paste or "--no-browser" in flags,
-            prompt_for_code=_prompt_for_code if paste else None,
-        )
+        if supplied is not None:
+            record = authenticator.complete_login(supplied)
+        else:
+            paste = _wants_paste(flags)
+            if paste and not _can_prompt():
+                _start_login(authenticator.begin_login()["authorize_url"], "litellm xai-oauth login")
+                return
+            record = authenticator.login(
+                force="--force" in flags,
+                no_browser=paste or "--no-browser" in flags,
+                prompt_for_code=_prompt_for_code if paste else None,
+            )
     except XAIOAuthError as exc:
         raise _OAuthCommandError(str(exc)) from exc
     _report_login(name, authenticator.auth_file, record.get("expires_at"))

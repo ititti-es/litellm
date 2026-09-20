@@ -24,6 +24,7 @@ Flags on `login`:
 |---|---|
 | `--force` | ignore a stored token and log in again |
 | `--manual` | print the URL and prompt for the code, instead of waiting on a loopback redirect |
+| `--code VALUE` | finish a login started earlier, from a pasted code or redirect URL |
 | `--browser` | force the loopback flow even in a session detected as remote |
 | `--no-browser` | print the authorization URL rather than opening a browser, but still wait on the loopback |
 
@@ -34,23 +35,45 @@ Anthropic and xAI receive their authorization code on a loopback port. Over SSH 
 report success having done nothing.
 
 `login` therefore detects a remote session — `SSH_CONNECTION`, `SSH_TTY`, `SSH_CLIENT`, or a Linux host
-with neither `DISPLAY` nor `WAYLAND_DISPLAY` — and switches to asking for the code:
+with neither `DISPLAY` nor `WAYLAND_DISPLAY` — and asks for the code instead.
+
+Where there is a terminal, it prompts. Where there is not — a pipe, a script, a non-interactive remote
+command — it prints the URL and stops, because `click.prompt` would only hit EOF and abort:
 
 ```
 $ litellm anthropic-oauth login
-Open this URL in a browser on any machine, then paste the result below:
+1. Open this URL in a browser on any machine:
 
-https://claude.ai/oauth/authorize?code=true&client_id=...
+   https://claude.ai/oauth/authorize?code=true&client_id=...
 
-The browser will land on a 127.0.0.1 address that fails to load. That is expected:
-copy the whole address bar, or just the code after `code=`.
-Authorization code (or the full redirect URL):
+2. Approve the request there.
+3. The browser then lands on a 127.0.0.1 page that FAILS TO LOAD. That is the success case.
+4. Copy that failed page's address (not the URL above) -- the code is in it.
+
+Then finish the login with:
+  litellm anthropic-oauth login --code '<the code>'
+
+The link is valid for 15 minutes.
 ```
 
-The failed page *is* the success case: the code is in its URL. Paste the address bar, or just the `code=`
-value.
+**Copy the address of the page that fails, not the URL you were given.** Anthropic's authorization URL
+contains a literal `code=true` parameter, so pasting it back would otherwise look like a valid code and be
+rejected by the provider as `invalid_grant`. That mistake is now caught and named.
 
-If you would rather use the browser flow, forward the port when you connect and pass `--browser`:
+### Why the login has two halves
+
+The PKCE verifier is generated with the URL and must be sent with the code. Holding it only in memory means
+an interrupted login — Ctrl+C, a closed pipe, a walk to another machine — destroys it, and any code from
+that URL can never be exchanged; the provider reports only `PKCE verification failed`.
+
+`begin_login` therefore writes the verifier, state and redirect URI to `pending.json` (`0600`, valid 15
+minutes) and `complete_login` reads it back, so the two halves can run in separate invocations. An
+interrupted login is resumed with `--code`, and a code from a superseded attempt is reported as such rather
+than as a PKCE failure.
+
+### Using a browser on this host instead
+
+Forward the port when you connect and pass `--browser`:
 
 ```sh
 ssh -L 53692:localhost:53692 <host>     # Anthropic

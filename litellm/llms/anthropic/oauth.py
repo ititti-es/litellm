@@ -27,8 +27,10 @@ from typing_extensions import NotRequired, ReadOnly
 
 from litellm._logging import verbose_logger
 from litellm.llms.base_llm.oauth import (
+    PendingLogin,
     TokenFile,
     new_state,
+    pending_is_fresh,
     pkce_pair,
     start_callback_server,
     wait_for_callback,
@@ -162,11 +164,62 @@ class AnthropicOAuthAuthenticator:
         state: Final = new_state()
 
         if prompt_for_code is not None:
-            return self._login_by_paste(verifier, challenge, state, prompt_for_code)
+            pending: Final = self.begin_login()
+            return self.complete_login(prompt_for_code(pending["authorize_url"]))
         return self._login_by_loopback(verifier, challenge, state, no_browser)
+
+    def begin_login(self) -> PendingLogin:
+        """Start a login and persist what completing it will need.
+
+        Returns the pending record, whose `authorize_url` is what the user opens. The PKCE verifier is
+        written to disk so `complete_login` can run in a later invocation.
+        """
+        verifier, challenge = pkce_pair()
+        state: Final = new_state()
+        redirect_uri: Final = f"http://127.0.0.1:{ANTHROPIC_OAUTH_REDIRECT_PORT}{ANTHROPIC_OAUTH_REDIRECT_PATH}"
+        pending: Final[PendingLogin] = {  # mutable-ok: written straight to the pending file
+            "verifier": verifier,
+            "state": state,
+            "redirect_uri": redirect_uri,
+            "authorize_url": self._build_authorize_url(redirect_uri, challenge, state),
+            "token_endpoint": ANTHROPIC_OAUTH_TOKEN_URL,
+            "created_at": time.time(),
+        }
+        self._pending_file().write(pending)
+        return pending
+
+    def complete_login(self, pasted: str) -> AnthropicOAuthRecord:
+        """Finish a login started by `begin_login`, from a pasted code or redirect URL."""
+        store: Final = self._pending_file()
+        raw: Final = store.read()
+        if not isinstance(raw, dict) or not raw.get("verifier"):
+            raise AnthropicOAuthError("No Anthropic login is in progress. Run `litellm anthropic-oauth login` first.")
+        if not pending_is_fresh(raw):
+            store.delete()
+            raise AnthropicOAuthError("The Anthropic login has expired. Run `litellm anthropic-oauth login` again.")
+
+        code, returned_state = parse_authorization_input(pasted)
+        if returned_state is not None and returned_state != raw.get("state"):
+            raise AnthropicOAuthError(
+                "This code came from a different login attempt. Run `litellm anthropic-oauth login` again and "
+                "use the URL it prints."
+            )
+
+        record: Final = self._exchange_and_store(
+            code=code,
+            state=raw["state"],
+            verifier=raw["verifier"],
+            redirect_uri=raw["redirect_uri"],
+        )
+        store.delete()
+        return record
+
+    def _pending_file(self) -> TokenFile:
+        return TokenFile(os.path.join(self.token_dir, "pending.json"))
 
     def logout(self) -> bool:
         """Delete the stored credentials. Returns whether a file was removed."""
+        self._pending_file().delete()
         return self._store.delete()
 
     def _login_by_loopback(
@@ -204,20 +257,6 @@ class AnthropicOAuthAuthenticator:
         if not code:
             raise AnthropicOAuthError("Anthropic authorization failed: no code returned")
 
-        return self._exchange_and_store(code=code, state=state, verifier=verifier, redirect_uri=redirect_uri)
-
-    def _login_by_paste(
-        self,
-        verifier: str,
-        challenge: str,
-        state: str,
-        prompt_for_code: Callable[[str], str],
-    ) -> AnthropicOAuthRecord:
-        redirect_uri: Final = f"http://127.0.0.1:{ANTHROPIC_OAUTH_REDIRECT_PORT}{ANTHROPIC_OAUTH_REDIRECT_PATH}"
-        authorize_url: Final = self._build_authorize_url(redirect_uri, challenge, state)
-        code, returned_state = parse_authorization_input(prompt_for_code(authorize_url))
-        if returned_state is not None and returned_state != state:
-            raise AnthropicOAuthError("Anthropic OAuth state mismatch")
         return self._exchange_and_store(code=code, state=state, verifier=verifier, redirect_uri=redirect_uri)
 
     def _exchange_and_store(

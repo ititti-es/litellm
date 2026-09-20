@@ -29,6 +29,10 @@ from litellm._logging import verbose_logger
 LOOPBACK_HOST: Final = "127.0.0.1"
 CALLBACK_POLL_SECONDS: Final = 1
 
+# Query parameters that belong to an authorization *request*; seeing one means the user pasted the URL they
+# were asked to open rather than where it sent them.
+_AUTHORIZE_URL_MARKERS: Final = ("code_challenge", "response_type", "client_id", "scope")
+
 
 class CallbackResult(TypedDict):
     """The query parameters an authorization server sends back to the loopback redirect."""
@@ -78,6 +82,14 @@ def parse_authorization_input(value: str) -> tuple[str, str | None]:
         raise ValueError("No authorization code provided")
     if text.startswith("http://") or text.startswith("https://"):
         params: Final = parse_qs(urlparse(text).query)
+        # An authorization URL is easy to paste back by mistake, and Anthropic's carries a literal
+        # `code=true`, which would otherwise be read as the code itself and rejected as invalid by the
+        # provider. These parameters only ever appear on the request, never on the redirect back.
+        if any(marker in params for marker in _AUTHORIZE_URL_MARKERS):
+            raise ValueError(
+                "That is the authorization URL, not the result of opening it. Open it in a browser, approve "
+                "the request, and copy the address of the 127.0.0.1 page it then fails to load."
+            )
         code: Final = _first(params, "code")
         if not code:
             raise ValueError("Redirect URL contained no authorization code")
@@ -182,6 +194,33 @@ def wait_for_callback(server: CallbackServer, timeout_seconds: float) -> Callbac
     finally:
         server.server_close()
     return None
+
+
+PENDING_LOGIN_TTL_SECONDS: Final = 900
+
+
+class PendingLogin(TypedDict):
+    """A login that has been started but not yet exchanged for a token.
+
+    The PKCE verifier exists only in the process that built the authorize URL, so a single-shot command
+    throws it away if the user cannot answer the prompt right then -- and any code from that URL becomes
+    unusable. Persisting it lets the two halves happen in separate invocations, which is what a
+    non-interactive shell or a slow trip to another machine's browser requires.
+    """
+
+    verifier: ReadOnly[str]
+    state: ReadOnly[str]
+    redirect_uri: ReadOnly[str]
+    authorize_url: ReadOnly[str]
+    token_endpoint: ReadOnly[str]
+    created_at: ReadOnly[float]
+
+
+def pending_is_fresh(pending: PendingLogin, now: float | None = None) -> bool:
+    created: Final = pending.get("created_at")
+    if not isinstance(created, (int, float)):
+        return False
+    return (now if now is not None else time.time()) - float(created) < PENDING_LOGIN_TTL_SECONDS
 
 
 class TokenFile:

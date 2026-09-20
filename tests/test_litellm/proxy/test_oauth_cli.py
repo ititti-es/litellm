@@ -7,6 +7,20 @@ import pytest
 from litellm.proxy.oauth_cli import handle_oauth_command
 
 
+@pytest.fixture(autouse=True)
+def deterministic_session(monkeypatch):
+    """Pin what the CLI reads from its environment.
+
+    The command chooses between the loopback, prompt and print-and-stop paths from the session and from
+    whether stdin is a terminal. Left unpinned, these tests would take different paths depending on where
+    the suite itself is run -- under pytest stdin is never a tty, and CI may or may not be over SSH.
+    """
+    for name in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("litellm.proxy.oauth_cli._can_prompt", lambda: True)
+
+
 @pytest.fixture
 def isolated_credentials(tmp_path, monkeypatch):
     """Point every provider's credential file at a temporary directory."""
@@ -152,15 +166,20 @@ def test_login_failure_becomes_a_click_exception(isolated_credentials, monkeypat
 
 
 @pytest.fixture
-def local_desktop(monkeypatch):
-    for name in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("DISPLAY", ":0")
+def local_desktop():
+    """The default, pinned by `deterministic_session`."""
+    return None
 
 
 @pytest.fixture
 def over_ssh(monkeypatch):
     monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22")
+
+
+@pytest.fixture
+def no_terminal(monkeypatch):
+    """A shell that cannot be prompted: a pipe, a script, or a non-interactive remote command."""
+    monkeypatch.setattr("litellm.proxy.oauth_cli._can_prompt", lambda: False)
 
 
 def _capture_login(monkeypatch, provider_module):
@@ -241,3 +260,69 @@ def test_force_flag_is_passed_through(isolated_credentials, over_ssh, monkeypatc
     handle_oauth_command(("anthropic-oauth", "login", "--force"))
 
     assert calls[0]["force"] is True
+
+
+# --- a shell that cannot be prompted ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider,command", [("anthropic-oauth", "anthropic"), ("xai-oauth", "xai")])
+def test_without_a_terminal_the_url_is_printed_and_the_login_pauses(
+    provider, command, isolated_credentials, over_ssh, no_terminal, monkeypatch, capsys
+):
+    """`click.prompt` gets EOF in a pipe or a non-interactive shell, so the login is split in two."""
+    import importlib
+
+    module = importlib.import_module(f"litellm.llms.{command}.oauth")
+    cls = getattr(module, "AnthropicOAuthAuthenticator" if command == "anthropic" else "XAIOAuthAuthenticator")
+    monkeypatch.setattr(cls, "begin_login", lambda self: {"authorize_url": "https://example.com/authorize"})
+
+    assert handle_oauth_command((provider, "login")) is True
+
+    out = capsys.readouterr().out
+    assert "https://example.com/authorize" in out
+    assert f"litellm {provider} login --code" in out, "the second half of the login must be spelled out"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [("login", "--code", "THE-CODE"), ("login", "--code=THE-CODE")],
+)
+def test_the_code_flag_completes_a_started_login(flags, isolated_credentials, monkeypatch):
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    supplied: list[str] = []
+    monkeypatch.setattr(
+        AnthropicOAuthAuthenticator,
+        "complete_login",
+        lambda self, pasted: supplied.append(pasted) or {"expires_at": time.time() + 3600},
+    )
+
+    assert handle_oauth_command(("anthropic-oauth", *flags)) is True
+    assert supplied == ["THE-CODE"]
+
+
+def test_the_code_flag_does_not_start_a_new_login(isolated_credentials, monkeypatch):
+    """Starting a new login here would replace the pending verifier the code belongs to."""
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    def fail(self):
+        raise AssertionError("begin_login must not run when a code is supplied")
+
+    monkeypatch.setattr(AnthropicOAuthAuthenticator, "begin_login", fail)
+    monkeypatch.setattr(
+        AnthropicOAuthAuthenticator, "complete_login", lambda self, pasted: {"expires_at": time.time() + 60}
+    )
+
+    handle_oauth_command(("anthropic-oauth", "login", "--code", "THE-CODE"))
+
+
+def test_a_completion_failure_is_reported_cleanly(isolated_credentials, monkeypatch):
+    from litellm.llms.anthropic import oauth as anthropic_oauth
+
+    def explode(self, pasted):
+        raise anthropic_oauth.AnthropicOAuthError("This code came from a different login attempt.")
+
+    monkeypatch.setattr(anthropic_oauth.AnthropicOAuthAuthenticator, "complete_login", explode)
+
+    with pytest.raises(click.ClickException, match="different login attempt"):
+        handle_oauth_command(("anthropic-oauth", "login", "--code", "STALE"))
