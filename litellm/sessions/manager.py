@@ -143,9 +143,13 @@ class SessionManager:
     evicted session resolves as Unknown, which callers treat exactly as today's stateless path
     """
 
-    def __init__(self, budget_bytes: int = 256 << 20, clock: CacheClock | None = None) -> None:
+    def __init__(
+        self, budget_bytes: int = 256 << 20, clock: CacheClock | None = None, record_store_false: bool = False
+    ) -> None:
         self._budget: Final = budget_bytes
         self._clock: Final = clock or CacheClock()
+        self.record_store_false = record_store_false  # writable-ok: a config reload may change it
+        """Record `store: false` turns without rewriting them; see SessionManagerSettings.record_store_false"""
         self._turns: Final[dict[str, TurnRecord]] = {}  # mutable-ok: latest upstream turn per held session
         self._sessions: Final[OrderedDict[str, Session]] = OrderedDict()  # mutable-ok: LRU order of held sessions
         self._sizes: Final[dict[str, int]] = {}  # mutable-ok: byte size per held session, kept beside the LRU

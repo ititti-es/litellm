@@ -343,3 +343,19 @@ async def test_the_clients_session_id_is_stored_and_read_back():
     with_metadata = stored.__class__(**{**_fields(stored), "metadata": write.metadata})
     loaded = await PrismaTranscriptStore(FakeRepository(with_metadata), None).load("r1")
     assert loaded is not None and loaded.client_session_id == "ses_client_9"
+
+
+def test_record_store_false_is_off_unless_configured():
+    from litellm.proxy.sessions import configured_session_manager
+
+    assert configured_session_manager({"enabled": True}, None).record_store_false is False
+    assert configured_session_manager({"enabled": True, "record_store_false": True}, None).record_store_false is True
+
+
+def test_a_reload_can_change_record_store_false_without_dropping_held_sessions():
+    from litellm.proxy.sessions import configured_session_manager
+
+    live = configured_session_manager({"enabled": True}, None)
+    reloaded = configured_session_manager({"enabled": True, "record_store_false": True}, live)
+
+    assert reloaded is live and live.record_store_false is True

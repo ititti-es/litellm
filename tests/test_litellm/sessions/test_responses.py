@@ -295,3 +295,102 @@ async def test_an_unnamed_session_still_gets_a_fresh_one_every_turn():
 
     assert isinstance(first, PendingTurn) and isinstance(second, PendingTurn)
     assert first.key != second.key and second.prior is None
+
+
+# --- store: false, recorded but never rewritten ------------------------------------------------------------
+
+
+@pytest.fixture
+def upstream_inputs(monkeypatch):
+    """What each call actually sent upstream."""
+    import importlib
+
+    main = importlib.import_module("litellm.responses.main")  # `litellm.responses` is also a function
+
+    sent = []
+    original = main.responses
+
+    def recording(*args, **kwargs):
+        sent.append(kwargs.get("input"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(main, "responses", recording)
+    return sent
+
+
+def _client_history(*exchanges, then):
+    """What opencode or Codex sends: the whole conversation, every turn, with store: false."""
+    items = []
+    for prompt, reply in exchanges:
+        items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]})
+        items.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": reply}]})
+    return [*items, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": then}]}]
+
+
+async def test_store_false_is_recorded_when_the_gateway_is_its_owners_store(manager):
+    manager.record_store_false = True
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1", input="hi", store=False, mock_response="yo", litellm_metadata={"user_api_key_hash": "k"}
+    )
+
+    assert manager.stats().commits == 1
+
+
+async def test_a_store_false_client_keeps_its_own_history_and_the_gateway_only_records_it(manager, upstream_inputs):
+    """The client owns this conversation's state: what it sends is what the provider gets."""
+    manager.record_store_false = True
+    meta = {"user_api_key_hash": "k"}
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input=_client_history(then="one"),
+        store=False,
+        mock_response="a1",
+        litellm_metadata=meta,
+        litellm_session_id="thread-1",
+    )
+    second = _client_history(("one", "a1"), then="two")
+    response = await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input=second,
+        store=False,
+        mock_response="a2",
+        litellm_metadata=meta,
+        litellm_session_id="thread-1",
+    )
+
+    assert upstream_inputs[-1] == second
+    resolved = manager.resolve(_provider_id(response.id), "k")
+    assert isinstance(resolved, Resolved)
+    assert manager.stats().sessions == 1
+    assert [item["content"][0]["text"] for item in resolved.session.items] == ["one", "a1", "two", "a2"]
+
+
+async def test_store_false_passes_previous_response_id_through_untouched(manager, upstream_inputs):
+    """Even for a session the gateway holds, it does not substitute its own copy of the history."""
+    manager.record_store_false = True
+    first = await litellm.aresponses(
+        model="openai/gpt-4.1", input="one", mock_response="a1", litellm_metadata={"user_api_key_hash": "k"}
+    )
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="two",
+        store=False,
+        previous_response_id=first.id,
+        mock_response="a2",
+        litellm_metadata={"user_api_key_hash": "k"},
+    )
+
+    assert upstream_inputs[-1] == "two"
+
+
+async def test_store_false_is_still_not_recorded_by_default(manager):
+    assert manager.record_store_false is False
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1", input="hi", store=False, mock_response="yo", litellm_metadata={"user_api_key_hash": "k"}
+    )
+
+    assert manager.stats().commits == 0

@@ -49,11 +49,12 @@ def configured_session_manager(raw: object, current: SessionManager | None) -> S
         return None
     budget: Final = settings.budget_mb << 20
     if current is not None and current.budget_bytes == budget:
+        current.record_store_false = settings.record_store_false
         return current
     clock: Final = CacheClock(
         target=settings.compaction.target_hit_rate, half_life_seconds=settings.compaction.evidence_half_life_seconds
     )
-    return SessionManager(budget_bytes=budget, clock=clock)
+    return SessionManager(budget_bytes=budget, clock=clock, record_store_false=settings.record_store_false)
 
 
 class PrismaTranscriptStore:

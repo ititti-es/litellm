@@ -81,6 +81,23 @@ be worth doing.
 
 Nothing changes for a client that sends `previous_response_id`, or for one that sends no session id at all.
 
+## `store: false`
+
+Harnesses that keep their own history — opencode, Codex — send `store: false` on every turn. The flag asks the
+*provider* not to keep the response. By default the manager reads it the same way and records nothing, which
+on a gateway that is its owner's own session store means none of those harnesses' turns are ever recorded.
+
+`session_manager.record_store_false: true` records them anyway, with one rule: **a `store: false` turn is
+recorded, never rewritten.** The client owns that conversation's state, so the provider receives the input
+exactly as the client sent it — no replayed history, and `previous_response_id` passes through untouched. The
+gateway only keeps the record, continuing the client's session by the rule in "Clients that keep their own
+history". The one thing still added is `prompt_cache_key`, and only when the client sent none: a routing hint
+that keeps the provider's cache warm, not content.
+
+Compaction and recording-only turns don't combine: a compacted transcript no longer reproduces the history
+the client resends, so the next turn would start a new session. Leave compaction off where most traffic is
+`store: false`.
+
 ## Open
 
 - Compaction calls are attributed to the session's key in metadata but may not appear in per-key spend tracking.

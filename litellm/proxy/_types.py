@@ -2638,6 +2638,15 @@ class SessionManagerSettings(LiteLLMPydanticObjectBase):
         default_factory=SessionCompactionSettings,
         description="Compact sessions while their upstream prompt cache is still warm, just before it expires",
     )
+    record_store_false: bool = Field(
+        False,
+        description=(
+            "Also record turns sent with `store: false`. That flag asks the provider not to keep the response, and "
+            "harnesses that hold their own history (opencode, Codex) always send it. On a gateway that is its "
+            "owner's own session store, those turns can be recorded anyway; the upstream request is not changed, "
+            "the client's input is sent exactly as it arrived"
+        ),
+    )
 
 
 class ConfigGeneralSettings(LiteLLMPydanticObjectBase):

@@ -704,7 +704,15 @@ async def aresponses(
                 ),
             )
 
-        session_turn: Final = None if store is False else await _begin_session_turn(previous_response_id, input, kwargs)
+        # `store: false` is the client keeping its own history. By default nothing is recorded; with
+        # record_store_false the turn is recorded but never rewritten -- no replayed history, and
+        # previous_response_id passes through -- because the client, not the gateway, owns that state.
+        record_only: Final = store is False
+        session_turn: Final = (
+            await _begin_session_turn(previous_response_id, input, kwargs)
+            if not record_only or _records_store_false()
+            else None
+        )
         if isinstance(session_turn, Forbidden):
             raise litellm.BadRequestError(
                 message=f"Previous response {previous_response_id} not found",
@@ -713,7 +721,7 @@ async def aresponses(
             )
         session_input: Final = (
             session_turn.upstream_input()
-            if isinstance(session_turn, PendingTurn) and session_turn.prior is not None
+            if isinstance(session_turn, PendingTurn) and session_turn.prior is not None and not record_only
             else None
         )
         affinity: Final = turn_affinity(session_turn, custom_llm_provider, kwargs)
@@ -837,6 +845,11 @@ def _deployment_id(kwargs: Mapping[str, object]) -> str | None:
     model_info: Final = kwargs.get("model_info")
     deployment: Final = model_info.get("id") if isinstance(model_info, dict) else None
     return deployment if isinstance(deployment, str) else None
+
+
+def _records_store_false() -> bool:
+    manager: Final = litellm.session_manager
+    return manager is not None and manager.record_store_false
 
 
 async def _begin_session_turn(
