@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
 
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
+    forces_upstream_stream = True  # the Codex backend only answers with an event stream
+
     def __init__(self) -> None:
         super().__init__()
         self.authenticator = Authenticator()

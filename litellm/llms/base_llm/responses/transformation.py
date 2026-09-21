@@ -1,5 +1,6 @@
 import types
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import httpx
@@ -27,8 +28,28 @@ else:
 
 
 class BaseResponsesAPIConfig(ABC):
+    forces_upstream_stream: bool = False
+    """The provider only speaks server-sent events, so its request always says `stream: true`.
+
+    That flag then describes the wire, not the caller. A caller who did not ask to stream still expects one
+    response back, so the handler has to collect the events itself instead of handing the stream through.
+    """
+
     def __init__(self):
         pass
+
+    def is_stream_request(
+        self, requested: bool, data: Mapping[str, object], extra_body: Mapping[str, object] | None
+    ) -> bool:
+        """Whether the caller is to be answered with a stream.
+
+        `data` is the provider request after transformation; an `extra_body` the caller merged in can also ask
+        for one. A provider that forces streaming upstream sets `stream` in `data` regardless of the caller, so
+        for it only what the caller asked for counts.
+        """
+        if self.forces_upstream_stream:
+            return bool(requested or (extra_body is not None and extra_body.get("stream")))
+        return bool(requested or data.get("stream"))
 
     @property
     @abstractmethod
