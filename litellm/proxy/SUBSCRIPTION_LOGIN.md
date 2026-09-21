@@ -235,7 +235,8 @@ rebase. `litellm anthropic-oauth login` supplies the credential; `ANTHROPIC_API_
 gateway serving requests with tools enabled would hand every caller code execution on the proxy host. Enable
 them only where every caller is trusted.
 
-The credential goes to the subprocess on file descriptor 3, never in its environment or argv, both of which
+The credential goes to the subprocess on a pipe, whose descriptor number is passed in
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` — never the token itself in its environment or argv, both of which
 are readable through `/proc`. `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are scrubbed from the child
 environment so an ambient one cannot be used by accident.
 
@@ -259,7 +260,13 @@ Two consequences worth knowing:
 - **The session manager does not drive this provider.** Claude Code owns the transcript, its caching and its
   own compaction. Layering the gateway's transcript on top would be two owners for one conversation, which
   is the duplication this fork exists to remove. The gateway still keeps a *record* of it; see below.
-- **A subprocess per request** costs process startup and rules out streaming today.
+- **A subprocess per request** costs process startup: the first token arrives after roughly six seconds.
+  Replies stream (`--output-format stream-json --include-partial-messages`), so everything after that
+  arrives as it is written. Each run is its own process group, and a caller who disconnects mid-reply ends it
+  and anything it started.
+- **No login of its own is used.** `claude_cli_config_dir` gives Claude Code a home apart from the interactive
+  one, and it authenticates only with the token on the pipe. Verified: from an empty home the gateway's token
+  answers and a bogus one fails.
 
 ### Where the transcript goes
 

@@ -8,7 +8,8 @@ from typing import Final, TypedDict
 from pydantic import TypeAdapter, ValidationError
 from typing_extensions import NotRequired, ReadOnly
 
-from litellm.types.utils import Choices, Message, ModelResponse, Usage
+from litellm.types.llms.openai import ChatCompletionUsageBlock
+from litellm.types.utils import Choices, GenericStreamingChunk, Message, ModelResponse, Usage
 
 from .common_utils import CLAUDE_CLI_DEFAULT_SYSTEM_PROMPT, ClaudeCLIError
 
@@ -120,14 +121,21 @@ def usage_of(result: CliResult) -> Usage:
     )
 
 
-def to_model_response(result: CliResult, model: str, response: ModelResponse) -> ModelResponse:
+def finish_reason_of(result: CliResult) -> str:
+    return _FINISH_REASONS.get(result.get("stop_reason") or "", "stop")
+
+
+def raise_if_error(result: CliResult) -> None:
     if result.get("is_error"):
         raise ClaudeCLIError(f"Claude CLI reported an error: {result.get('result') or result.get('subtype')}")
+
+
+def to_model_response(result: CliResult, model: str, response: ModelResponse) -> ModelResponse:
+    raise_if_error(result)
     text: Final = result.get("result") or ""
-    stop_reason: Final = result.get("stop_reason")
     response.choices = [  # mutable-ok: the single choice this interface returns
         Choices(
-            finish_reason=_FINISH_REASONS.get(stop_reason or "", "stop"),
+            finish_reason=finish_reason_of(result),
             index=0,
             message=Message(content=text, role="assistant"),
         )
@@ -135,3 +143,80 @@ def to_model_response(result: CliResult, model: str, response: ModelResponse) ->
     response.model = model
     setattr(response, "usage", usage_of(result))  # noqa: B010  # ModelResponse declares usage dynamically
     return response
+
+
+# --- streaming (`--output-format stream-json --include-partial-messages`) --------------------------------------
+#
+# One JSON object per line. Text arrives as `stream_event` records wrapping the Messages API's own
+# `content_block_delta` / `text_delta` events, and the run ends with a `result` record of exactly the shape the
+# non-streaming `json` format returns. Everything else (system, assistant, rate-limit records) is bookkeeping.
+
+_STREAM_EVENT: Final = "stream_event"
+_RESULT: Final = "result"
+
+
+def _line_object(line: str) -> Mapping[str, object] | None:
+    text: Final = line.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload: Final = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def stream_text(line: str) -> str | None:
+    """The text a stream line adds to the reply, if it adds any."""
+    record: Final = _line_object(line)
+    if record is None or record.get("type") != _STREAM_EVENT:
+        return None
+    event: Final = record.get("event")
+    if not isinstance(event, Mapping) or event.get("type") != "content_block_delta":
+        return None
+    delta: Final = event.get("delta")
+    if not isinstance(delta, Mapping) or delta.get("type") != "text_delta":
+        return None
+    text: Final = delta.get("text")
+    return text if isinstance(text, str) and text else None
+
+
+def stream_result(line: str) -> CliResult | None:
+    """The run's closing record, if this line is it."""
+    record: Final = _line_object(line)
+    if record is None or record.get("type") != _RESULT:
+        return None
+    try:
+        return _RESULT_ADAPTER.validate_python(record)
+    except ValidationError as exc:
+        raise ClaudeCLIError(f"Claude CLI returned an unexpected result record: {exc}") from exc
+
+
+def text_chunk(text: str) -> GenericStreamingChunk:
+    return {  # mutable-ok: GenericStreamingChunk is the TypedDict CustomLLM streaming requires
+        "text": text,
+        "is_finished": False,
+        "finish_reason": "",
+        "usage": None,
+        "index": 0,
+        "tool_use": None,
+    }
+
+
+def final_chunk(result: CliResult) -> GenericStreamingChunk:
+    """The closing chunk: why the reply stopped and what it cost. Carries no text of its own."""
+    raise_if_error(result)
+    usage: Final = usage_of(result)
+    block: Final[ChatCompletionUsageBlock] = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    return {  # mutable-ok: GenericStreamingChunk is the TypedDict CustomLLM streaming requires
+        "text": "",
+        "is_finished": True,
+        "finish_reason": finish_reason_of(result),
+        "usage": block,
+        "index": 0,
+        "tool_use": None,
+    }

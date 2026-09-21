@@ -28,9 +28,9 @@ CLAUDE_CLI_DEFAULT_SYSTEM_PROMPT: Final = (
 CLAUDE_CLI_NO_TOOLS: Final = "*"
 
 # The name of the environment variable Claude Code reads a file descriptor number from. Passing the token
-# this way keeps it out of the child's environment, where /proc would expose it.
+# this way keeps it out of the child's environment, where /proc would expose it. The number is set per call
+# to wherever the pipe actually is; see _TokenPipe.child_env.
 CLAUDE_CLI_TOKEN_FD_ENV: Final = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
-CLAUDE_CLI_TOKEN_FD: Final = 3
 
 # Session ids are UUIDs, and Claude Code accepts one we choose. Deriving it from the caller's session means
 # no mapping table has to be kept anywhere.

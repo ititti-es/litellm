@@ -19,19 +19,22 @@ so no mapping is stored and a restart resumes the same conversation.
 
 import asyncio
 import os
+import signal
 import subprocess
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import tempfile
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, Protocol
+from typing import Final, NamedTuple, Protocol, TypeAlias
 
 from litellm._logging import verbose_logger
 from litellm.llms.custom_llm import CustomLLM
-from litellm.types.utils import ModelResponse
+from litellm.types.utils import GenericStreamingChunk, ModelResponse
 
 from .common_utils import (
     CLAUDE_CLI_DEFAULT_TIMEOUT,
     CLAUDE_CLI_NO_TOOLS,
-    CLAUDE_CLI_TOKEN_FD,
     CLAUDE_CLI_TOKEN_FD_ENV,
     ClaudeCLIError,
     binary_path,
@@ -39,7 +42,17 @@ from .common_utils import (
     session_uuid,
 )
 from .sync import SyncRequest, sync_transcript
-from .transformation import CliResult, parse_cli_output, render_prompt, system_prompt_of, to_model_response
+from .transformation import (
+    CliResult,
+    final_chunk,
+    parse_cli_output,
+    render_prompt,
+    stream_result,
+    stream_text,
+    system_prompt_of,
+    text_chunk,
+    to_model_response,
+)
 
 
 class CommandRunner(Protocol):
@@ -56,11 +69,40 @@ class AsyncCommandRunner(Protocol):
     ) -> Awaitable[tuple[int, str, str]]: ...
 
 
+class StreamExit(NamedTuple):
+    """The last item a stream runner yields, once the process has ended."""
+
+    returncode: int
+    stderr: str
+
+
+StreamItem: TypeAlias = str | StreamExit
+
+
+class StreamRunner(Protocol):
+    """Runs the CLI, yielding each stdout line as it arrives and then a StreamExit."""
+
+    def __call__(
+        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+    ) -> Iterator[StreamItem]: ...
+
+
+class AsyncStreamRunner(Protocol):
+    def __call__(
+        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+    ) -> AsyncIterator[StreamItem]: ...
+
+
 _SCRUBBED_ENV: Final = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")
 _STARTED_SESSIONS: Final[set[str]] = set()  # mutable-ok: process-local record of sessions already opened
 _RESUME_FLAG: Final = "--resume"
 _NEW_SESSION_FLAG: Final = "--session-id"
 _NO_PARAMS: Final[Mapping[str, object]] = MappingProxyType({})
+_JSON_FORMAT: Final = ("--output-format", "json")
+# Partial messages are what make this a stream of tokens rather than of whole turns; stream-json needs --verbose.
+_STREAM_FORMAT: Final = ("--output-format", "stream-json", "--verbose", "--include-partial-messages")
+# One stream-json line can carry a whole assistant message, well past asyncio's 64 KiB readline default.
+_STREAM_LINE_LIMIT: Final = 64 * 1024 * 1024
 
 
 def _params(litellm_params: Mapping[str, object] | None) -> Mapping[str, object]:
@@ -131,7 +173,6 @@ def _child_env(params: Mapping[str, object]) -> Mapping[str, str]:
     env = dict(os.environ)  # mutable-ok: the child's environment, built per call
     for name in _SCRUBBED_ENV:
         env.pop(name, None)
-    env[CLAUDE_CLI_TOKEN_FD_ENV] = str(CLAUDE_CLI_TOKEN_FD)
     config_dir: Final = params.get("claude_cli_config_dir")
     if isinstance(config_dir, str) and config_dir:
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config_dir)
@@ -145,13 +186,13 @@ def _build_command(
     session: str | None,
     resume: bool,
     params: Mapping[str, object],
+    streaming: bool = False,
 ) -> tuple[str, ...]:
     command = (
         binary_path(),
         "--print",
         prompt,
-        "--output-format",
-        "json",
+        *(_STREAM_FORMAT if streaming else _JSON_FORMAT),
         "--system-prompt",
         system,
     )
@@ -180,6 +221,15 @@ class _TokenPipe:
         os.set_inheritable(self.read_fd, True)
         return self
 
+    def child_env(self, env: Mapping[str, str]) -> dict[str, str]:
+        """The child's environment, naming the descriptor the token will actually arrive on.
+
+        `pass_fds` keeps a descriptor's number in the child, and `os.pipe()` hands out whichever number is free
+        -- almost never 3 in a long-running server. A fixed number here would point Claude Code at a closed
+        descriptor, and it would silently fall back to whatever login it finds on its own.
+        """
+        return {**env, CLAUDE_CLI_TOKEN_FD_ENV: str(self.read_fd)}  # mutable-ok: the child's environment
+
     def deliver(self) -> None:
         os.write(self.write_fd, self.token.encode())
         os.close(self.write_fd)
@@ -200,6 +250,18 @@ class _TokenPipe:
         self.read_fd = self.write_fd = -1
 
 
+def _end(proc: "subprocess.Popen[bytes] | asyncio.subprocess.Process") -> None:
+    """Kill the run and everything it started.
+
+    Each run is its own process group (`start_new_session`), so this reaches children Claude Code spawned
+    itself; killing only the leader would orphan them.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def _run(command: Sequence[str], env: Mapping[str, str], token: str, timeout: float) -> tuple[int, str, str]:
     with _TokenPipe(token) as pipe:
         try:
@@ -209,9 +271,10 @@ def _run(command: Sequence[str], env: Mapping[str, str], token: str, timeout: fl
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=dict(env),  # mutable-ok: the child's environment, required as a dict
+                env=pipe.child_env(env),
                 pass_fds=(pipe.read_fd,),
                 close_fds=True,
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise ClaudeCLIError(
@@ -223,7 +286,7 @@ def _run(command: Sequence[str], env: Mapping[str, str], token: str, timeout: fl
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            proc.kill()
+            _end(proc)
             proc.communicate()
             raise ClaudeCLIError(f"Claude CLI timed out after {timeout:g}s", status_code=504) from exc
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
@@ -239,9 +302,10 @@ async def _run_async(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=dict(env),  # mutable-ok: the child's environment, required as a dict
+                env=pipe.child_env(env),
                 pass_fds=(pipe.read_fd,),
                 close_fds=True,
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise ClaudeCLIError(
@@ -253,10 +317,98 @@ async def _run_async(
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            proc.kill()
+            _end(proc)
             await proc.communicate()
             raise ClaudeCLIError(f"Claude CLI timed out after {timeout:g}s", status_code=504) from exc
     return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+def _not_found(command: Sequence[str], exc: FileNotFoundError) -> ClaudeCLIError:
+    return ClaudeCLIError(
+        f"Claude CLI not found at {command[0]!r}. Install Claude Code or set CLAUDE_CLI_PATH.", status_code=500
+    )
+
+
+def _stream(command: Sequence[str], env: Mapping[str, str], token: str, timeout: float) -> Iterator[StreamItem]:
+    """Yield stdout a line at a time, then how the process ended.
+
+    stderr goes to a temporary file rather than a pipe: nothing reads a pipe while stdout is being consumed, so
+    a chatty stderr could otherwise fill it and stall the child. Closing the generator early -- a caller who
+    disconnects mid-reply -- kills the process rather than leaving it running to no one.
+    """
+    timed_out: Final = threading.Event()
+    with _TokenPipe(token) as pipe, tempfile.TemporaryFile() as errors:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                env=pipe.child_env(env),
+                pass_fds=(pipe.read_fd,),
+                close_fds=True,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            raise _not_found(command, exc) from exc
+        pipe.close_parent_read()
+        pipe.deliver()
+
+        def expire() -> None:
+            timed_out.set()
+            _end(proc)
+
+        watchdog: Final = threading.Timer(timeout, expire)
+        watchdog.start()
+        try:
+            for raw in proc.stdout or ():
+                yield raw.decode(errors="replace")
+            proc.wait()
+        finally:
+            watchdog.cancel()
+            if proc.poll() is None:
+                _end(proc)
+                proc.wait()
+        if timed_out.is_set():
+            raise ClaudeCLIError(f"Claude CLI timed out after {timeout:g}s", status_code=504)
+        errors.seek(0)
+        yield StreamExit(proc.returncode, errors.read().decode(errors="replace"))
+
+
+async def _stream_async(
+    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+) -> AsyncIterator[StreamItem]:
+    """The async counterpart of `_stream`; stderr is drained by a task so it can never stall the child."""
+    with _TokenPipe(token) as pipe:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=pipe.child_env(env),
+                pass_fds=(pipe.read_fd,),
+                close_fds=True,
+                start_new_session=True,
+                limit=_STREAM_LINE_LIMIT,
+            )
+        except FileNotFoundError as exc:
+            raise _not_found(command, exc) from exc
+        pipe.close_parent_read()
+        pipe.deliver()
+        errors: Final = asyncio.ensure_future(proc.stderr.read() if proc.stderr else asyncio.sleep(0, b""))
+        try:
+            async with asyncio.timeout(timeout):
+                while line := await proc.stdout.readline() if proc.stdout else b"":
+                    yield line.decode(errors="replace")
+                returncode: Final = await proc.wait()
+        except TimeoutError as exc:
+            raise ClaudeCLIError(f"Claude CLI timed out after {timeout:g}s", status_code=504) from exc
+        finally:
+            if proc.returncode is None:
+                _end(proc)
+                await proc.wait()
+        yield StreamExit(returncode, (await errors).decode(errors="replace"))
 
 
 def _plan(
@@ -327,6 +479,71 @@ def _finish(
     return to_model_response(result, model, model_response)
 
 
+@dataclass(slots=True)
+class _StreamedTurn:
+    """What one streamed run produced, gathered as its lines go past."""
+
+    spoke: bool = False
+    result: CliResult | None = None
+    exit: StreamExit | None = None
+
+    def take(self, item: StreamItem) -> GenericStreamingChunk | None:
+        """The chunk to hand the caller for this item, if it carries any text."""
+        if isinstance(item, StreamExit):
+            self.exit = item
+            return None
+        text: Final = stream_text(item)
+        if text is not None:
+            self.spoke = True
+            return text_chunk(text)
+        result: Final = stream_result(item)
+        if result is not None:
+            self.result = result
+        return None
+
+    def session_vanished(self, resumed: bool) -> bool:
+        """Whether this was a resume of a session Claude Code no longer has, failed before saying anything.
+
+        Only then is a retry safe: once text has reached the caller, a second run would repeat it.
+        """
+        return (
+            resumed
+            and not self.spoke
+            and self.exit is not None
+            and self.exit.returncode != 0
+            and is_missing_session(self.exit.stderr)
+        )
+
+    def closing(self, session: str | None, params: Mapping[str, object]) -> GenericStreamingChunk:
+        ended: Final = self.exit
+        if ended is None or ended.returncode != 0 or self.result is None:
+            code: Final = ended.returncode if ended is not None else "?"
+            detail: Final = (ended.stderr if ended is not None else "").strip()[:400] or "no result record"
+            raise ClaudeCLIError(f"Claude CLI exited {code}: {detail}")
+        chunk: Final = final_chunk(self.result)
+        if session:
+            _STARTED_SESSIONS.add(session)
+        _record_transcript(self.result, session, params)
+        return chunk
+
+
+def _attempts(
+    model: str,
+    messages: Sequence[Mapping[str, object]],
+    prompt: str,
+    session: str | None,
+    resume: bool,
+    params: Mapping[str, object],
+) -> tuple[tuple[tuple[str, ...], bool], ...]:
+    """The runs to try, in order: as planned, then -- only for a resume -- afresh with the whole conversation."""
+    system: Final = system_prompt_of(messages)
+    planned: Final = (_build_command(model, prompt, system, session, resume, params, streaming=True), resume)
+    if not resume:
+        return (planned,)
+    whole: Final = render_prompt(messages, latest_only=False)
+    return (planned, (_build_command(model, whole, system, session, False, params, streaming=True), False))
+
+
 class ClaudeCLIHandler(CustomLLM):
     """Runs Claude Code for each request, resuming its session between turns.
 
@@ -334,10 +551,18 @@ class ClaudeCLIHandler(CustomLLM):
     vanished session -- without a real binary or a real subscription.
     """
 
-    def __init__(self, run: CommandRunner | None = None, run_async: AsyncCommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        run: CommandRunner | None = None,
+        run_async: AsyncCommandRunner | None = None,
+        stream: StreamRunner | None = None,
+        stream_async: AsyncStreamRunner | None = None,
+    ) -> None:
         super().__init__()
         self._run = run or _run
         self._run_async = run_async or _run_async
+        self._stream = stream or _stream
+        self._stream_async = stream_async or _stream_async
 
     def completion(  # pyright: ignore[reportIncompatibleMethodOverride]  # base declares a broader signature than this provider needs
         self,
@@ -414,6 +639,77 @@ class ClaudeCLIHandler(CustomLLM):
             returncode, stdout, stderr = await self._run_async(command, env, token, wait)
 
         return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
+
+    def streaming(  # pyright: ignore[reportIncompatibleMethodOverride]  # see completion
+        self,
+        model: str,
+        messages: list,  # mutable-ok: matches CustomLLM's declared signature
+        api_base: str = "",
+        custom_prompt_dict: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        model_response: ModelResponse | None = None,
+        print_verbose: Callable | None = None,
+        encoding: object = None,
+        api_key: str | None = None,
+        logging_obj: object = None,
+        optional_params: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        acompletion: object = None,
+        litellm_params: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        logger_fn: object = None,
+        headers: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        timeout: float | None = None,
+        client: object = None,
+    ) -> Iterator[GenericStreamingChunk]:
+        """Stream the reply as Claude Code produces it; every agent harness asks for this."""
+        provider_model, prompt, session, resume, env, token, wait = _plan(
+            model, messages, litellm_params, api_key, timeout
+        )
+        params: Final = _params(litellm_params)
+        turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
+        for command, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
+            turn = _StreamedTurn()
+            for item in self._stream(command, env, token, wait):
+                if (chunk := turn.take(item)) is not None:
+                    yield chunk
+            if not turn.session_vanished(resumed):
+                break
+            verbose_logger.info("Claude CLI session %s is gone; starting a new one", session)
+            _STARTED_SESSIONS.discard(session or "")
+        yield turn.closing(session, params)
+
+    async def astreaming(  # pyright: ignore[reportIncompatibleMethodOverride]  # see completion
+        self,
+        model: str,
+        messages: list,  # mutable-ok: matches CustomLLM's declared signature
+        api_base: str = "",
+        custom_prompt_dict: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        model_response: ModelResponse | None = None,
+        print_verbose: Callable | None = None,
+        encoding: object = None,
+        api_key: str | None = None,
+        logging_obj: object = None,
+        optional_params: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        acompletion: object = None,
+        litellm_params: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        logger_fn: object = None,
+        headers: dict | None = None,  # mutable-ok: matches CustomLLM's declared signature
+        timeout: float | None = None,
+        client: object = None,
+    ) -> AsyncIterator[GenericStreamingChunk]:
+        provider_model, prompt, session, resume, env, token, wait = _plan(
+            model, messages, litellm_params, api_key, timeout
+        )
+        params: Final = _params(litellm_params)
+        turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
+        for command, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
+            turn = _StreamedTurn()
+            async for item in self._stream_async(command, env, token, wait):
+                if (chunk := turn.take(item)) is not None:
+                    yield chunk
+            if not turn.session_vanished(resumed):
+                break
+            verbose_logger.info("Claude CLI session %s is gone; starting a new one", session)
+            _STARTED_SESSIONS.discard(session or "")
+        yield turn.closing(session, params)
 
 
 claude_cli_handler: Final = ClaudeCLIHandler()

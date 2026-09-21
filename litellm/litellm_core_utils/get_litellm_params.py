@@ -26,7 +26,10 @@ AWS_CREDENTIAL_KWARGS_KEYS: Final = frozenset(
 # Keys `completion()` forwards from its own kwargs into `get_litellm_params`,
 # which are otherwise invisible to it because that call site passes explicit
 # named arguments rather than `**kwargs`.
-FORWARDED_KWARGS_KEYS: Final = AWS_CREDENTIAL_KWARGS_KEYS
+# Deployment settings of the claude_cli provider. Anything not named in these sets is dropped from
+# litellm_params before a provider sees it, which silently disabled all three.
+CLAUDE_CLI_KWARGS_KEYS: Final = frozenset({"claude_cli_config_dir", "claude_cli_allowed_tools", "claude_cli_timeout"})
+FORWARDED_KWARGS_KEYS: Final = AWS_CREDENTIAL_KWARGS_KEYS | CLAUDE_CLI_KWARGS_KEYS
 
 # Pre-define optional kwargs keys as frozenset for O(1) lookups
 # These are extracted from kwargs only if present, avoiding unnecessary .get() calls
@@ -64,6 +67,7 @@ OPTIONAL_KWARGS_KEYS: Final = (
         }
     )
     | AWS_CREDENTIAL_KWARGS_KEYS
+    | CLAUDE_CLI_KWARGS_KEYS
 )
 
 # Backward-compatible alias for existing imports/tests.

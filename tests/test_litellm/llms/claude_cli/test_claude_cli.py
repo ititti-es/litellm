@@ -11,6 +11,7 @@ from litellm.llms.claude_cli.common_utils import (
 )
 from litellm.llms.claude_cli.handler import ClaudeCLIHandler
 from litellm.llms.claude_cli.transformation import (
+    stream_text,
     parse_cli_output,
     render_prompt,
     system_prompt_of,
@@ -18,6 +19,14 @@ from litellm.llms.claude_cli.transformation import (
     usage_of,
 )
 from litellm.types.utils import ModelResponse
+
+
+@pytest.fixture(autouse=True)
+def _no_real_login(monkeypatch):
+    """Tests must not read the machine's own Claude login; before this one they silently depended on it."""
+    from litellm.llms.anthropic.oauth import AnthropicOAuthAuthenticator
+
+    monkeypatch.setattr(AnthropicOAuthAuthenticator, "get_access_token", lambda self: "sk-ant-oat01-fixture")
 
 
 def _cli_json(result="ok", **overrides):
@@ -178,7 +187,8 @@ def test_the_token_never_reaches_the_child_environment():
     env = runner.calls[0]["env"]
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
     assert "ANTHROPIC_API_KEY" not in env
-    assert env["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"] == "3"
+    # The descriptor number is only known once the pipe exists; the runner names it (tested against a real child below).
+    assert "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" not in env
     assert "sk-ant-oat01-secret" not in json.dumps(env)
     assert runner.calls[0]["token"] == "sk-ant-oat01-secret"
 
@@ -406,3 +416,312 @@ async def test_the_async_path_reports_its_turn_too(reported):
     )
 
     assert [request.client_session_id for request in reported] == ["s-async"]
+
+
+# --- streaming ------------------------------------------------------------------------------------------
+
+
+from litellm.llms.claude_cli.handler import StreamExit, _run, _stream, _stream_async  # noqa: E402
+
+
+def _delta(text):
+    return json.dumps(
+        {
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        }
+    )
+
+
+def _result_line(**overrides):
+    return json.dumps({"type": "result", **json.loads(_cli_json(**overrides))})
+
+
+class _StreamRunner:
+    """Stands in for the streaming subprocess: each run yields its lines, then how it ended."""
+
+    def __init__(self, *runs):
+        self.runs = list(runs) or [([_delta("o"), _delta("k"), _result_line()], StreamExit(0, ""))]
+        self.calls = []
+
+    def __call__(self, command, env, token, timeout):
+        self.calls.append(list(command))
+        lines, ended = self.runs.pop(0) if len(self.runs) > 1 else self.runs[0]
+        yield from lines
+        yield ended
+
+    def flag(self, name, call=0):
+        argv = self.calls[call]
+        return argv[argv.index(name) + 1] if name in argv else None
+
+
+class _AsyncStreamRunner(_StreamRunner):
+    async def __call__(self, command, env, token, timeout):
+        for item in _StreamRunner.__call__(self, command, env, token, timeout):
+            yield item
+
+
+def _streamed(handler, messages, **params):
+    return list(
+        handler.streaming(
+            model="claude_cli/claude-sonnet-5",
+            messages=messages,
+            litellm_params={"api_key": "sk-ant-oat01-x", **params},
+        )
+    )
+
+
+def test_the_reply_streams_as_it_is_written_then_says_how_it_ended():
+    handler = ClaudeCLIHandler(stream=_StreamRunner())
+
+    chunks = _streamed(handler, _messages(("user", "hi")))
+
+    assert [chunk["text"] for chunk in chunks] == ["o", "k", ""]
+    assert [chunk["is_finished"] for chunk in chunks] == [False, False, True]
+    assert chunks[-1]["finish_reason"] == "stop"
+    assert chunks[-1]["usage"] == {"prompt_tokens": 2104, "completion_tokens": 8, "total_tokens": 2112}
+
+
+def test_streaming_asks_claude_code_for_partial_messages():
+    """Without partial messages the stream is one event per whole turn, which is not streaming."""
+    runner = _StreamRunner()
+
+    _streamed(ClaudeCLIHandler(stream=runner), _messages(("user", "hi")))
+
+    assert runner.flag("--output-format") == "stream-json"
+    assert "--include-partial-messages" in runner.calls[0] and "--verbose" in runner.calls[0]
+
+
+def test_bookkeeping_lines_are_not_text():
+    noise = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "assistant", "message": {}}),
+        "not json",
+        "",
+    ]
+    runner = _StreamRunner(([*noise, _delta("ok"), _result_line()], StreamExit(0, "")))
+
+    chunks = _streamed(ClaudeCLIHandler(stream=runner), _messages(("user", "hi")))
+
+    assert [chunk["text"] for chunk in chunks] == ["ok", ""]
+
+
+def test_a_streamed_conversation_resumes_with_only_the_newest_message():
+    runner = _StreamRunner()
+    handler = ClaudeCLIHandler(stream=runner)
+
+    _streamed(handler, _messages(("user", "one")), litellm_session_id="s-stream")
+    _streamed(handler, _messages(("user", "one"), ("assistant", "ok"), ("user", "two")), litellm_session_id="s-stream")
+
+    assert runner.flag("--resume", call=1) == session_uuid("anonymous", "s-stream")
+    assert runner.calls[1][runner.calls[1].index("--print") + 1] == "two"
+
+
+def test_a_vanished_session_is_started_again_with_the_whole_conversation():
+    session = session_uuid("anonymous", "s-gone")
+    from litellm.llms.claude_cli.handler import _STARTED_SESSIONS
+
+    _STARTED_SESSIONS.add(session)
+    runner = _StreamRunner(
+        ([], StreamExit(1, "No conversation found with session ID")),
+        ([_delta("fresh"), _result_line()], StreamExit(0, "")),
+    )
+
+    chunks = _streamed(
+        ClaudeCLIHandler(stream=runner),
+        _messages(("user", "one"), ("assistant", "a"), ("user", "two")),
+        litellm_session_id="s-gone",
+    )
+
+    assert [chunk["text"] for chunk in chunks] == ["fresh", ""]
+    assert runner.flag("--session-id", call=1) == session
+    assert "user: one" in runner.calls[1][runner.calls[1].index("--print") + 1]
+
+
+def test_a_failure_after_text_is_not_retried():
+    """A second run would repeat what the caller has already been shown."""
+    session = session_uuid("anonymous", "s-late")
+    from litellm.llms.claude_cli.handler import _STARTED_SESSIONS
+
+    _STARTED_SESSIONS.add(session)
+    runner = _StreamRunner(([_delta("partial")], StreamExit(1, "No conversation found")))
+    chunks = []
+
+    with pytest.raises(ClaudeCLIError):
+        for chunk in ClaudeCLIHandler(stream=runner).streaming(
+            model="claude_cli/claude-sonnet-5",
+            messages=_messages(("user", "hi")),
+            litellm_params={"api_key": "sk-ant-oat01-x", "litellm_session_id": "s-late"},
+        ):
+            chunks.append(chunk)
+
+    assert [chunk["text"] for chunk in chunks] == ["partial"]
+    assert len(runner.calls) == 1
+
+
+def test_a_failed_run_raises():
+    runner = _StreamRunner(([], StreamExit(2, "boom")))
+
+    with pytest.raises(ClaudeCLIError, match="boom"):
+        _streamed(ClaudeCLIHandler(stream=runner), _messages(("user", "hi")))
+
+
+def test_a_run_that_reports_an_error_raises():
+    runner = _StreamRunner(([_result_line(is_error=True, result="quota exhausted")], StreamExit(0, "")))
+
+    with pytest.raises(ClaudeCLIError, match="quota exhausted"):
+        _streamed(ClaudeCLIHandler(stream=runner), _messages(("user", "hi")))
+
+
+def test_a_run_that_never_reports_a_result_raises():
+    runner = _StreamRunner(([_delta("hi")], StreamExit(0, "")))
+
+    with pytest.raises(ClaudeCLIError, match="no result record"):
+        _streamed(ClaudeCLIHandler(stream=runner), _messages(("user", "hi")))
+
+
+def test_a_streamed_turn_is_reported_for_storing(reported):
+    _streamed(ClaudeCLIHandler(stream=_StreamRunner()), _messages(("user", "hi")), litellm_session_id="s-rec")
+
+    assert [request.client_session_id for request in reported] == ["s-rec"]
+
+
+@pytest.mark.asyncio
+async def test_the_async_stream_behaves_like_the_sync_one(reported):
+    runner = _AsyncStreamRunner()
+    handler = ClaudeCLIHandler(stream_async=runner)
+
+    chunks = [
+        chunk
+        async for chunk in handler.astreaming(
+            model="claude_cli/claude-sonnet-5",
+            messages=_messages(("user", "hi")),
+            litellm_params={"api_key": "sk-ant-oat01-x", "litellm_session_id": "s-as"},
+        )
+    ]
+
+    assert [chunk["text"] for chunk in chunks] == ["o", "k", ""]
+    assert runner.flag("--session-id") == session_uuid("anonymous", "s-as")
+    assert [request.client_session_id for request in reported] == ["s-as"]
+
+
+# --- the real subprocess runners, against a stand-in for Claude Code ---------------------------------------
+
+
+@pytest.fixture
+def fake_claude(tmp_path):
+    """A script that behaves like `claude --print --output-format stream-json`: echoes the token it was
+    handed on fd 3, writes a lot to stderr, then optionally sleeps."""
+
+    def make(sleep=0):
+        script = tmp_path / "claude"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            'token=$(cat <&"$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")\n'
+            "head -c 200000 /dev/zero | tr '\\0' 'e' >&2\n"
+            f"echo '{_delta('token=')}'\n"
+            'printf \'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}}\\n\' "$token"\n'
+            f"sleep {sleep}\n"
+            "echo done\n"
+        )
+        script.chmod(0o755)
+        return (str(script),)
+
+    return make
+
+
+def _env():
+    """What the handler hands a runner: no descriptor number yet, since only the runner knows it."""
+    return {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"}
+
+
+def test_the_sync_runner_streams_lines_and_does_not_stall_on_stderr(fake_claude):
+    """200 KB of stderr would fill an unread pipe and hang the child."""
+    items = list(_stream(fake_claude(), _env(), "secret-token", timeout=20))
+
+    lines, ended = items[:-1], items[-1]
+    assert "".join(stream_text(line) or "" for line in lines) == "token=secret-token"
+    assert ended.returncode == 0 and len(ended.stderr) == 200000
+
+
+@pytest.mark.asyncio
+async def test_the_async_runner_streams_lines_and_does_not_stall_on_stderr(fake_claude):
+    items = [item async for item in _stream_async(fake_claude(), _env(), "secret-token", timeout=20)]
+
+    lines, ended = items[:-1], items[-1]
+    assert "".join(stream_text(line) or "" for line in lines) == "token=secret-token"
+    assert ended.returncode == 0 and len(ended.stderr) == 200000
+
+
+def test_the_sync_runner_gives_up_after_its_timeout(fake_claude):
+    with pytest.raises(ClaudeCLIError, match="timed out"):
+        list(_stream(fake_claude(sleep=30), _env(), "t", timeout=1))
+
+
+@pytest.mark.asyncio
+async def test_the_async_runner_gives_up_after_its_timeout(fake_claude):
+    with pytest.raises(ClaudeCLIError, match="timed out"):
+        [item async for item in _stream_async(fake_claude(sleep=30), _env(), "t", timeout=1)]
+
+
+def test_a_caller_who_stops_reading_ends_the_process(fake_claude, tmp_path):
+    """A client that disconnects mid-reply must not leave Claude Code running to no one."""
+    import psutil
+
+    runner = _stream(fake_claude(sleep=30), _env(), "t", timeout=60)
+    next(runner)
+    children = psutil.Process().children(recursive=True)
+    runner.close()
+
+    gone, alive = psutil.wait_procs(children, timeout=5)
+    assert alive == []
+
+
+def test_the_one_shot_runner_delivers_the_token_where_it_says(tmp_path):
+    """The non-streaming path had the same fixed-descriptor bug: Claude Code read a closed fd 3 and fell back
+    to whatever login it found on its own."""
+    script = tmp_path / "claude"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        'token=$(cat <&"$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")\n'
+        'printf \'{"result":"%s","is_error":false}\\n\' "$token"\n'
+    )
+    script.chmod(0o755)
+    blocker = os.open(os.devnull, os.O_RDONLY)  # hold fd 3 (or whatever is lowest) so the pipe cannot land there
+    try:
+        returncode, stdout, _ = _run((str(script),), _env(), "secret-token", timeout=20)
+    finally:
+        os.close(blocker)
+
+    assert returncode == 0 and json.loads(stdout)["result"] == "secret-token"
+
+
+def test_a_deployments_claude_cli_settings_reach_the_provider():
+    """LiteLLM drops any litellm_params key it has not been told about; all three were silently lost."""
+    import litellm
+
+    seen = {}
+
+    class _Recording(ClaudeCLIHandler):
+        def completion(self, *args, litellm_params=None, **kwargs):
+            seen.update(litellm_params or {})
+            return ModelResponse()
+
+    litellm.custom_provider_map = [{"provider": "claude_cli", "custom_handler": _Recording()}]
+    from litellm.utils import custom_llm_setup
+
+    custom_llm_setup()
+    try:
+        litellm.completion(
+            model="claude_cli/claude-sonnet-5",
+            messages=[{"role": "user", "content": "hi"}],
+            claude_cli_config_dir="/srv/claude",
+            claude_cli_allowed_tools=["Read"],
+            claude_cli_timeout=30,
+        )
+    finally:
+        litellm.custom_provider_map = []
+
+    assert seen["claude_cli_config_dir"] == "/srv/claude"
+    assert seen["claude_cli_allowed_tools"] == ["Read"]
+    assert seen["claude_cli_timeout"] == 30
