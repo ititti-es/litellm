@@ -753,7 +753,8 @@ async def aresponses(
                     deployment=_deployment_id(kwargs),
                     compaction_policy=requested_policy(metadata, _requester_metadata(kwargs)),
                     model_group=_model_group(kwargs),
-                )
+                ),
+                record_only=record_only,
             )
             if isinstance(session_turn, PendingTurn)
             else None

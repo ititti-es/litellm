@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from litellm.sessions.session import comparable
+from litellm.sessions.session import search_text
 
 if TYPE_CHECKING:
     from prisma import Prisma
@@ -43,21 +43,6 @@ def segment_node_id(session_id: str, version: int, seq: int) -> str:
 
 def session_node_id(session_id: str) -> str:
     return f"mem_sess_{_digest(session_id)}"
-
-
-def extract_search_text(content: object) -> str | None:
-    """Reuses the same flat-text reduction the session manager uses to compare two renderings of one
-    history (litellm/sessions/session.py:comparable), so search indexes exactly what "what was said"
-    already means elsewhere in this codebase, rather than a second, divergent parse of the same item shapes.
-    `content` is one stored Responses item (e.g. {"type": "message", ...} or {"type": "function_call", ...}).
-    """
-    if not isinstance(content, Mapping):
-        return None
-    reduced: Final = comparable([content])
-    if not reduced:
-        return None
-    text: Final = reduced[0][1][-1]
-    return text or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +83,7 @@ def segment_from_item(
     if meta.get("kind") != "compaction_summary":
         return None
     provenance: Final = _as_mapping(meta.get("provenance"))
-    summary: Final = _as_str(meta.get("summary")) or extract_search_text(content)
+    summary: Final = _as_str(meta.get("summary")) or (search_text(content) if isinstance(content, dict) else None)
     if not summary:
         return None
     covers: Final = _as_mapping(meta.get("covers"))
@@ -156,7 +141,7 @@ async def backfill(client: Prisma, *, dry_run: bool) -> BackfillStats:
         segments: list[SegmentNode] = []
         for item in items:
             if item.search_text is None:
-                text = extract_search_text(item.content) or ""
+                text = (search_text(item.content) if isinstance(item.content, dict) else None) or ""
                 text_filled += 1 if text else 0
                 if not dry_run:
                     await client.litellm_conversationitem.update(

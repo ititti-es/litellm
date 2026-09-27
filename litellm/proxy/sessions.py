@@ -182,9 +182,15 @@ def router_upstream(
             else None
         )
         deployment: Final = MappingProxyType(credentials) if credentials is not None else MappingProxyType({})
+        flags: Final = (
+            _auth_flags(current, replay.deployment)
+            if current is not None and replay.deployment is not None
+            else _NO_FLAGS
+        )
         response: Final = await responses(
             input=items,
             **_passthrough(deployment),
+            **flags,
             **_passthrough(replay.params),
             custom_llm_provider=deployment.get("custom_llm_provider", replay.provider),
             model=replay.model,
@@ -195,6 +201,20 @@ def router_upstream(
         return reply_from(response)
 
     return call
+
+
+_AUTH_FLAGS: Final = ("use_xai_oauth", "use_anthropic_oauth")
+_NO_FLAGS: Final[Mapping[str, bool]] = MappingProxyType({})
+
+
+def _auth_flags(router: Router, deployment_id: str) -> Mapping[str, bool]:
+    """Subscription logins are deployment settings, not credentials, so the credentials lookup leaves them out"""
+    found: Final = router.get_deployment(model_id=deployment_id) or router.get_deployment_by_model_group_name(
+        deployment_id
+    )
+    if found is None:
+        return _NO_FLAGS
+    return MappingProxyType({flag: True for flag in _AUTH_FLAGS if getattr(found.litellm_params, flag, None)})
 
 
 def _passthrough(source: Mapping[str, object]) -> Mapping[str, object]:

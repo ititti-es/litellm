@@ -55,8 +55,10 @@ class _Runner:
         self.results = list(results) or [(0, _cli_json(), "")]
         self.calls = []
 
-    def __call__(self, command, env, token, timeout):
-        self.calls.append({"command": list(command), "env": dict(env), "token": token, "timeout": timeout})
+    def __call__(self, command, env, token, timeout, prompt=""):
+        self.calls.append(
+            {"command": list(command), "env": dict(env), "token": token, "timeout": timeout, "prompt": prompt}
+        )
         return self.results.pop(0) if len(self.results) > 1 else self.results[0]
 
     def flag(self, name, call=0):
@@ -123,8 +125,8 @@ def test_a_later_turn_resumes_and_sends_only_the_new_message():
     )
 
     assert runner.flag("--resume", call=1) == session_uuid("anonymous", "s-resume")
-    assert runner.calls[1]["command"][2] == "second"
-    assert "first" not in runner.calls[1]["command"][2]
+    assert runner.calls[1]["prompt"] == "second"
+    assert "first" not in runner.calls[1]["prompt"]
 
 
 def test_without_a_session_key_every_call_stands_alone():
@@ -155,7 +157,7 @@ def test_a_vanished_session_is_reopened_with_the_whole_conversation():
 
     assert len(runner.calls) == 3, "the failed resume is retried once"
     assert "--session-id" in runner.calls[2]["command"]
-    assert "first" in runner.calls[2]["command"][2], "the retry replays the conversation it could not resume"
+    assert "first" in runner.calls[2]["prompt"], "the retry replays the conversation it could not resume"
     assert response.choices[0].message.content == "recovered"
 
 
@@ -319,8 +321,8 @@ def test_the_timeout_is_configurable():
 
 
 class _AsyncRunner(_Runner):
-    async def __call__(self, command, env, token, timeout):
-        return _Runner.__call__(self, command, env, token, timeout)
+    async def __call__(self, command, env, token, timeout, prompt=""):
+        return _Runner.__call__(self, command, env, token, timeout, prompt)
 
 
 @pytest.mark.asyncio
@@ -443,9 +445,11 @@ class _StreamRunner:
     def __init__(self, *runs):
         self.runs = list(runs) or [([_delta("o"), _delta("k"), _result_line()], StreamExit(0, ""))]
         self.calls = []
+        self.prompts = []
 
-    def __call__(self, command, env, token, timeout):
+    def __call__(self, command, env, token, timeout, prompt=""):
         self.calls.append(list(command))
+        self.prompts.append(prompt)
         lines, ended = self.runs.pop(0) if len(self.runs) > 1 else self.runs[0]
         yield from lines
         yield ended
@@ -456,8 +460,8 @@ class _StreamRunner:
 
 
 class _AsyncStreamRunner(_StreamRunner):
-    async def __call__(self, command, env, token, timeout):
-        for item in _StreamRunner.__call__(self, command, env, token, timeout):
+    async def __call__(self, command, env, token, timeout, prompt=""):
+        for item in _StreamRunner.__call__(self, command, env, token, timeout, prompt):
             yield item
 
 
@@ -514,7 +518,7 @@ def test_a_streamed_conversation_resumes_with_only_the_newest_message():
     _streamed(handler, _messages(("user", "one"), ("assistant", "ok"), ("user", "two")), litellm_session_id="s-stream")
 
     assert runner.flag("--resume", call=1) == session_uuid("anonymous", "s-stream")
-    assert runner.calls[1][runner.calls[1].index("--print") + 1] == "two"
+    assert runner.prompts[1] == "two"
 
 
 def test_a_vanished_session_is_started_again_with_the_whole_conversation():
@@ -535,7 +539,25 @@ def test_a_vanished_session_is_started_again_with_the_whole_conversation():
 
     assert [chunk["text"] for chunk in chunks] == ["fresh", ""]
     assert runner.flag("--session-id", call=1) == session
-    assert "user: one" in runner.calls[1][runner.calls[1].index("--print") + 1]
+    assert "user: one" in runner.prompts[1]
+
+
+def test_a_session_started_by_an_earlier_process_is_resumed_not_restarted():
+    """The started-sessions record is per process; after a restart the derived id already exists in Claude Code."""
+    runner = _StreamRunner(
+        ([], StreamExit(1, "Error: Session ID is already in use")),
+        ([_delta("again"), _result_line()], StreamExit(0, "")),
+    )
+
+    chunks = _streamed(
+        ClaudeCLIHandler(stream=runner),
+        _messages(("user", "one"), ("assistant", "a"), ("user", "two")),
+        litellm_session_id="s-restarted",
+    )
+
+    assert [chunk["text"] for chunk in chunks] == ["again", ""]
+    assert runner.flag("--resume", call=1) == session_uuid("anonymous", "s-restarted")
+    assert runner.prompts[1] == "two"
 
 
 def test_a_failure_after_text_is_not_retried():
@@ -694,6 +716,22 @@ def test_the_one_shot_runner_delivers_the_token_where_it_says(tmp_path):
         os.close(blocker)
 
     assert returncode == 0 and json.loads(stdout)["result"] == "secret-token"
+
+
+def test_the_prompt_reaches_the_child_on_stdin_not_argv(tmp_path):
+    """One argv string is capped at 128 KiB, and argv is readable by every local user."""
+    script = tmp_path / "claude"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        'cat <&"$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" >/dev/null\n'
+        'printf \'{"result":"%s","argc":%d}\\n\' "$(wc -c)" "$#"\n'
+    )
+    script.chmod(0o755)
+    prompt = "x" * 300_000
+
+    returncode, stdout, _ = _run((str(script),), _env(), "t", timeout=20, prompt=prompt)
+
+    assert returncode == 0 and json.loads(stdout) == {"result": str(len(prompt)), "argc": 0}
 
 
 def test_a_deployments_claude_cli_settings_reach_the_provider():

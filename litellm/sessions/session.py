@@ -66,6 +66,12 @@ def comparable(items: Sequence[Item]) -> tuple[tuple[int, Form], ...]:
     return tuple((index, form) for index, item in enumerate(items) if (form := _form(item)) is not None)
 
 
+def search_text(item: Item) -> str | None:
+    """What an item says, as `comparable` reads it, for the full-text index"""
+    form: Final = _form(item)
+    return (form[-1] or None) if form is not None else None
+
+
 def _form(item: Item) -> Form | None:
     kind: Final = item.get("type", "message")
     if kind == "reasoning":
@@ -100,9 +106,18 @@ def _part_text(part: JsonValue) -> str:
     return text if isinstance(text, str) else f"[{part.get('type')}]"
 
 
+_CLIENT_CALLS: Final = frozenset(
+    {"function_call", "custom_tool_call", "local_shell_call", "computer_call", "shell_call", "apply_patch_call"}
+)
+# An `fc_`/`ctc_` id makes OpenAI demand the reasoning item it followed, which is dropped unless sealed
+_ID_OPTIONAL_CALLS: Final = frozenset({"function_call", "custom_tool_call"})
+
+
 def _replay_output(item: Item) -> Item | None:
     kind: Final = item.get("type")
-    if kind == "function_call":
+    if kind in _ID_OPTIONAL_CALLS:
+        return {key: value for key, value in item.items() if key != "id"}  # mutable-ok: JSON wire payload
+    if kind in _CLIENT_CALLS:
         return item
     if kind == "reasoning":
         return item if item.get("encrypted_content") else None

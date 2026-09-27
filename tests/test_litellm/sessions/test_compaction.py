@@ -119,6 +119,29 @@ def test_small_sessions_and_sessions_with_a_turn_in_flight_are_left_alone():
     assert busy.due_compactions(deadline - 10, min_prefix_tokens=1000, lead_seconds=20) == ()
 
 
+def test_a_session_whose_client_owns_its_history_is_never_compacted():
+    """A resending client would no longer reproduce a rewritten history, so every later turn became a new session"""
+    manager = SessionManager()
+    manager.commit(
+        owner="k",
+        prior=None,
+        turn_input=(user("one"), assistant("a1"), user("two")),
+        output=(assistant("a2"),),
+        response_id="r1",
+        now=5.0,
+        new_session_id="s1",
+        started_at=0.0,
+        usage=BIG,
+        replay=REPLAY,
+        compactable=False,
+    )
+    for gap in (100.0, 200.0):
+        manager.clock.observe("xai", "xai/grok", gap, 30_000, 29_000, observed_at=gap)
+    deadline = manager.warm_until("s1")
+    assert deadline is not None
+    assert manager.due_compactions(deadline - 10, min_prefix_tokens=1000, lead_seconds=20) == ()
+
+
 def fake_upstream(reply, calls):
     async def call(replay, items, owner, max_output_tokens):
         calls.append((replay, items, owner))
@@ -152,6 +175,21 @@ def test_compaction_reuses_the_prefix_and_rebases_onto_summary_and_latest_exchan
     resolved = manager.resolve("r2", "k")
     assert isinstance(resolved, Resolved) and resolved.history == compacted.items
     assert not isinstance(manager.resolve("r1", "k"), Resolved)
+
+
+def test_a_turn_begun_while_the_summary_was_written_keeps_the_uncompacted_session():
+    """Rebasing under a turn in flight split the conversation into a fork when that turn committed"""
+    manager = SessionManager()
+    two_turns(manager)
+    deadline = manager.warm_until("s1")
+    (job,) = manager.due_compactions(deadline - 10, min_prefix_tokens=1000, lead_seconds=20)
+    manager.begin("s1", deadline - 5)
+
+    compacted = asyncio.run(compact(manager, job, DEFAULT, fake_upstream(CompactionReply("s", False, None), [])))
+
+    assert compacted is None
+    resolved = manager.resolve("r2", "k")
+    assert isinstance(resolved, Resolved) and resolved.session.version == 0 and len(resolved.session.items) == 4
 
 
 def test_the_turn_after_compaction_is_not_read_as_a_cache_miss():

@@ -102,6 +102,7 @@ class TurnRecord:
     replay: ReplayBase | None
     begun_at: float
     compacted: bool = False
+    compactable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +248,7 @@ class SessionManager:
         usage: TurnUsage | None = None,
         replay: ReplayBase | None = None,
         client_session_id: str | None = None,
+        compactable: bool = True,
     ) -> Session:
         session: Final = self._next_session(
             owner, prior, turn_input, output, response_id, now, new_session_id, client_session_id
@@ -256,7 +258,9 @@ class SessionManager:
         started: Final = started_at if started_at is not None else now
         self._observe(prior, started, usage, replay)
         self._hold(session)
-        self._turns[session.id] = TurnRecord(response_id, started, usage, replay, begun_at=started)
+        self._turns[session.id] = TurnRecord(
+            response_id, started, usage, replay, begun_at=started, compactable=compactable
+        )
         self._commits += 1
         if durable and self._store is not None:
             self._persist(_PendingWrite(session, first_new, response_id))
@@ -339,6 +343,7 @@ class SessionManager:
             or session is None
             or deadline is None
             or record.compacted
+            or not record.compactable
             or record.replay is None
             or record.usage is None
             or record.begun_at > record.started_at
@@ -369,6 +374,9 @@ class SessionManager:
         """Rebase the session onto its summary items plus the kept tail; None when a turn landed meanwhile"""
         live: Final = self._sessions.get(job.session.id)
         if live is None or live.version != job.session.version or len(live.items) != len(job.session.items):
+            return None
+        pending: Final = self._turns.get(live.id)
+        if pending is not None and pending.begun_at > pending.started_at:
             return None
         head: Final = len(summary)
         items: Final = (*summary, *live.items[job.tail_start :])

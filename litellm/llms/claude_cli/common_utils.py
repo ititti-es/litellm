@@ -37,6 +37,7 @@ CLAUDE_CLI_TOKEN_FD_ENV: Final = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
 CLAUDE_CLI_SESSION_NAMESPACE: Final = uuid.UUID("6f1d4f9c-2a9e-4c43-9a7f-1b2c3d4e5f60")
 
 _MISSING_SESSION_MARKERS: Final = ("no conversation found", "session not found")
+_SESSION_IN_USE_MARKERS: Final = ("already in use",)
 
 
 class ClaudeCLIError(BaseLLMException):
@@ -61,3 +62,9 @@ def is_missing_session(stderr: str) -> bool:
     """Whether a failure means the session to resume does not exist yet."""
     lowered: Final = stderr.lower()
     return any(marker in lowered for marker in _MISSING_SESSION_MARKERS)
+
+
+def is_session_in_use(stderr: str) -> bool:
+    """Whether a new session could not start because Claude Code already has one under that id."""
+    lowered: Final = stderr.lower()
+    return any(marker in lowered for marker in _SESSION_IN_USE_MARKERS)

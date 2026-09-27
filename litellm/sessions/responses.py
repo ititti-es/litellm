@@ -91,14 +91,15 @@ class PendingTurn:
     started_at: float = 0.0
     replay: ReplayBase | None = None
     client_session_id: str | None = None
+    compactable: bool = True
 
     @property
     def cache_key(self) -> str:
         """Stable across gateway restarts when the client names its session, so the upstream cache stays warm"""
         return affinity_key(self.owner, self.client_session_id) if self.client_session_id else self.key
 
-    def replaying(self, replay: ReplayBase) -> PendingTurn:
-        return replace(self, replay=replay)
+    def replaying(self, replay: ReplayBase, record_only: bool = False) -> PendingTurn:
+        return replace(self, replay=replay, compactable=self.compactable and not record_only)
 
     def upstream_input(self) -> list[Mapping[str, JsonValue]]:  # mutable-ok: provider request input is a JSON list
         history: Final = self.prior.history if self.prior is not None else ()
@@ -119,6 +120,7 @@ class PendingTurn:
             usage=turn_usage(response.usage),
             replay=self.replay,
             client_session_id=self.client_session_id,
+            compactable=self.compactable,
         )
 
 
@@ -177,6 +179,7 @@ def _continuing(
         continuation.session_id,
         started_at,
         client_session_id=client,
+        compactable=False,
     )
 
 

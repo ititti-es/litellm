@@ -12,6 +12,7 @@ Reads happen on the request path, which is synchronous, so this uses a synchrono
 the proxy's async Prisma client.
 """
 
+import functools
 import hashlib
 import json
 import time
@@ -19,6 +20,8 @@ from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from pydantic import TypeAdapter, ValidationError
 
 from litellm._logging import verbose_logger
 from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper, encrypt_value_helper
@@ -114,6 +117,26 @@ def _decrypted(stored: Mapping[str, object]) -> dict[str, object] | None:
     return decoded
 
 
+_RECORD: Final = TypeAdapter(dict[str, object])
+
+
+def _record(value: object) -> dict[str, object] | None:
+    try:
+        return _RECORD.validate_python(value)
+    except ValidationError:
+        return None
+
+
+def _expires_later(candidate: Mapping[str, object], current: Mapping[str, object]) -> bool:
+    candidate_expiry: Final = candidate.get("expires_at")
+    current_expiry: Final = current.get("expires_at")
+    return (
+        isinstance(candidate_expiry, int | float)
+        and isinstance(current_expiry, int | float)
+        and candidate_expiry > current_expiry
+    )
+
+
 class DatabaseCredentialStore:
     """Reads and writes one provider's OAuth record in the proxy database."""
 
@@ -150,9 +173,16 @@ class DatabaseCredentialStore:
         except Exception as exc:  # noqa: BLE001  # any database failure degrades to the local file
             verbose_logger.warning("Could not read %s credentials from the database: %s", self.provider, exc)
             return self._from_fallback()
-        if not row or not isinstance(row[0], dict):
-            return None
-        return _decrypted(row[0])
+        stored: Final = _decrypted(row[0]) if row and isinstance(row[0], dict) else None
+        local: Final = _record(self._from_fallback()) if stored is not None else None
+        if stored is None or local is None or not _expires_later(local, stored):
+            return stored
+        # A refresh whose database write failed left the rotated refresh token only in the file
+        try:
+            self._write_database(local)
+        except Exception as exc:  # noqa: BLE001  # the file record is still the one to use
+            verbose_logger.warning("Could not restore %s credentials to the database: %s", self.provider, exc)
+        return local
 
     def _from_fallback(self) -> object | None:
         """Fall back to the local file when the database is unreachable, so a blip is not an outage."""
@@ -163,8 +193,36 @@ class DatabaseCredentialStore:
         return TokenFile(self.fallback_path).read()
 
     def write(self, data: object) -> None:
-        if not isinstance(data, Mapping):
+        record: Final = _record(data)
+        if record is None:
             raise TypeError("An OAuth credential record must be a mapping")
+        mirrored: Final = self._mirror(record)
+        try:
+            self._write_database(record)
+        except Exception as exc:
+            if not mirrored:
+                raise
+            verbose_logger.error(
+                "Could not write %s credentials to the database; kept them in %s: %s",
+                self.provider,
+                self.fallback_path,
+                exc,
+            )
+        self._cached, self._cached_at = record, time.time()
+
+    def _mirror(self, data: Mapping[str, object]) -> bool:
+        if not self.fallback_path:
+            return False
+        from litellm.llms.base_llm.oauth import TokenFile
+
+        try:
+            TokenFile(self.fallback_path).write(data)
+        except OSError as exc:
+            verbose_logger.warning("Could not mirror %s credentials to %s: %s", self.provider, self.fallback_path, exc)
+            return False
+        return True
+
+    def _write_database(self, data: Mapping[str, object]) -> None:
         values: Final = json.dumps(_encrypted(data))
         info: Final = json.dumps(_credential_info(self.provider))
         with self._connect() as conn, conn.cursor() as cur:
@@ -183,7 +241,6 @@ class DatabaseCredentialStore:
                 (self.name, values, info, CREDENTIAL_KIND, CREDENTIAL_KIND),
             )
             conn.commit()
-        self._cached, self._cached_at = dict(data), time.time()  # mutable-ok: a snapshot, not the caller's
 
     def delete(self) -> bool:
         with self._connect() as conn, conn.cursor() as cur:
@@ -227,7 +284,9 @@ class DatabaseCredentialStore:
 def database_store_factory(database_url: str):
     """Return a factory the OAuth modules can use to build a store per provider."""
 
+    @functools.cache
     def factory(provider: str, path: str) -> DatabaseCredentialStore:
+        """One store per provider, so its read cache outlives the authenticator each request builds"""
         return DatabaseCredentialStore(provider, database_url, fallback_path=path)
 
     return factory

@@ -26,7 +26,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, NamedTuple, Protocol, TypeAlias
+from typing import IO, Final, NamedTuple, Protocol, TypeAlias
 
 from litellm._logging import verbose_logger
 from litellm.llms.custom_llm import CustomLLM
@@ -39,6 +39,7 @@ from .common_utils import (
     ClaudeCLIError,
     binary_path,
     is_missing_session,
+    is_session_in_use,
     session_uuid,
 )
 from .sync import SyncRequest, sync_transcript
@@ -59,13 +60,13 @@ class CommandRunner(Protocol):
     """Runs the CLI and returns (returncode, stdout, stderr)."""
 
     def __call__(
-        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
     ) -> tuple[int, str, str]: ...
 
 
 class AsyncCommandRunner(Protocol):
     def __call__(
-        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
     ) -> Awaitable[tuple[int, str, str]]: ...
 
 
@@ -83,13 +84,13 @@ class StreamRunner(Protocol):
     """Runs the CLI, yielding each stdout line as it arrives and then a StreamExit."""
 
     def __call__(
-        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
     ) -> Iterator[StreamItem]: ...
 
 
 class AsyncStreamRunner(Protocol):
     def __call__(
-        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+        self, command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
     ) -> AsyncIterator[StreamItem]: ...
 
 
@@ -181,7 +182,6 @@ def _child_env(params: Mapping[str, object]) -> Mapping[str, str]:
 
 def _build_command(
     model: str,
-    prompt: str,
     system: str,
     session: str | None,
     resume: bool,
@@ -191,7 +191,6 @@ def _build_command(
     command = (
         binary_path(),
         "--print",
-        prompt,
         *(_STREAM_FORMAT if streaming else _JSON_FORMAT),
         "--system-prompt",
         system,
@@ -262,13 +261,15 @@ def _end(proc: "subprocess.Popen[bytes] | asyncio.subprocess.Process") -> None:
         pass
 
 
-def _run(command: Sequence[str], env: Mapping[str, str], token: str, timeout: float) -> tuple[int, str, str]:
+def _run(
+    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
+) -> tuple[int, str, str]:
     with _TokenPipe(token) as pipe:
         try:
-            # stdin is closed explicitly: Claude Code otherwise waits several seconds for piped input.
+            # The prompt goes on stdin: one argv string is capped at 128 KiB and readable by any local user.
             proc = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=pipe.child_env(env),
@@ -284,7 +285,7 @@ def _run(command: Sequence[str], env: Mapping[str, str], token: str, timeout: fl
         pipe.close_parent_read()
         pipe.deliver()
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout, stderr = proc.communicate(input=prompt.encode(), timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             _end(proc)
             proc.communicate()
@@ -293,13 +294,13 @@ def _run(command: Sequence[str], env: Mapping[str, str], token: str, timeout: fl
 
 
 async def _run_async(
-    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
 ) -> tuple[int, str, str]:
     with _TokenPipe(token) as pipe:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=pipe.child_env(env),
@@ -315,12 +316,33 @@ async def _run_async(
         pipe.close_parent_read()
         pipe.deliver()
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(input=prompt.encode()), timeout=timeout)
         except (TimeoutError, asyncio.TimeoutError) as exc:
             _end(proc)
             await proc.communicate()
             raise ClaudeCLIError(f"Claude CLI timed out after {timeout:g}s", status_code=504) from exc
     return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+def _feed(stdin: IO[bytes] | None, prompt: str) -> None:
+    if stdin is None:
+        return
+    try:
+        stdin.write(prompt.encode())
+        stdin.close()
+    except BrokenPipeError:
+        pass  # the child exited first; its exit status says why
+
+
+async def _feed_async(stdin: asyncio.StreamWriter | None, prompt: str) -> None:
+    if stdin is None:
+        return
+    try:
+        stdin.write(prompt.encode())
+        await stdin.drain()
+        stdin.close()
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the child exited first; its exit status says why
 
 
 def _not_found(command: Sequence[str], exc: FileNotFoundError) -> ClaudeCLIError:
@@ -329,7 +351,9 @@ def _not_found(command: Sequence[str], exc: FileNotFoundError) -> ClaudeCLIError
     )
 
 
-def _stream(command: Sequence[str], env: Mapping[str, str], token: str, timeout: float) -> Iterator[StreamItem]:
+def _stream(
+    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
+) -> Iterator[StreamItem]:
     """Yield stdout a line at a time, then how the process ended.
 
     stderr goes to a temporary file rather than a pipe: nothing reads a pipe while stdout is being consumed, so
@@ -341,7 +365,7 @@ def _stream(command: Sequence[str], env: Mapping[str, str], token: str, timeout:
         try:
             proc = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=errors,
                 env=pipe.child_env(env),
@@ -361,6 +385,7 @@ def _stream(command: Sequence[str], env: Mapping[str, str], token: str, timeout:
         watchdog: Final = threading.Timer(timeout, expire)
         watchdog.start()
         try:
+            _feed(proc.stdin, prompt)
             for raw in proc.stdout or ():
                 yield raw.decode(errors="replace")
             proc.wait()
@@ -376,14 +401,14 @@ def _stream(command: Sequence[str], env: Mapping[str, str], token: str, timeout:
 
 
 async def _stream_async(
-    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float
+    command: Sequence[str], env: Mapping[str, str], token: str, timeout: float, prompt: str = ""
 ) -> AsyncIterator[StreamItem]:
     """The async counterpart of `_stream`; stderr is drained by a task so it can never stall the child."""
     with _TokenPipe(token) as pipe:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=pipe.child_env(env),
@@ -399,6 +424,7 @@ async def _stream_async(
         errors: Final = asyncio.ensure_future(proc.stderr.read() if proc.stderr else asyncio.sleep(0, b""))
         try:
             async with asyncio.timeout(timeout):
+                await _feed_async(proc.stdin, prompt)
                 while line := await proc.stdout.readline() if proc.stdout else b"":
                     yield line.decode(errors="replace")
                 returncode: Final = await proc.wait()
@@ -501,17 +527,16 @@ class _StreamedTurn:
             self.result = result
         return None
 
-    def session_vanished(self, resumed: bool) -> bool:
-        """Whether this was a resume of a session Claude Code no longer has, failed before saying anything.
+    def session_unusable(self, resumed: bool) -> bool:
+        """Whether the planned session could not be used, failed before saying anything.
 
         Only then is a retry safe: once text has reached the caller, a second run would repeat it.
         """
         return (
-            resumed
-            and not self.spoke
+            not self.spoke
             and self.exit is not None
             and self.exit.returncode != 0
-            and is_missing_session(self.exit.stderr)
+            and _session_unusable(resumed, self.exit.stderr)
         )
 
     def closing(self, session: str | None, params: Mapping[str, object]) -> GenericStreamingChunk:
@@ -527,6 +552,12 @@ class _StreamedTurn:
         return chunk
 
 
+def _session_unusable(resumed: bool, stderr: str) -> bool:
+    """A resume found no session, or a fresh start found one already there (started before a restart, or by
+    another worker)"""
+    return is_missing_session(stderr) if resumed else is_session_in_use(stderr)
+
+
 def _attempts(
     model: str,
     messages: Sequence[Mapping[str, object]],
@@ -534,14 +565,14 @@ def _attempts(
     session: str | None,
     resume: bool,
     params: Mapping[str, object],
-) -> tuple[tuple[tuple[str, ...], bool], ...]:
-    """The runs to try, in order: as planned, then -- only for a resume -- afresh with the whole conversation."""
+) -> tuple[tuple[tuple[str, ...], str, bool], ...]:
+    """The runs to try, in order: as planned, then with the session taken the other way round."""
     system: Final = system_prompt_of(messages)
-    planned: Final = (_build_command(model, prompt, system, session, resume, params, streaming=True), resume)
-    if not resume:
+    planned: Final = (_build_command(model, system, session, resume, params, streaming=True), prompt, resume)
+    if not session:
         return (planned,)
-    whole: Final = render_prompt(messages, latest_only=False)
-    return (planned, (_build_command(model, whole, system, session, False, params, streaming=True), False))
+    other: Final = render_prompt(messages, latest_only=not resume)
+    return (planned, (_build_command(model, system, session, not resume, params, streaming=True), other, not resume))
 
 
 class ClaudeCLIHandler(CustomLLM):
@@ -588,18 +619,18 @@ class ClaudeCLIHandler(CustomLLM):
         )
         system: Final = system_prompt_of(messages)
         params: Final = _params(litellm_params)
-        command = _build_command(provider_model, prompt, system, session, resume, params)
-        returncode, stdout, stderr = self._run(command, env, token, wait)
+        command = _build_command(provider_model, system, session, resume, params)
+        returncode, stdout, stderr = self._run(command, env, token, wait, prompt=prompt)
 
-        if returncode != 0 and resume and is_missing_session(stderr):
-            # The session was recorded as started but Claude Code no longer has it -- its history may have
-            # been cleared. Start it again, this time sending the whole conversation.
-            verbose_logger.info("Claude CLI session %s is gone; starting a new one", session)
-            _STARTED_SESSIONS.discard(session or "")
-            command = _build_command(
-                provider_model, render_prompt(messages, latest_only=False), system, session, False, params
+        if returncode != 0 and session and _session_unusable(resume, stderr):
+            verbose_logger.info(
+                "Claude CLI session %s cannot be %s; retrying", session, "resumed" if resume else "started"
             )
-            returncode, stdout, stderr = self._run(command, env, token, wait)
+            _STARTED_SESSIONS.discard(session)
+            command = _build_command(provider_model, system, session, not resume, params)
+            returncode, stdout, stderr = self._run(
+                command, env, token, wait, prompt=render_prompt(messages, latest_only=not resume)
+            )
 
         return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
 
@@ -627,16 +658,18 @@ class ClaudeCLIHandler(CustomLLM):
         )
         system: Final = system_prompt_of(messages)
         params: Final = _params(litellm_params)
-        command = _build_command(provider_model, prompt, system, session, resume, params)
-        returncode, stdout, stderr = await self._run_async(command, env, token, wait)
+        command = _build_command(provider_model, system, session, resume, params)
+        returncode, stdout, stderr = await self._run_async(command, env, token, wait, prompt=prompt)
 
-        if returncode != 0 and resume and is_missing_session(stderr):
-            verbose_logger.info("Claude CLI session %s is gone; starting a new one", session)
-            _STARTED_SESSIONS.discard(session or "")
-            command = _build_command(
-                provider_model, render_prompt(messages, latest_only=False), system, session, False, params
+        if returncode != 0 and session and _session_unusable(resume, stderr):
+            verbose_logger.info(
+                "Claude CLI session %s cannot be %s; retrying", session, "resumed" if resume else "started"
             )
-            returncode, stdout, stderr = await self._run_async(command, env, token, wait)
+            _STARTED_SESSIONS.discard(session)
+            command = _build_command(provider_model, system, session, not resume, params)
+            returncode, stdout, stderr = await self._run_async(
+                command, env, token, wait, prompt=render_prompt(messages, latest_only=not resume)
+            )
 
         return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
 
@@ -665,14 +698,16 @@ class ClaudeCLIHandler(CustomLLM):
         )
         params: Final = _params(litellm_params)
         turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
-        for command, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
+        for command, attempt_prompt, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
             turn = _StreamedTurn()
-            for item in self._stream(command, env, token, wait):
+            for item in self._stream(command, env, token, wait, prompt=attempt_prompt):
                 if (chunk := turn.take(item)) is not None:
                     yield chunk
-            if not turn.session_vanished(resumed):
+            if not turn.session_unusable(resumed):
                 break
-            verbose_logger.info("Claude CLI session %s is gone; starting a new one", session)
+            verbose_logger.info(
+                "Claude CLI session %s cannot be %s; retrying", session, "resumed" if resumed else "started"
+            )
             _STARTED_SESSIONS.discard(session or "")
         yield turn.closing(session, params)
 
@@ -700,14 +735,16 @@ class ClaudeCLIHandler(CustomLLM):
         )
         params: Final = _params(litellm_params)
         turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
-        for command, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
+        for command, attempt_prompt, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
             turn = _StreamedTurn()
-            async for item in self._stream_async(command, env, token, wait):
+            async for item in self._stream_async(command, env, token, wait, prompt=attempt_prompt):
                 if (chunk := turn.take(item)) is not None:
                     yield chunk
-            if not turn.session_vanished(resumed):
+            if not turn.session_unusable(resumed):
                 break
-            verbose_logger.info("Claude CLI session %s is gone; starting a new one", session)
+            verbose_logger.info(
+                "Claude CLI session %s cannot be %s; retrying", session, "resumed" if resumed else "started"
+            )
             _STARTED_SESSIONS.discard(session or "")
         yield turn.closing(session, params)
 

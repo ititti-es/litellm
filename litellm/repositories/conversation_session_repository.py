@@ -8,7 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Final, Protocol
 
+from pydantic import JsonValue, TypeAdapter
+
 from litellm.repositories.prisma_protocols import DatabaseClient, TableActions
+from litellm.sessions.session import search_text
 
 if TYPE_CHECKING:
     from prisma import models as prisma_models
@@ -120,6 +123,13 @@ class _ConversationDb(Protocol):
     def batch_(self) -> _ConversationBatch: ...
 
 
+_ITEM: Final = TypeAdapter(dict[str, JsonValue])
+
+
+class TranscriptConflict(Exception):
+    pass
+
+
 class ConversationSessionRepository:
     def __init__(self, prisma_client: DatabaseClient) -> None:
         self._prisma_client: Final = prisma_client
@@ -129,7 +139,18 @@ class ConversationSessionRepository:
         return self._prisma_client.db  # pyright: ignore[reportReturnType]  # generated client satisfies the protocol
 
     async def save_turn(self, write: TurnWrite) -> None:
-        """One committed turn, atomically: the session row, its new items, and the response that addresses them"""
+        """One committed turn, atomically: the session row, its new items, and the response that addresses them
+
+        Another worker that moved the session on first wins: a newer stored version is refused here, and an item
+        seq it already wrote fails the batch, so a response never addresses items it did not produce
+        """
+        stored: Final = await self._db.litellm_conversationsession.find_unique(
+            where={"session_id": write.session_id}  # mutable-ok: Prisma where filter must be a dict
+        )
+        if stored is not None and stored.version > write.version:
+            raise TranscriptConflict(
+                f"session {write.session_id} is at version {stored.version}, this write is for {write.version}"
+            )
         batch: Final = self._db.batch_()
         fields: Final = {  # mutable-ok: Prisma payload must be a dict
             "owner": write.owner,
@@ -150,7 +171,6 @@ class ConversationSessionRepository:
             data=[  # mutable-ok: Prisma create_many takes a list of dicts
                 _item_row(write.session_id, write.version, item) for item in write.items
             ],
-            skip_duplicates=True,
         )
         response_fields: Final = {  # mutable-ok: Prisma payload must be a dict
             "session_id": write.session_id,
@@ -317,6 +337,7 @@ def _item_row(session_id: str, version: int, item: ItemRow) -> Mapping[str, obje
         "seq": item.seq,
         "content": item.content,
         "is_output": item.is_output,
+        "search_text": search_text(_ITEM.validate_json(item.content)) or "",
     }
     return {**row, "meta": item.meta} if item.meta is not None else row  # mutable-ok: Prisma row payload
 

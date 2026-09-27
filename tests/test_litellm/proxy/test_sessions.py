@@ -156,6 +156,8 @@ async def test_policies_resolve_stored_then_built_in_then_default():
 
 
 async def test_compaction_calls_reach_the_deployment_that_served_the_turn():
+    from types import SimpleNamespace
+
     from litellm.proxy.sessions import router_upstream
     from litellm.sessions import ReplayBase
     from litellm.sessions.responses import MANAGED_BY_CALLER
@@ -171,6 +173,10 @@ async def test_compaction_calls_reach_the_deployment_that_served_the_turn():
             assert model_id == "d1"
             return {"api_key": "sk-upstream", "custom_llm_provider": "xai", "model": "xai/alias"}
 
+        def get_deployment(self, model_id):
+            assert model_id == "d1"
+            return SimpleNamespace(litellm_params=SimpleNamespace(use_xai_oauth=True, use_anthropic_oauth=None))
+
     replay = ReplayBase("xai", "xai/grok", {"prompt_cache_key": "s1", "stream": True}, deployment="d1")
     reply = await router_upstream(lambda: Router(), send)(replay, [{"type": "message"}], "owner-hash", 3000)
 
@@ -180,6 +186,7 @@ async def test_compaction_calls_reach_the_deployment_that_served_the_turn():
     assert call["prompt_cache_key"] == "s1" and call["max_output_tokens"] == 3000
     assert call["litellm_metadata"][MANAGED_BY_CALLER] is True
     assert call["litellm_metadata"]["user_api_key_hash"] == "owner-hash"
+    assert call["use_xai_oauth"] is True and "use_anthropic_oauth" not in call
 
 
 async def test_due_sessions_are_compacted_with_the_configured_policy():

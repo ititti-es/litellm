@@ -47,6 +47,23 @@ def test_continuation_replays_history_in_the_shape_a_stateless_upstream_accepts(
     assert manager.stats().sessions == 1
 
 
+def test_replayed_tool_calls_pair_with_their_outputs_without_the_reasoning_they_followed():
+    """An `fc_` id without its reasoning item, or a dropped custom tool call, is a 400 upstream"""
+    manager = SessionManager()
+    custom = {"type": "custom_tool_call", "id": "ctc_1", "call_id": "c2", "name": "apply_patch", "input": "x"}
+    manager.commit(
+        owner="k",
+        prior=None,
+        turn_input=(USER,),
+        output=(REASONING_PLAIN, {**CALL, "id": "fc_1"}, custom),
+        response_id="r1",
+        now=1.0,
+    )
+    resolved = manager.resolve("r1", "k")
+    assert isinstance(resolved, Resolved)
+    assert resolved.history == (USER, CALL, {key: value for key, value in custom.items() if key != "id"})
+
+
 def test_input_items_are_never_projected_even_when_they_look_like_output():
     manager = SessionManager()
     manager.commit(owner="k", prior=None, turn_input=(REASONING_PLAIN, ASSISTANT), output=(), response_id="r1", now=1.0)

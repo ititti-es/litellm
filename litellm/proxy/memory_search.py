@@ -24,12 +24,11 @@ if TYPE_CHECKING:
 
 _ITEMS_SQL: Final = """
 SELECT i.session_id, i.seq, s.title, s.source,
-       ts_rank(to_tsvector('english', i.search_text), plainto_tsquery('english', $1)) AS rank,
+       ts_rank(to_tsvector('english', COALESCE(i.search_text, '')), plainto_tsquery('english', $1)) AS rank,
        left(i.search_text, 200) AS snippet
 FROM "LiteLLM_ConversationItem" i
 JOIN "LiteLLM_ConversationSession" s ON s.session_id = i.session_id AND s.version = i.version
-WHERE i.search_text IS NOT NULL
-  AND to_tsvector('english', i.search_text) @@ plainto_tsquery('english', $1)
+WHERE to_tsvector('english', COALESCE(i.search_text, '')) @@ plainto_tsquery('english', $1)
   AND ($2::text IS NULL OR s.owner = $2)
 ORDER BY rank DESC
 LIMIT $3
