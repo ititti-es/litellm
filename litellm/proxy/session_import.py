@@ -135,20 +135,25 @@ def _decoded(content: object) -> object:
 
 
 async def run_import(
-    sessions: Iterable[ImportedSession], owner: str, repository: ConversationSessionRepository | None
+    sessions: Iterable[ImportedSession],
+    owner: str,
+    repository: ConversationSessionRepository | None,
+    write: bool = True,
 ) -> Iterator[str]:
-    lines: Final = tuple([await _import_one(session, owner, repository) for session in sessions])
+    lines: Final = tuple([await _import_one(session, owner, repository, write) for session in sessions])
     return iter(lines)
 
 
-async def _import_one(session: ImportedSession, owner: str, repository: ConversationSessionRepository | None) -> str:
+async def _import_one(
+    session: ImportedSession, owner: str, repository: ConversationSessionRepository | None, write: bool
+) -> str:
     stored: Final = (
         await repository.current_transcript(imported_session_id(session.source, session.source_id))
         if repository is not None
         else None
     )
     planned: Final = plan_import(session, owner, stored)
-    if repository is not None and planned.action != "unchanged":
+    if write and repository is not None and planned.action != "unchanged":
         await repository.import_session(planned.write)
     title: Final = (session.title or "")[:60]
     return (
@@ -178,8 +183,9 @@ async def repository_from_url(url: str | None) -> AsyncGenerator[ConversationSes
 
 
 async def _main(args: argparse.Namespace) -> int:
-    url: Final = None if getattr(args, "dry_run", False) else args.database_url or os.environ.get("DATABASE_URL")
-    if url is None and not getattr(args, "dry_run", False):
+    dry_run: Final = bool(getattr(args, "dry_run", False))
+    url: Final = args.database_url or os.environ.get("DATABASE_URL")
+    if url is None and not dry_run:
         sys.stderr.write("DATABASE_URL (or --database-url) is required unless --dry-run\n")
         return 2
     async with repository_from_url(url) as repository:
@@ -193,7 +199,7 @@ async def _main(args: argparse.Namespace) -> int:
         owner: Final = hash_token(args.owner_key) if args.owner_key else f"{ARCHIVE_OWNER_PREFIX}{args.command}"
         reader: Final = _READERS[args.command]
         scratch: Final = Path(args.scratch_dir).expanduser() if args.scratch_dir else None
-        for line in await run_import(reader(source, scratch), owner, repository):
+        for line in await run_import(reader(source, scratch), owner, repository, write=not dry_run):
             sys.stdout.write(line + "\n")
         return 0
 
