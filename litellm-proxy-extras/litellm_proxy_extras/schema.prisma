@@ -1520,6 +1520,7 @@ model LiteLLM_ConversationSession {
   updated_at           DateTime                       @default(now()) @updatedAt
   items                LiteLLM_ConversationItem[]
   responses            LiteLLM_ConversationResponse[]
+  memory_nodes         LiteLLM_MemorySummaryNode[]
   compaction_policy    LiteLLM_CompactionPolicy?      @relation(fields: [compaction_policy_id], references: [policy_id], onDelete: SetNull)
 
   @@unique([source, source_id])
@@ -1529,14 +1530,17 @@ model LiteLLM_ConversationSession {
 
 // Append-only transcript rows; a compaction writes the rebased transcript under the next version
 model LiteLLM_ConversationItem {
-  session_id String
-  version    Int
-  seq        Int
-  content    Json
-  is_output  Boolean
-  meta       Json?
-  created_at DateTime                    @default(now())
-  session    LiteLLM_ConversationSession @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
+  session_id  String
+  version     Int
+  seq         Int
+  content     Json
+  is_output   Boolean
+  meta        Json?
+  // Flat text extracted from content at write time (see litellm/sessions/session.py:comparable()),
+  // backing the tsvector full-text index added in the same migration that introduces this column.
+  search_text String?
+  created_at  DateTime                    @default(now())
+  session     LiteLLM_ConversationSession @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
 
   @@id([session_id, version, seq])
 }
@@ -1551,6 +1555,32 @@ model LiteLLM_ConversationResponse {
   session     LiteLLM_ConversationSession @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
 
   @@index([session_id])
+}
+
+// A node in the hierarchical memory over the session store (litellm/sessions/MEMORY_DESIGN.md).
+// Segment nodes summarise one compaction span of a session (span_version/span_first_seq/span_last_seq);
+// session nodes summarise a session's own segment nodes (children via parent_id) and carry no span.
+// Project/scope levels, pgvector embeddings, and redaction are not built yet — see the design doc.
+model LiteLLM_MemorySummaryNode {
+  node_id         String                       @id
+  parent_id       String?
+  session_id      String
+  level           String
+  span_version    Int?
+  span_first_seq  Int?
+  span_last_seq   Int?
+  summary         String
+  policy_id       String?
+  model           String?
+  tokens          Int?
+  source_versions Json?
+  created_at      DateTime                     @default(now())
+  session         LiteLLM_ConversationSession  @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
+  parent          LiteLLM_MemorySummaryNode?   @relation("MemorySummaryNodeChildren", fields: [parent_id], references: [node_id], onDelete: Cascade)
+  children        LiteLLM_MemorySummaryNode[]  @relation("MemorySummaryNodeChildren")
+
+  @@index([session_id])
+  @@index([parent_id])
 }
 
 // Named compaction instruction sets: built-in, imported from a harness, or custom
