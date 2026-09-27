@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import IO, Final, NamedTuple, Protocol, TypeAlias
@@ -182,7 +183,7 @@ def _child_env(params: Mapping[str, object]) -> Mapping[str, str]:
 
 def _build_command(
     model: str,
-    system: str,
+    system_prompt_file: str,
     session: str | None,
     resume: bool,
     params: Mapping[str, object],
@@ -192,8 +193,8 @@ def _build_command(
         binary_path(),
         "--print",
         *(_STREAM_FORMAT if streaming else _JSON_FORMAT),
-        "--system-prompt",
-        system,
+        "--system-prompt-file",
+        system_prompt_file,
     )
     if model:
         command += ("--model", model)
@@ -205,6 +206,27 @@ def _build_command(
     if session:
         command += (_RESUME_FLAG if resume else _NEW_SESSION_FLAG, session)
     return command
+
+
+@contextmanager
+def _command(
+    model: str,
+    system: str,
+    session: str | None,
+    resume: bool,
+    params: Mapping[str, object],
+    streaming: bool = False,
+) -> Iterator[tuple[str, ...]]:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as prompt_file:
+        prompt_file.write(system)
+        prompt_file_path: Final = prompt_file.name
+    try:
+        yield _build_command(model, prompt_file_path, session, resume, params, streaming)
+    finally:
+        try:
+            os.unlink(prompt_file_path)
+        except FileNotFoundError:
+            pass
 
 
 class _TokenPipe:
@@ -559,20 +581,17 @@ def _session_unusable(resumed: bool, stderr: str) -> bool:
 
 
 def _attempts(
-    model: str,
     messages: Sequence[Mapping[str, object]],
     prompt: str,
     session: str | None,
     resume: bool,
-    params: Mapping[str, object],
-) -> tuple[tuple[tuple[str, ...], str, bool], ...]:
+) -> tuple[tuple[str, bool], ...]:
     """The runs to try, in order: as planned, then with the session taken the other way round."""
-    system: Final = system_prompt_of(messages)
-    planned: Final = (_build_command(model, system, session, resume, params, streaming=True), prompt, resume)
+    planned: Final = (prompt, resume)
     if not session:
         return (planned,)
     other: Final = render_prompt(messages, latest_only=not resume)
-    return (planned, (_build_command(model, system, session, not resume, params, streaming=True), other, not resume))
+    return (planned, (other, not resume))
 
 
 class ClaudeCLIHandler(CustomLLM):
@@ -619,18 +638,18 @@ class ClaudeCLIHandler(CustomLLM):
         )
         system: Final = system_prompt_of(messages)
         params: Final = _params(litellm_params)
-        command = _build_command(provider_model, system, session, resume, params)
-        returncode, stdout, stderr = self._run(command, env, token, wait, prompt=prompt)
+        with _command(provider_model, system, session, resume, params) as command:
+            returncode, stdout, stderr = self._run(command, env, token, wait, prompt=prompt)
 
         if returncode != 0 and session and _session_unusable(resume, stderr):
             verbose_logger.info(
                 "Claude CLI session %s cannot be %s; retrying", session, "resumed" if resume else "started"
             )
             _STARTED_SESSIONS.discard(session)
-            command = _build_command(provider_model, system, session, not resume, params)
-            returncode, stdout, stderr = self._run(
-                command, env, token, wait, prompt=render_prompt(messages, latest_only=not resume)
-            )
+            with _command(provider_model, system, session, not resume, params) as command:
+                returncode, stdout, stderr = self._run(
+                    command, env, token, wait, prompt=render_prompt(messages, latest_only=not resume)
+                )
 
         return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
 
@@ -658,18 +677,18 @@ class ClaudeCLIHandler(CustomLLM):
         )
         system: Final = system_prompt_of(messages)
         params: Final = _params(litellm_params)
-        command = _build_command(provider_model, system, session, resume, params)
-        returncode, stdout, stderr = await self._run_async(command, env, token, wait, prompt=prompt)
+        with _command(provider_model, system, session, resume, params) as command:
+            returncode, stdout, stderr = await self._run_async(command, env, token, wait, prompt=prompt)
 
         if returncode != 0 and session and _session_unusable(resume, stderr):
             verbose_logger.info(
                 "Claude CLI session %s cannot be %s; retrying", session, "resumed" if resume else "started"
             )
             _STARTED_SESSIONS.discard(session)
-            command = _build_command(provider_model, system, session, not resume, params)
-            returncode, stdout, stderr = await self._run_async(
-                command, env, token, wait, prompt=render_prompt(messages, latest_only=not resume)
-            )
+            with _command(provider_model, system, session, not resume, params) as command:
+                returncode, stdout, stderr = await self._run_async(
+                    command, env, token, wait, prompt=render_prompt(messages, latest_only=not resume)
+                )
 
         return _finish(returncode, stdout, stderr, session, provider_model, model_response or ModelResponse(), params)
 
@@ -698,11 +717,13 @@ class ClaudeCLIHandler(CustomLLM):
         )
         params: Final = _params(litellm_params)
         turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
-        for command, attempt_prompt, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
+        system: Final = system_prompt_of(messages)
+        for attempt_prompt, resumed in _attempts(messages, prompt, session, resume):
             turn = _StreamedTurn()
-            for item in self._stream(command, env, token, wait, prompt=attempt_prompt):
-                if (chunk := turn.take(item)) is not None:
-                    yield chunk
+            with _command(provider_model, system, session, resumed, params, streaming=True) as command:
+                for item in self._stream(command, env, token, wait, prompt=attempt_prompt):
+                    if (chunk := turn.take(item)) is not None:
+                        yield chunk
             if not turn.session_unusable(resumed):
                 break
             verbose_logger.info(
@@ -735,11 +756,13 @@ class ClaudeCLIHandler(CustomLLM):
         )
         params: Final = _params(litellm_params)
         turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
-        for command, attempt_prompt, resumed in _attempts(provider_model, messages, prompt, session, resume, params):
+        system: Final = system_prompt_of(messages)
+        for attempt_prompt, resumed in _attempts(messages, prompt, session, resume):
             turn = _StreamedTurn()
-            async for item in self._stream_async(command, env, token, wait, prompt=attempt_prompt):
-                if (chunk := turn.take(item)) is not None:
-                    yield chunk
+            with _command(provider_model, system, session, resumed, params, streaming=True) as command:
+                async for item in self._stream_async(command, env, token, wait, prompt=attempt_prompt):
+                    if (chunk := turn.take(item)) is not None:
+                        yield chunk
             if not turn.session_unusable(resumed):
                 break
             verbose_logger.info(

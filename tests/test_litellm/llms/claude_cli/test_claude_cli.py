@@ -4,16 +4,15 @@ import os
 import pytest
 
 from litellm.llms.claude_cli.common_utils import (
-    CLAUDE_CLI_DEFAULT_SYSTEM_PROMPT,
     ClaudeCLIError,
     is_missing_session,
     session_uuid,
 )
 from litellm.llms.claude_cli.handler import ClaudeCLIHandler
 from litellm.llms.claude_cli.transformation import (
-    stream_text,
     parse_cli_output,
     render_prompt,
+    stream_text,
     system_prompt_of,
     to_model_response,
     usage_of,
@@ -65,6 +64,20 @@ class _Runner:
         """Return the value following a flag in a recorded argv, or None."""
         argv = self.calls[call]["command"]
         return argv[argv.index(name) + 1] if name in argv else None
+
+
+class _SystemPromptRunner(_Runner):
+    def __init__(self, *results):
+        super().__init__(*results)
+        self.system_prompt = ""
+        self.system_prompt_file = ""
+
+    def __call__(self, command, env, token, timeout, prompt=""):
+        argv = list(command)
+        self.system_prompt_file = argv[argv.index("--system-prompt-file") + 1]
+        with open(self.system_prompt_file, encoding="utf-8") as prompt_file:
+            self.system_prompt = prompt_file.read()
+        return super().__call__(command, env, token, timeout, prompt)
 
 
 def _messages(*pairs):
@@ -208,18 +221,33 @@ def test_the_token_is_not_in_the_command_line():
 
 def test_claude_codes_own_system_prompt_is_replaced():
     """Left in place it costs ~3.7k tokens and makes the model emit tool-call syntax as plain text."""
-    runner = _Runner()
+    runner = _SystemPromptRunner()
     _complete(ClaudeCLIHandler(run=runner), _messages(("system", "You are terse."), ("user", "hi")))
 
-    assert runner.flag("--system-prompt") == "You are terse."
+    assert runner.flag("--system-prompt-file")
+    assert runner.system_prompt == "You are terse."
     assert "--append-system-prompt" not in runner.calls[0]["command"]
 
 
 def test_a_request_without_a_system_message_still_replaces_it():
-    runner = _Runner()
+    runner = _SystemPromptRunner()
     _complete(ClaudeCLIHandler(run=runner), _messages(("user", "hi")))
 
-    assert runner.flag("--system-prompt") == CLAUDE_CLI_DEFAULT_SYSTEM_PROMPT
+    assert runner.flag("--system-prompt-file")
+    assert runner.system_prompt
+
+
+def test_a_large_system_prompt_is_passed_by_file_and_removed_after_the_run():
+    runner = _SystemPromptRunner()
+    system = "x" * (128 * 1024 + 1)
+
+    _complete(ClaudeCLIHandler(run=runner), _messages(("system", system), ("user", "hi")))
+
+    argv = runner.calls[0]["command"]
+    assert "--system-prompt" not in argv
+    assert max(len(argument.encode()) for argument in argv) < 128 * 1024
+    assert runner.system_prompt == system
+    assert not os.path.exists(runner.system_prompt_file)
 
 
 def test_several_system_messages_are_joined():
