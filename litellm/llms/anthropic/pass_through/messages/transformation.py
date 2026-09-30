@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import httpx
 
@@ -12,12 +12,14 @@ from litellm.llms.base_llm.anthropic_messages.transformation import (
 from litellm.types.llms.anthropic import (
     ANTHROPIC_ADVISOR_TOOL_TYPE,
     ANTHROPIC_BETA_HEADER_VALUES,
+    ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER,
     AnthropicMessagesRequest,
 )
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
 from litellm.types.llms.anthropic_tool_search import get_tool_search_beta_header
+from litellm.types.llms.openai import AllMessageValues
 from litellm.types.router import GenericLiteLLMParams
 
 from ...common_utils import (
@@ -638,6 +640,10 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             if piece.strip()
         )
         beta_values.update(existing_beta)
+
+        messages_typed: Final = cast(list[AllMessageValues], messages)
+        if AnthropicModelInfo().is_mid_conversation_tool_change_used(messages_typed):
+            beta_values.add(ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER)
 
         if requires_native_compaction_beta(custom_llm_provider, optional_params, messages):
             beta_values.add(ANTHROPIC_BETA_HEADER_VALUES.COMPACT_2026_09_04.value)
