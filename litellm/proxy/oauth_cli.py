@@ -272,7 +272,7 @@ def _chatgpt(action: str, flags: Sequence[str]) -> None:
     if "--force" in flags:
         _delete_record(authenticator.auth_file)
     try:
-        authenticator.get_access_token()
+        authenticator.get_access_token(allow_login=True)
     except (GetAccessTokenError, GetDeviceCodeError) as exc:
         raise _OAuthCommandError(str(exc)) from exc
     stored: Final = _read_record(authenticator.auth_file)

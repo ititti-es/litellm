@@ -6,6 +6,28 @@ from unittest.mock import mock_open, patch
 import pytest
 
 from litellm.llms.chatgpt.authenticator import Authenticator
+from litellm.llms.chatgpt.common_utils import GetAccessTokenError
+
+
+class _EmptyStore:
+    def read(self):
+        return None
+
+    def write(self, data):
+        raise AssertionError("Noninteractive authentication must not start login")
+
+    def delete(self):
+        raise AssertionError("Noninteractive authentication must preserve credentials")
+
+
+def test_missing_credentials_fail_without_device_login(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path))
+    authenticator = Authenticator(store=_EmptyStore())
+
+    with pytest.raises(GetAccessTokenError, match="litellm chatgpt login") as failure:
+        authenticator.get_access_token()
+
+    assert failure.value.status_code == 401
 
 
 def _make_jwt(payload: dict) -> str:
