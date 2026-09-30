@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -192,6 +193,42 @@ def test_tools_are_enabled_only_when_a_deployment_names_them():
 
     assert runner.flag("--allowed-tools") == "Read,Grep"
     assert "--disallowed-tools" not in runner.calls[0]["command"]
+
+
+def test_function_tools_are_explicitly_rejected_by_sync_surfaces():
+    runner = _Runner()
+    stream = _StreamRunner()
+    handler = ClaudeCLIHandler(run=runner, stream=stream)
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with pytest.raises(ClaudeCLIError, match="require async"):
+        handler.completion(
+            model="claude_cli/claude-sonnet-5",
+            messages=_messages(("user", "hi")),
+            optional_params={"tools": tools},
+        )
+    with pytest.raises(ClaudeCLIError, match="require async"):
+        list(
+            handler.streaming(
+                model="claude_cli/claude-sonnet-5",
+                messages=_messages(("user", "hi")),
+                optional_params={"tools": tools},
+            )
+        )
+
+    assert runner.calls == []
+    assert stream.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ("none", "required", {"type": "function", "function": {"name": "lookup"}}))
+async def test_function_tools_reject_unsupported_tool_choice(choice):
+    with pytest.raises(ClaudeCLIError, match="tool_choice='auto'"):
+        await ClaudeCLIHandler().acompletion(
+            model="claude_cli/claude-sonnet-5",
+            messages=_messages(("user", "hi")),
+            optional_params={"tools": [{"type": "function", "function": {"name": "lookup"}}], "tool_choice": choice},
+        )
 
 
 def test_the_token_never_reaches_the_child_environment():
@@ -595,15 +632,14 @@ def test_a_failure_after_text_is_not_retried():
 
     _STARTED_SESSIONS.add(session)
     runner = _StreamRunner(([_delta("partial")], StreamExit(1, "No conversation found")))
-    chunks = []
-
+    stream = ClaudeCLIHandler(stream=runner).streaming(
+        model="claude_cli/claude-sonnet-5",
+        messages=_messages(("user", "hi")),
+        litellm_params={"api_key": "sk-ant-oat01-x", "litellm_session_id": "s-late"},
+    )
+    chunks = (next(stream),)
     with pytest.raises(ClaudeCLIError):
-        for chunk in ClaudeCLIHandler(stream=runner).streaming(
-            model="claude_cli/claude-sonnet-5",
-            messages=_messages(("user", "hi")),
-            litellm_params={"api_key": "sk-ant-oat01-x", "litellm_session_id": "s-late"},
-        ):
-            chunks.append(chunk)
+        next(stream)
 
     assert [chunk["text"] for chunk in chunks] == ["partial"]
     assert len(runner.calls) == 1
@@ -791,3 +827,301 @@ def test_a_deployments_claude_cli_settings_reach_the_provider():
     assert seen["claude_cli_config_dir"] == "/srv/claude"
     assert seen["claude_cli_allowed_tools"] == ["Read"]
     assert seen["claude_cli_timeout"] == 30
+
+
+@pytest.mark.asyncio
+async def test_tool_bridge_gates_two_exact_claude_ids_and_ignores_old_history(tmp_path, monkeypatch):
+    import sys
+
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession
+
+    fake = tmp_path / "fake.py"
+    fake.write_text(
+        "import json,sys,time,pathlib\n"
+        "args=sys.argv[1:]\n"
+        "assert args[args.index('--tools')+1]==''\n"
+        "assert '--disallowed-tools' not in args\n"
+        "assert args[args.index('--allowed-tools')+1]=='mcp__litellm_bridge__first,mcp__litellm_bridge__second'\n"
+        "assert '--strict-mcp-config' in args and '--restricted' in args\n"
+        "assert pathlib.Path(args[args.index('--system-prompt-file')+1]).read_text()=='use tools'\n"
+        "assert json.loads(sys.stdin.readline())['message']['content']=='ask'\n"
+        "print(json.dumps({'type':'assistant','message':{'content':["
+        "{'type':'tool_use','id':'toolu_first','name':'first','input':{}},"
+        "{'type':'tool_use','id':'toolu_second','name':'second','input':{}}]}}),flush=True)\n"
+        "while not pathlib.Path(sys.argv[0]+'.done').exists():time.sleep(.01)\n"
+        "print(json.dumps({'type':'result','result':'completed','is_error':False}),flush=True)\n"
+        "assert json.loads(sys.stdin.readline())['message']['content']=='new'\n"
+        "print(json.dumps({'type':'result','result':'next','is_error':False}),flush=True)\n"
+    )
+    definitions = (
+        {"name": "first", "description": "", "parameters": {"type": "object"}},
+        {"name": "second", "description": "", "parameters": {"type": "object"}},
+    )
+    bridge = BridgeSession("fake", "fingerprint", definitions, 5)
+    try:
+        wrapper = tmp_path / "wrapper"
+        wrapper.write_text(
+            f"#!{sys.executable}\nimport runpy,sys\nsys.argv=['{fake}']+sys.argv[1:]\nrunpy.run_path('{fake}',run_name='__main__')\n"
+        )
+        wrapper.chmod(0o700)
+        monkeypatch.setenv("CLAUDE_CLI_PATH", str(wrapper))
+        await bridge.start("fake-model", "use tools", "ask", dict(os.environ), "synthetic")
+
+        async def relay(call_id, name):
+            reader, writer = await asyncio.open_unix_connection(str(bridge.directory.name) + "/relay.sock")
+            writer.write(
+                (
+                    json.dumps({"capability": bridge.capability, "id": call_id, "name": name, "arguments": {}}) + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            result = json.loads(await reader.readline())
+            writer.close()
+            await writer.wait_closed()
+            return result
+
+        first = asyncio.create_task(relay("toolu_first", "first"))
+        second = asyncio.create_task(relay("toolu_second", "second"))
+        chunks = [chunk async for chunk in bridge.run((), None)]
+        calls = [chunk["tool_use"] for chunk in chunks if chunk.get("tool_use")]
+        assert {call["id"] for call in calls} == {"toolu_first", "toolu_second"}
+        assert {call["index"] for call in calls} == {0, 1}
+        assert not first.done() and not second.done()
+        with pytest.raises(ClaudeCLIError, match="pending Claude calls"):
+            await collect_bridge(bridge, (("toolu_first", "one"),))
+        (tmp_path / "fake.py.done").touch()
+        resumed = asyncio.create_task(collect_bridge(bridge, (("toolu_first", "one"), ("toolu_second", "two"))))
+        assert await first == {"content": "one"}
+        assert await second == {"content": "two"}
+        assert (await resumed)[-1]["finish_reason"] == "stop"
+        later = [chunk async for chunk in bridge.run((("toolu_first", "old"), ("toolu_second", "old")), "new")]
+        assert later[-1]["finish_reason"] == "stop"
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_bridge_accepts_consecutive_tool_rounds_before_a_final_result(tmp_path, monkeypatch):
+    import sys
+
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession
+
+    fake = tmp_path / "fake.py"
+    fake.write_text(
+        "import json,pathlib,socket,sys\n"
+        "args=sys.argv[1:]\n"
+        "sidecar=json.loads(pathlib.Path(args[args.index('--mcp-config')+1]).read_text())['mcpServers']['litellm_bridge']['args']\n"
+        "directory=pathlib.Path(sidecar[sidecar.index('--directory')+1])\n"
+        "def relay(call_id,arguments):\n"
+        " sock=socket.socket(socket.AF_UNIX);sock.connect(str(directory/'relay.sock'))\n"
+        " request={'capability':(directory/'capability').read_text(),'id':call_id,'name':'lookup','arguments':arguments}\n"
+        " sock.sendall((json.dumps(request)+'\\n').encode());return sock\n"
+        "def receive(sock):\n"
+        " data=b''\n"
+        " while not data.endswith(b'\\n'):data+=sock.recv(4096)\n"
+        " return json.loads(data)\n"
+        "assert json.loads(sys.stdin.readline())['message']['content']=='ask'\n"
+        "first=relay('toolu_first',{})\n"
+        "print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','id':'toolu_first','name':'lookup','input':{}}]}}),flush=True)\n"
+        "assert receive(first)=={'content':'one'}\n"
+        "large={'value':'x'*(64*1024+1)}\n"
+        "second=relay('toolu_second',large)\n"
+        "print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','id':'toolu_second','name':'lookup','input':large}]}}),flush=True)\n"
+        "assert receive(second)=={'content':'two'}\n"
+        "print(json.dumps({'type':'result','result':'completed','is_error':False}),flush=True)\n"
+    )
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport runpy,sys\nsys.argv=['{fake}']+sys.argv[1:]\nrunpy.run_path('{fake}',run_name='__main__')\n"
+    )
+    wrapper.chmod(0o700)
+    monkeypatch.setenv("CLAUDE_CLI_PATH", str(wrapper))
+    definitions = ({"name": "lookup", "description": "", "parameters": {"type": "object"}},)
+    bridge = BridgeSession("consecutive", "fingerprint", definitions, 5)
+    try:
+        await bridge.start("fake-model", "use tools", "ask", dict(os.environ), "synthetic")
+
+        first = await collect_bridge(bridge, ())
+        assert first[-1]["finish_reason"] == "tool_calls"
+        assert first[0]["tool_use"]["id"] == "toolu_first"
+
+        second = await collect_bridge(bridge, (("toolu_first", "one"),))
+        assert second[-1]["finish_reason"] == "tool_calls"
+        assert second[0]["tool_use"]["id"] == "toolu_second"
+        assert len(json.loads(second[0]["tool_use"]["function"]["arguments"])["value"]) > 64 * 1024
+
+        final = await collect_bridge(bridge, (("toolu_second", "two"),))
+        assert final[-1]["finish_reason"] == "stop"
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_tool_results_do_not_cancel_bridge_expiry():
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession
+
+    bridge = BridgeSession("expiry", "fingerprint", (), 5)
+    bridge.pending = frozenset(("toolu_expected",))
+    bridge.refresh_expiry()
+    expiry = bridge.expiry
+    try:
+        with pytest.raises(ClaudeCLIError, match="pending Claude calls"):
+            await collect_bridge(bridge, (("toolu_wrong", "result"),))
+
+        assert expiry is not None and not expiry.cancelled()
+    finally:
+        await bridge.close()
+
+
+async def collect_bridge(bridge, results):
+    return [chunk async for chunk in bridge.run(results, None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", (None, "auto"))
+async def test_async_completion_returns_calls_before_a_serial_second_relay_arrives(tmp_path, monkeypatch, choice):
+    from litellm.llms.claude_cli.tool_bridge import _SESSIONS
+
+    fake = tmp_path / "claude"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os,pathlib,select,socket,sys\n"
+        "args=sys.argv[1:]\n"
+        "assert args[args.index('--tools')+1]==''\n"
+        "assert '--disallowed-tools' not in args\n"
+        "assert args[args.index('--permission-mode')+1]=='dontAsk'\n"
+        "assert args[args.index('--permission-prompts')+1]=='none'\n"
+        "allowed=args[args.index('--allowed-tools')+1].split(',')\n"
+        "assert allowed==['mcp__litellm_bridge__first','mcp__litellm_bridge__second']\n"
+        "config=json.loads(pathlib.Path(args[args.index('--mcp-config')+1]).read_text())\n"
+        "assert list(config['mcpServers'])==['litellm_bridge']\n"
+        "sidecar=config['mcpServers']['litellm_bridge']['args']\n"
+        "directory=pathlib.Path(sidecar[sidecar.index('--directory')+1])\n"
+        "assert pathlib.Path(args[args.index('--system-prompt-file')+1]).read_text()=='keep this system prompt'\n"
+        "assert os.read(int(os.environ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR']),100)==b'synthetic'\n"
+        "assert json.loads(sys.stdin.readline())['message']['content'].endswith('run both')\n"
+        "def connect(call_id,name,value):\n"
+        " s=socket.socket(socket.AF_UNIX);s.connect(str(directory/'relay.sock'))\n"
+        " request={'capability':(directory/'capability').read_text(),'id':call_id,'name':name,'arguments':{'value':value}}\n"
+        " s.sendall((json.dumps(request)+'\\n').encode());return s\n"
+        "first=connect('toolu_first','first',1)\n"
+        "calls=[{'type':'tool_use','id':'toolu_first','name':'mcp__litellm_bridge__first','input':{'value':1}},"
+        "{'type':'tool_use','id':'toolu_second','name':'mcp__litellm_bridge__second','input':{'value':2}}]\n"
+        "print(json.dumps({'type':'assistant','message':{'content':calls}}),flush=True)\n"
+        "def receive(sock):\n"
+        " data=b''\n"
+        " while not data.endswith(b'\\n'):data+=sock.recv(4096)\n"
+        " return json.loads(data)\n"
+        "assert receive(first)=={'content':'one'}\n"
+        "second=connect('toolu_second','second',2)\n"
+        "assert receive(second)=={'content':'two'}\n"
+        "assert not select.select([sys.stdin],[],[],0.2)[0]\n"
+        f"print({_delta('continued')!r},flush=True)\n"
+        f"print({_result_line(result='continued', stop_reason='end_turn')!r},flush=True)\n"
+    )
+    fake.chmod(0o700)
+    monkeypatch.setenv("CLAUDE_CLI_PATH", str(fake))
+    handler = ClaudeCLIHandler()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"],
+                },
+            },
+        }
+        for name in ("first", "second")
+    ]
+    params = {
+        "api_key": "synthetic",
+        "litellm_session_id": str(tmp_path),
+        "metadata": {"user_api_key_hash": "owner"},
+    }
+    optional_params = {"tools": tools, **({"tool_choice": choice} if choice is not None else {})}
+
+    first_response = await handler.acompletion(
+        model="claude_cli/fake-model",
+        messages=_messages(("system", "keep this system prompt"), ("user", "run both")),
+        optional_params=optional_params,
+        litellm_params=params,
+    )
+
+    calls = first_response.choices[0].message.tool_calls
+    assert first_response.choices[0].finish_reason == "tool_calls"
+    assert [(call.id, call.function.name, call.function.arguments) for call in calls] == [
+        ("toolu_first", "first", '{"value":1}'),
+        ("toolu_second", "second", '{"value":2}'),
+    ]
+
+    second_response = await handler.acompletion(
+        model="claude_cli/fake-model",
+        messages=[
+            *_messages(("system", "keep this system prompt"), ("user", "run both")),
+            {"role": "assistant", "content": None, "tool_calls": [call.model_dump() for call in calls]},
+            {"role": "tool", "tool_call_id": "toolu_first", "content": "one"},
+            {"role": "tool", "tool_call_id": "toolu_second", "content": "two"},
+        ],
+        optional_params=optional_params,
+        litellm_params=params,
+    )
+
+    assert second_response.choices[0].message.content == "continued"
+    assert second_response.choices[0].finish_reason == "stop"
+    await _SESSIONS[session_uuid("owner", str(tmp_path))].close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_sidecar_forwards_claude_tool_use_metadata(tmp_path):
+    import sys
+
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    received = asyncio.get_running_loop().create_future()
+
+    async def relay(reader, writer):
+        request = json.loads(await reader.readline())
+        received.set_result(request)
+        writer.write((json.dumps({"content": "x" * (64 * 1024 + 1)}) + "\n").encode())
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    socket_path = tmp_path / "relay.sock"
+    server = await asyncio.start_unix_server(relay, path=str(socket_path))
+    (tmp_path / "capability").write_text("secret")
+    (tmp_path / "tools.json").write_text(
+        json.dumps([{"name": "lookup", "description": "", "parameters": {"type": "object"}}])
+    )
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            "-m",
+            "litellm.llms.claude_cli.mcp_sidecar",
+            "--socket",
+            str(socket_path),
+            "--directory",
+            str(tmp_path),
+        ],
+    )
+    try:
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                result = await session.call_tool("lookup", {"term": "x"}, meta={"claudecode/toolUseId": "toolu_exact"})
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert (await received) == {
+        "capability": "secret",
+        "id": "toolu_exact",
+        "name": "lookup",
+        "arguments": {"term": "x"},
+    }
+    assert result.content[0].text == "x" * (64 * 1024 + 1)

@@ -44,6 +44,7 @@ from .common_utils import (
     session_uuid,
 )
 from .sync import SyncRequest, sync_transcript
+from .tool_bridge import complete_bridge, stream_bridge
 from .transformation import (
     CliResult,
     final_chunk,
@@ -109,6 +110,26 @@ _STREAM_LINE_LIMIT: Final = 64 * 1024 * 1024
 
 def _params(litellm_params: Mapping[str, object] | None) -> Mapping[str, object]:
     return litellm_params or _NO_PARAMS
+
+
+def _function_tools(
+    optional_params: Mapping[str, object] | None, litellm_params: Mapping[str, object] | None
+) -> object:
+    if optional_params is not None and "tools" in optional_params:
+        return optional_params["tools"]
+    return (litellm_params or _NO_PARAMS).get("tools")
+
+
+def _validate_tool_choice(
+    optional_params: Mapping[str, object] | None, litellm_params: Mapping[str, object] | None
+) -> None:
+    params: Final = (
+        optional_params if optional_params is not None and "tool_choice" in optional_params else litellm_params
+    )
+    choice: Final = params.get("tool_choice") if params is not None else None
+    if choice is None or choice == "auto":
+        return
+    raise ClaudeCLIError("only tool_choice='auto' is supported for function tools", status_code=400)
 
 
 def _access_token(params: Mapping[str, object], api_key: str | None) -> str:
@@ -633,6 +654,8 @@ class ClaudeCLIHandler(CustomLLM):
         timeout: float | None = None,
         client: object = None,
     ) -> ModelResponse:
+        if _function_tools(optional_params, litellm_params) is not None:
+            raise ClaudeCLIError("function tools require async completion or async streaming", status_code=400)
         provider_model, prompt, session, resume, env, token, wait = _plan(
             model, messages, litellm_params, api_key, timeout
         )
@@ -672,6 +695,19 @@ class ClaudeCLIHandler(CustomLLM):
         timeout: float | None = None,
         client: object = None,
     ) -> ModelResponse:
+        tools: Final = _function_tools(optional_params, litellm_params)
+        if tools is not None:
+            _validate_tool_choice(optional_params, litellm_params)
+            params: Final = _params(litellm_params)
+            return await complete_bridge(
+                model,
+                messages,
+                params,
+                _access_token(params, api_key),
+                _timeout_of(params, timeout),
+                tools,
+                model_response or ModelResponse(),
+            )
         provider_model, prompt, session, resume, env, token, wait = _plan(
             model, messages, litellm_params, api_key, timeout
         )
@@ -712,6 +748,8 @@ class ClaudeCLIHandler(CustomLLM):
         client: object = None,
     ) -> Iterator[GenericStreamingChunk]:
         """Stream the reply as Claude Code produces it; every agent harness asks for this."""
+        if _function_tools(optional_params, litellm_params) is not None:
+            raise ClaudeCLIError("function tools require async completion or async streaming", status_code=400)
         provider_model, prompt, session, resume, env, token, wait = _plan(
             model, messages, litellm_params, api_key, timeout
         )
@@ -751,6 +789,15 @@ class ClaudeCLIHandler(CustomLLM):
         timeout: float | None = None,
         client: object = None,
     ) -> AsyncIterator[GenericStreamingChunk]:
+        tools: Final = _function_tools(optional_params, litellm_params)
+        if tools is not None:
+            _validate_tool_choice(optional_params, litellm_params)
+            params: Final = _params(litellm_params)
+            async for chunk in stream_bridge(
+                model, messages, params, _access_token(params, api_key), _timeout_of(params, timeout), tools
+            ):
+                yield chunk
+            return
         provider_model, prompt, session, resume, env, token, wait = _plan(
             model, messages, litellm_params, api_key, timeout
         )
