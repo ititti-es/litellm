@@ -3432,19 +3432,20 @@ def test_add_litellm_metadata_opencode_legacy_parent_session_fallback(metadata_k
     assert turn[metadata_key]["session_id"] == parent_id
 
 
-def test_explicit_litellm_conversation_id_keeps_precedence_over_bare_session_id():
+@pytest.mark.parametrize("explicit_trace", (None, "explicit-trace"))
+def test_explicit_litellm_headers_keep_precedence_over_bare_session_id(explicit_trace: str | None):
     turn: Final = LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers={
             "X-LiteLLM-Session-Id": "explicit-conversation",
             "x-session-id": "bare-conversation",
-            "x-litellm-trace-id": "explicit-trace",
+            **({"x-litellm-trace-id": explicit_trace} if explicit_trace else {}),
         },
         data={"metadata": {}},
         _metadata_variable_name="metadata",
     )
 
-    assert turn["litellm_session_id"] == "explicit-conversation"
-    assert turn["litellm_trace_id"] == "explicit-trace"
+    assert turn["litellm_session_id"] == (explicit_trace or "explicit-conversation")
+    assert turn["litellm_trace_id"] == (explicit_trace or "explicit-conversation")
 
 
 def test_add_litellm_metadata_groups_opencode_turns_into_one_session():

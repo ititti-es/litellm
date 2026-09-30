@@ -1560,7 +1560,8 @@ class LiteLLMProxyRequestSetup:
             metadata_from_headers["trace_id"] = chain_id
             metadata_from_headers["session_id"] = chain_id
             data["litellm_session_id"] = (
-                normalized_headers.get("x-litellm-session-id")
+                normalized_headers.get("x-litellm-trace-id")
+                or normalized_headers.get("x-litellm-session-id")
                 or _extract_bare_session_id_from_headers(normalized_headers)
                 or chain_id
             )
