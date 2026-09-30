@@ -1,3 +1,5 @@
+from typing import Final
+
 import pytest
 
 import litellm
@@ -167,8 +169,8 @@ async def test_a_clients_session_id_keys_the_upstream_cache_and_is_recorded(mana
 
 
 async def test_a_restarted_gateway_keeps_the_same_upstream_cache_key(manager):
-    from litellm.sessions.responses import affinity_key
     from litellm.sessions import SessionManager
+    from litellm.sessions.responses import affinity_key
 
     first = await litellm.aresponses(
         model="openai/gpt-4.1",
@@ -228,6 +230,35 @@ async def test_a_resent_history_continues_its_session_instead_of_starting_anothe
     assert second.key == first.key
     assert [item["content"][0]["text"] for item in second.turn_input] == ["two"]
     assert [item["content"][0]["text"] for item in second.upstream_input()] == ["one", "a1", "two"]
+
+
+async def test_resent_tool_results_continue_when_client_omits_empty_assistant_output():
+    manager: Final = SessionManager()
+    first: Final = await begin_turn(manager, None, "run probe", "key-a", "thread-1")
+    assert isinstance(first, PendingTurn)
+    call: Final = {"type": "function_call", "id": "fc_probe", "call_id": "c1", "name": "probe", "arguments": "{}"}
+    first.finish(
+        ResponsesAPIResponse(
+            id="resp_1",
+            created_at=0,
+            output=[{"type": "message", "role": "assistant", "content": []}, call],
+        )
+    )
+    second: Final = await begin_turn(
+        manager,
+        None,
+        [
+            {"role": "user", "content": "run probe"},
+            call,
+            {"type": "function_call_output", "call_id": "c1", "output": "marker"},
+        ],
+        "key-a",
+        "thread-1",
+    )
+    assert isinstance(second, PendingTurn) and isinstance(second.prior, Resolved)
+    assert second.key == first.key
+    assert tuple(item.get("type") for item in second.turn_input) == ("function_call_output",)
+    assert manager.stats().sessions == 1
 
 
 async def test_the_whole_thread_ends_up_in_one_session():

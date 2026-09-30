@@ -61,6 +61,12 @@ def test_positions_survive_the_items_that_were_left_out():
     assert [index for index, _ in comparable(items)] == [0, 2]
 
 
+def test_empty_assistant_output_does_not_change_tool_history_identity():
+    call: Final[Item] = {"type": "function_call", "call_id": "c1", "name": "probe", "arguments": "{}"}
+    assert _forms([{"role": "assistant", "content": []}, call]) == _forms([call])
+    assert _forms([{"role": "assistant", "content": [{"type": "input_image"}]}, call]) != _forms([call])
+
+
 def test_a_tool_call_is_compared_on_what_it_asked_for():
     call = [{"type": "function_call", "call_id": "c1", "name": "ls", "arguments": '{"path": "/"}'}]
     same = [{"type": "function_call", "call_id": "c1", "name": "ls", "arguments": '{"path": "/"}', "id": "fc_1"}]

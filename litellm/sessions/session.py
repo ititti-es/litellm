@@ -100,7 +100,11 @@ def _form(item: Item) -> Form | None:
         return ("function_call", _string(item, "call_id"), _string(item, "name"), _string(item, "arguments"))
     if kind == "function_call_output":
         return ("function_call_output", _string(item, "call_id"), _text_of(item.get("output")))
-    return ("message", _string(item, "role"), _text_of(item.get("content")))
+    role: Final = _string(item, "role")
+    text: Final = _text_of(item.get("content"))
+    if role == "assistant" and not text:
+        return None
+    return ("message", role, text)
 
 
 def _string(item: Item, key: str) -> str:
