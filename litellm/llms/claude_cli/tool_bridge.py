@@ -77,6 +77,7 @@ class _FunctionInput(BaseModel):
     name: str
     description: str = ""
     parameters: Mapping[str, object] | None = None
+    strict: bool | None = None
 
 
 class _ToolInput(BaseModel):

@@ -1028,6 +1028,7 @@ async def test_async_completion_returns_calls_before_a_serial_second_relay_arriv
             "function": {
                 "name": name,
                 "description": "",
+                "strict": False,
                 "parameters": {
                     "type": "object",
                     "properties": {"value": {"type": "integer"}},
