@@ -53,7 +53,7 @@ def test_stored_settings_are_validated():
         policy_from("p", "custom", "x", {"keep_turns": 0})
     with pytest.raises(pydantic.ValidationError):
         policy_from("p", "custom", "x", {"unknown": 1})
-    with pytest.raises(ValueError):
+    with pytest.raises(pydantic.ValidationError):
         policy_from_json('{"name": "p"}')
 
 

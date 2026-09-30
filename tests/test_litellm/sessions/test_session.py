@@ -1,4 +1,8 @@
-from litellm.sessions.session import comparable
+from typing import Final
+
+import pytest
+
+from litellm.sessions.session import Item, comparable, search_text
 
 
 def _forms(items):
@@ -79,3 +83,51 @@ def test_a_part_carrying_no_text_is_named_rather_than_ignored():
     without = [{"role": "user", "content": [{"type": "input_text", "text": "look"}]}]
 
     assert _forms(with_image) != _forms(without)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "reasoning", "content": "hidden", "summary": [{"type": "summary_text", "text": "hidden"}]},
+        {"role": "user", "content": [{"type": "input_image", "image_url": "synthetic-image"}]},
+        {"role": "user", "content": [{"type": "input_audio", "data": "synthetic-audio"}]},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "hidden"}]},
+        {"role": "assistant", "content": ""},
+    ],
+)
+def test_search_text_excludes_reasoning_nontext_and_empty_items(item: Item) -> None:
+    assert search_text(item) is None
+
+
+def test_search_text_keeps_only_text_from_mixed_message_parts() -> None:
+    item: Final[Item] = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "first"},
+            {"type": "input_image", "image_url": "synthetic-image"},
+            {"type": "input_audio", "data": "synthetic-audio"},
+            {"type": "thinking", "thinking": "hidden"},
+            {"type": "text", "text": "second"},
+        ],
+    }
+
+    assert search_text(item) == "first\nsecond"
+
+
+@pytest.mark.parametrize(
+    "item,expected",
+    [
+        ({"role": "user", "content": "plain text"}, "plain text"),
+        ({"type": "function_call", "name": "lookup", "arguments": '{"query":"synthetic"}'}, '{"query":"synthetic"}'),
+        ({"type": "function_call_output", "call_id": "call-1", "output": "synthetic result"}, "synthetic result"),
+        (
+            {
+                "type": "function_call_output",
+                "output": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+            },
+            "first\nsecond",
+        ),
+    ],
+)
+def test_search_text_indexes_message_text_tool_arguments_and_tool_results(item: Item, expected: str) -> None:
+    assert search_text(item) == expected

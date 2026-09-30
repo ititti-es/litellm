@@ -510,12 +510,12 @@ def test_pull_copies_the_database_credentials_to_the_local_file(isolated_credent
 
 
 def test_pushing_nothing_is_an_error_rather_than_a_silent_success(isolated_credentials, fake_database):
-    with pytest.raises(click.ClickException, match="No .* credentials found"):
+    with pytest.raises(click.ClickException, match=r"No .* credentials found"):
         handle_oauth_command(("anthropic-oauth", "push"))
 
 
 def test_pulling_nothing_is_an_error(isolated_credentials, fake_database):
-    with pytest.raises(click.ClickException, match="No .* credentials found"):
+    with pytest.raises(click.ClickException, match=r"No .* credentials found"):
         handle_oauth_command(("anthropic-oauth", "pull"))
 
 

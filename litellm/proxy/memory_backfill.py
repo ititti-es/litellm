@@ -25,12 +25,30 @@ import sys
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
+
+from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict
 
 from litellm.sessions.session import search_text
 
 if TYPE_CHECKING:
     from prisma import Prisma
+    from prisma import models as prisma_models
+
+
+_MAPPING: Final = TypeAdapter(Mapping[str, object])
+
+
+class _SourceVersions(TypedDict):
+    covers: ReadOnly[Mapping[str, object]]
+
+
+class _ItemKey(TypedDict):
+    session_id: ReadOnly[str]
+    version: ReadOnly[int]
+    seq: ReadOnly[int]
 
 
 def _digest(value: str) -> str:
@@ -60,7 +78,7 @@ class SegmentNode:
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
-    return value if isinstance(value, Mapping) else {}
+    return _MAPPING.validate_python(value if isinstance(value, Mapping) else MappingProxyType({}))
 
 
 def _as_str(value: object) -> str | None:
@@ -88,6 +106,7 @@ def segment_from_item(
         return None
     covers: Final = _as_mapping(meta.get("covers"))
     usage: Final = _as_mapping(meta.get("usage"))
+    source_versions: Final[_SourceVersions] = {"covers": covers}
     return SegmentNode(
         node_id=segment_node_id(session_id, version, seq),
         session_id=session_id,
@@ -98,7 +117,7 @@ def segment_from_item(
         span_version=_as_int(covers.get("version")),
         span_first_seq=_as_int(covers.get("first_seq")),
         span_last_seq=_as_int(covers.get("last_seq")),
-        source_versions=json.dumps({"covers": dict(covers)}),
+        source_versions=json.dumps(source_versions),
     )
 
 
@@ -119,8 +138,10 @@ class BackfillStats:
 @asynccontextmanager
 async def _client(url: str) -> AsyncGenerator[Prisma]:
     from prisma import Prisma
+    from prisma.types import DatasourceOverride
 
-    client: Final = Prisma(datasource={"url": url})
+    datasource: Final = DatasourceOverride(url=url)
+    client: Final = Prisma(datasource=datasource)
     await client.connect()
     try:
         yield client
@@ -130,66 +151,80 @@ async def _client(url: str) -> AsyncGenerator[Prisma]:
 
 async def backfill(client: Prisma, *, dry_run: bool) -> BackfillStats:
     sessions: Final = await client.litellm_conversationsession.find_many()
-    text_filled = 0
-    segment_nodes = 0
-    session_nodes = 0
-    for session in sessions:
-        items = await client.litellm_conversationitem.find_many(
-            where={"session_id": session.session_id, "version": session.version},  # mutable-ok: Prisma where
-            order={"seq": "asc"},  # mutable-ok: Prisma order
-        )
-        segments: list[SegmentNode] = []
-        for item in items:
-            if item.search_text is None:
-                text = (search_text(item.content) if isinstance(item.content, dict) else None) or ""
-                text_filled += 1 if text else 0
-                if not dry_run:
-                    await client.litellm_conversationitem.update(
-                        where={  # mutable-ok: Prisma where
-                            "session_id_version_seq": {
-                                "session_id": item.session_id,
-                                "version": item.version,
-                                "seq": item.seq,
-                            }
-                        },
-                        data={"search_text": text},  # mutable-ok: Prisma data
-                    )
-            meta = item.meta if isinstance(item.meta, Mapping) else {}
-            segment = segment_from_item(session.session_id, item.version, item.seq, meta, item.content)
-            if segment is not None:
-                segments.append(segment)
-
-        for segment in segments:
-            segment_nodes += 1
-            if not dry_run:
-                await client.litellm_memorysummarynode.upsert(
-                    where={"node_id": segment.node_id},  # mutable-ok: Prisma where
-                    data={  # mutable-ok: Prisma upsert payload
-                        "create": _segment_fields(segment),
-                        "update": _segment_fields(segment),
-                    },
-                )
-        if segments:
-            session_nodes += 1
-            node_id = session_node_id(session.session_id)
-            if not dry_run:
-                fields = {  # mutable-ok: Prisma payload
-                    "session_id": session.session_id,
-                    "level": "session",
-                    "summary": session_summary(segments),
-                    "tokens": sum(s.tokens or 0 for s in segments) or None,
-                }
-                await client.litellm_memorysummarynode.upsert(
-                    where={"node_id": node_id},  # mutable-ok: Prisma where
-                    data={"create": {"node_id": node_id, **fields}, "update": fields},  # mutable-ok: Prisma payload
-                )
-                for segment in segments:
-                    await client.litellm_memorysummarynode.update(
-                        where={"node_id": segment.node_id},  # mutable-ok: Prisma where
-                        data={"parent_id": node_id},  # mutable-ok: Prisma data
-                    )
+    counts: Final = tuple([await _backfill_session(client, session, dry_run=dry_run) for session in sessions])
     return BackfillStats(
-        sessions=len(sessions), items_text_filled=text_filled, segment_nodes=segment_nodes, session_nodes=session_nodes
+        sessions=len(sessions),
+        items_text_filled=sum(count.items_text_filled for count in counts),
+        segment_nodes=sum(count.segment_nodes for count in counts),
+        session_nodes=sum(count.session_nodes for count in counts),
+    )
+
+
+async def _backfill_session(
+    client: Prisma, session: prisma_models.LiteLLM_ConversationSession, *, dry_run: bool
+) -> BackfillStats:
+    items: Final = await client.litellm_conversationitem.find_many(
+        where={"session_id": session.session_id, "version": session.version},  # mutable-ok: Prisma where
+        order={"seq": "asc"},  # mutable-ok: Prisma order
+    )
+    text_filled: Final = sum(
+        bool(search_text(item.content)) for item in items if item.search_text is None and isinstance(item.content, dict)
+    )
+    segments: Final = tuple(
+        segment
+        for item in items
+        if (
+            segment := segment_from_item(
+                session.session_id, item.version, item.seq, _as_mapping(item.meta), item.content
+            )
+        )
+        is not None
+    )
+    for item in items:
+        if item.search_text is None:
+            text = (search_text(item.content) if isinstance(item.content, dict) else None) or ""
+            if not dry_run:
+                item_key: _ItemKey = {
+                    "session_id": item.session_id,
+                    "version": item.version,
+                    "seq": item.seq,
+                }
+                await client.litellm_conversationitem.update(
+                    where={  # mutable-ok: Prisma where
+                        "session_id_version_seq": item_key
+                    },
+                    data={"search_text": text},  # mutable-ok: Prisma data
+                )
+
+    for segment in segments:
+        if not dry_run:
+            await client.litellm_memorysummarynode.upsert(
+                where={"node_id": segment.node_id},  # mutable-ok: Prisma where
+                data={  # mutable-ok: Prisma upsert payload
+                    "create": _segment_fields(segment),
+                    "update": _segment_fields(segment),
+                },
+            )
+    if segments:
+        node_id: Final = session_node_id(session.session_id)
+        if not dry_run:
+            fields: Final = {  # mutable-ok: Prisma payload
+                "session_id": session.session_id,
+                "level": "session",
+                "summary": session_summary(segments),
+                "tokens": sum(s.tokens or 0 for s in segments) or None,
+            }
+            await client.litellm_memorysummarynode.upsert(
+                where={"node_id": node_id},  # mutable-ok: Prisma where
+                data={"create": {"node_id": node_id, **fields}, "update": fields},  # mutable-ok: Prisma payload
+            )
+            for segment in segments:
+                await client.litellm_memorysummarynode.update(
+                    where={"node_id": segment.node_id},  # mutable-ok: Prisma where
+                    data={"parent_id": node_id},  # mutable-ok: Prisma data
+                )
+    return BackfillStats(
+        sessions=1, items_text_filled=text_filled, segment_nodes=len(segments), session_nodes=int(bool(segments))
     )
 
 
@@ -215,7 +250,7 @@ async def _main(args: argparse.Namespace) -> int:
         sys.stderr.write("DATABASE_URL (or --database-url) is required\n")
         return 2
     async with _client(url) as client:
-        stats = await backfill(client, dry_run=args.dry_run)
+        stats: Final = await backfill(client, dry_run=args.dry_run)
     sys.stdout.write(
         f"sessions={stats.sessions} items_text_filled={stats.items_text_filled} "
         f"segment_nodes={stats.segment_nodes} session_nodes={stats.session_nodes}"

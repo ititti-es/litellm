@@ -26469,6 +26469,23 @@ export interface components {
             timezone?: string | null;
         };
         /**
+         * CompactionModelSettings
+         * @description Per-model compaction bars; unset fields use the proxy-wide values
+         */
+        CompactionModelSettings: {
+            /**
+             * Context Window
+             * @description Overrides the model's known context window (needed when LiteLLM does not know it)
+             */
+            context_window?: number | null;
+            /** Enabled */
+            enabled?: boolean | null;
+            /** Min Context Fraction */
+            min_context_fraction?: number | null;
+            /** Min Prefix Tokens */
+            min_prefix_tokens?: number | null;
+        };
+        /**
          * ComplexityRouterConfigValidationRequest
          * @description A complexity-router config to validate without saving, so a form can surface the
          *     backend's own verdict inline instead of a raw 400 at write time.
@@ -27054,6 +27071,8 @@ export interface components {
             reject_clientside_metadata_tags?: boolean | null;
             /** @description Spreads the proxy's scheduled background jobs (spend flushes, budget resets, config reloads, exports) across a window instead of firing them together on every replica. On by default; set to tune the window, pin a job, or turn it off. */
             scheduled_job_stagger?: components["schemas"]["ScheduledJobStaggerSettings"] | null;
+            /** @description Gateway-owned Responses API sessions: previous_response_id resolves to history the proxy holds, for every provider, bound to the key that created it */
+            session_manager?: components["schemas"]["SessionManagerSettings"] | null;
             /**
              * Store Model In Db
              * @description If True, models and config are stored in and loaded from the database. Default is False.
@@ -31004,6 +31023,12 @@ export interface components {
             timeout?: number | string | null;
             /** Tpm */
             tpm?: number | null;
+            /**
+             * Use Anthropic Oauth
+             * @description Use stored Claude Pro/Max OAuth credentials when no Anthropic API key is configured.
+             * @default false
+             */
+            use_anthropic_oauth: boolean | null;
             /** Use Chat Completions Api */
             use_chat_completions_api?: boolean | null;
             /**
@@ -37424,6 +37449,95 @@ export interface components {
             /** Timeout */
             timeout?: number | null;
         };
+        /** SessionCompactionSettings */
+        SessionCompactionSettings: {
+            /**
+             * Enabled
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * Evidence Half Life Seconds
+             * @description How quickly old cache observations lose weight; providers such as xAI vary cache lifetime with load, so the prediction should follow recent conditions
+             * @default 3600
+             */
+            evidence_half_life_seconds: number;
+            /**
+             * Lead Seconds
+             * @description Start compacting this long before the cache is predicted to expire
+             * @default 20
+             */
+            lead_seconds: number;
+            /**
+             * Min Context Fraction
+             * @description Only sessions filling at least this share of the model's context window are compacted, so a modest session keeps its full history through a break; unset to rely on min_prefix_tokens alone
+             * @default 0.5
+             */
+            min_context_fraction: number | null;
+            /**
+             * Min Prefix Tokens
+             * @description Only sessions whose next prefix is at least this long are compacted
+             * @default 20000
+             */
+            min_prefix_tokens: number;
+            /**
+             * Models
+             * @description Per-model overrides, keyed by model_list name (or the provider model string)
+             */
+            models?: {
+                [key: string]: components["schemas"]["CompactionModelSettings"];
+            };
+            /**
+             * Policy
+             * @description Name of a stored compaction policy (LiteLLM_CompactionPolicy); unset uses the built-in one
+             */
+            policy?: string | null;
+            /**
+             * Target Hit Rate
+             * @description The predicted expiry is the longest idle gap at which the cache was still hit at least this often
+             * @default 0.8
+             */
+            target_hit_rate: number;
+            /**
+             * Tick Seconds
+             * @description How often to look for sessions whose cache is about to expire
+             * @default 5
+             */
+            tick_seconds: number;
+        };
+        /** SessionManagerSettings */
+        SessionManagerSettings: {
+            /**
+             * Budget Mb
+             * @description Memory held by live sessions before the least recently used are evicted
+             * @default 256
+             */
+            budget_mb: number;
+            /** @description Compact sessions while their upstream prompt cache is still warm, just before it expires */
+            compaction?: components["schemas"]["SessionCompactionSettings"];
+            /**
+             * Enabled
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * Record Store False
+             * @description Also record turns sent with `store: false`. That flag asks the provider not to keep the response, and harnesses that hold their own history (opencode, Codex) always send it. On a gateway that is its owner's own session store, those turns can be recorded anyway; the upstream request is not changed, the client's input is sent exactly as it arrived
+             * @default false
+             */
+            record_store_false: boolean;
+            /**
+             * Retention Days
+             * @description Delete stored transcripts this long after their last turn. Unset keeps them permanently; pinned sessions (including every import) are always kept
+             */
+            retention_days?: number | null;
+            /**
+             * Store Transcripts
+             * @description Persist transcripts to the database so any worker can resume them
+             * @default false
+             */
+            store_transcripts: boolean;
+        };
         /**
          * ShadowEvalJobResponse
          * @description A shadow-eval job over one or more targets, each with its own budget and stop state;
@@ -41655,6 +41769,12 @@ export interface components {
             timeout?: number | string | null;
             /** Tpm */
             tpm?: number | null;
+            /**
+             * Use Anthropic Oauth
+             * @description Use stored Claude Pro/Max OAuth credentials when no Anthropic API key is configured.
+             * @default false
+             */
+            use_anthropic_oauth: boolean | null;
             /** Use Chat Completions Api */
             use_chat_completions_api?: boolean | null;
             /**

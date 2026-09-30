@@ -67,9 +67,29 @@ def comparable(items: Sequence[Item]) -> tuple[tuple[int, Form], ...]:
 
 
 def search_text(item: Item) -> str | None:
-    """What an item says, as `comparable` reads it, for the full-text index"""
-    form: Final = _form(item)
-    return (form[-1] or None) if form is not None else None
+    kind: Final = item.get("type", "message")
+    if kind == "reasoning":
+        return None
+    if kind == "function_call":
+        return _string(item, "arguments") or None
+    return _searchable_text(item.get("output") if kind == "function_call_output" else item.get("content")) or None
+
+
+def _searchable_text(content: JsonValue) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(text for part in content if (text := _searchable_part(part)))
+
+
+def _searchable_part(part: JsonValue) -> str:
+    if isinstance(part, str):
+        return part
+    if not isinstance(part, dict) or part.get("type") not in (None, "text", "input_text", "output_text"):
+        return ""
+    text: Final = part.get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _form(item: Item) -> Form | None:

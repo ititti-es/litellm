@@ -23,7 +23,7 @@ import signal
 import subprocess
 import tempfile
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -237,7 +237,7 @@ def _command(
     resume: bool,
     params: Mapping[str, object],
     streaming: bool = False,
-) -> Iterator[tuple[str, ...]]:
+) -> Generator[tuple[str, ...]]:
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as prompt_file:
         prompt_file.write(system)
         prompt_file_path: Final = prompt_file.name
@@ -696,9 +696,9 @@ class ClaudeCLIHandler(CustomLLM):
         client: object = None,
     ) -> ModelResponse:
         tools: Final = _function_tools(optional_params, litellm_params)
+        params: Final = _params(litellm_params)
         if tools is not None:
             _validate_tool_choice(optional_params, litellm_params)
-            params: Final = _params(litellm_params)
             return await complete_bridge(
                 model,
                 messages,
@@ -712,7 +712,6 @@ class ClaudeCLIHandler(CustomLLM):
             model, messages, litellm_params, api_key, timeout
         )
         system: Final = system_prompt_of(messages)
-        params: Final = _params(litellm_params)
         with _command(provider_model, system, session, resume, params) as command:
             returncode, stdout, stderr = await self._run_async(command, env, token, wait, prompt=prompt)
 
@@ -790,9 +789,9 @@ class ClaudeCLIHandler(CustomLLM):
         client: object = None,
     ) -> AsyncIterator[GenericStreamingChunk]:
         tools: Final = _function_tools(optional_params, litellm_params)
+        params: Final = _params(litellm_params)
         if tools is not None:
             _validate_tool_choice(optional_params, litellm_params)
-            params: Final = _params(litellm_params)
             async for chunk in stream_bridge(
                 model, messages, params, _access_token(params, api_key), _timeout_of(params, timeout), tools
             ):
@@ -801,7 +800,6 @@ class ClaudeCLIHandler(CustomLLM):
         provider_model, prompt, session, resume, env, token, wait = _plan(
             model, messages, litellm_params, api_key, timeout
         )
-        params: Final = _params(litellm_params)
         turn: _StreamedTurn = _StreamedTurn()  # rebind-ok: one per attempt
         system: Final = system_prompt_of(messages)
         for attempt_prompt, resumed in _attempts(messages, prompt, session, resume):

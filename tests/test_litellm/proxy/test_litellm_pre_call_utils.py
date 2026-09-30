@@ -3398,6 +3398,55 @@ OPENCODE_HEADERS = {
 }
 
 
+@pytest.mark.parametrize("metadata_key", ["metadata", "litellm_metadata"])
+@pytest.mark.parametrize("session_header", ["x-session-id", "X-Session-Id", "X-SESSION-ID"])
+def test_add_litellm_metadata_keeps_opencode_children_separate(metadata_key: str, session_header: str):
+    parent_id: Final = "ses_parent_session"
+    child_ids: Final = ("ses_child_session_a", "ses_child_session_b")
+    turns: Final = tuple(
+        LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+            headers={session_header: child_id, "x-parent-session-id": parent_id},
+            data={metadata_key: {}},
+            _metadata_variable_name=metadata_key,
+        )
+        for child_id in child_ids
+    )
+
+    assert tuple(turn["litellm_session_id"] for turn in turns) == child_ids
+    for turn in turns:
+        assert turn["litellm_trace_id"] == parent_id
+        assert turn[metadata_key]["trace_id"] == parent_id
+        assert turn[metadata_key]["session_id"] == parent_id
+
+
+@pytest.mark.parametrize("metadata_key", ["metadata", "litellm_metadata"])
+def test_add_litellm_metadata_opencode_legacy_parent_session_fallback(metadata_key: str):
+    parent_id: Final = "ses_parent_session"
+    turn: Final = LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers={"x-parent-session-id": parent_id}, data={metadata_key: {}}, _metadata_variable_name=metadata_key
+    )
+
+    assert turn["litellm_session_id"] == parent_id
+    assert turn["litellm_trace_id"] == parent_id
+    assert turn[metadata_key]["trace_id"] == parent_id
+    assert turn[metadata_key]["session_id"] == parent_id
+
+
+def test_explicit_litellm_conversation_id_keeps_precedence_over_bare_session_id():
+    turn: Final = LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers={
+            "X-LiteLLM-Session-Id": "explicit-conversation",
+            "x-session-id": "bare-conversation",
+            "x-litellm-trace-id": "explicit-trace",
+        },
+        data={"metadata": {}},
+        _metadata_variable_name="metadata",
+    )
+
+    assert turn["litellm_session_id"] == "explicit-conversation"
+    assert turn["litellm_trace_id"] == "explicit-trace"
+
+
 def test_add_litellm_metadata_groups_opencode_turns_into_one_session():
     """Every turn of an opencode session must land on metadata.session_id, which is what
     DeploymentAffinityCheck reads for session pinning, instead of a fresh per-call id."""

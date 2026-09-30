@@ -59,10 +59,10 @@ class Hit:
     seq: int | None = None
 
 
-async def search(client: Prisma, query: str, *, level: str | None, owner: str | None, limit: int) -> list[Hit]:
-    item_rows: Final = await client.query_raw(_ITEMS_SQL, query, owner, limit) if level is None else []
+async def search(client: Prisma, query: str, *, level: str | None, owner: str | None, limit: int) -> tuple[Hit, ...]:
+    item_rows: Final = await client.query_raw(_ITEMS_SQL, query, owner, limit) if level is None else ()
     node_rows: Final = await client.query_raw(_NODES_SQL, query, level, owner, limit)
-    hits: Final = [
+    hits: Final = tuple(
         Hit(
             kind="item",
             session_id=r["session_id"],
@@ -72,7 +72,7 @@ async def search(client: Prisma, query: str, *, level: str | None, owner: str | 
             seq=r["seq"],
         )
         for r in item_rows
-    ] + [
+    ) + tuple(
         Hit(
             kind=r["level"],
             session_id=r["session_id"],
@@ -82,9 +82,8 @@ async def search(client: Prisma, query: str, *, level: str | None, owner: str | 
             node_id=r["node_id"],
         )
         for r in node_rows
-    ]
-    hits.sort(key=lambda h: h.rank, reverse=True)
-    return hits[:limit]
+    )
+    return tuple(sorted(hits, key=lambda h: h.rank, reverse=True)[:limit])
 
 
 def _format(hit: Hit) -> str:
@@ -99,12 +98,14 @@ async def _main(args: argparse.Namespace) -> int:
         sys.stderr.write("DATABASE_URL (or --database-url) is required\n")
         return 2
     from prisma import Prisma
+    from prisma.types import DatasourceOverride
 
     owner: Final = hash_token(args.owner_key) if args.owner_key else None
-    client: Final = Prisma(datasource={"url": url})
+    datasource: Final = DatasourceOverride(url=url)
+    client: Final = Prisma(datasource=datasource)
     await client.connect()
     try:
-        hits = await search(client, args.query, level=args.level, owner=owner, limit=args.limit)
+        hits: Final = await search(client, args.query, level=args.level, owner=owner, limit=args.limit)
     finally:
         await client.disconnect()
     if not hits:
@@ -122,7 +123,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("query")
     parser.add_argument(
         "--level",
-        choices=["segment", "session"],
+        choices=("segment", "session"),
         help="restrict to one memory-node level (omit to also search raw item text)",
     )
     parser.add_argument("--owner-key", help="restrict to sessions owned by this virtual key")

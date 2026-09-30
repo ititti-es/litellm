@@ -650,6 +650,7 @@ try:
 except ImportError:
     build_billing_metrics_recorder = None
     shutdown_billing_metrics_recorder = None
+from litellm.proxy.claude_cli_sync import attach_claude_cli_sync, drain_claude_cli_sync
 from litellm.proxy.middleware.admission_control_middleware import (
     AdmissionControlMiddleware,
     admission_control_state,
@@ -669,6 +670,7 @@ from litellm.proxy.middleware.request_size_limit_middleware import (
 from litellm.proxy.middleware.security_headers_middleware import (
     SecurityHeadersMiddleware,
 )
+from litellm.proxy.oauth_credential_store import use_database_oauth_credentials
 from litellm.proxy.ocr_endpoints.endpoints import router as ocr_router
 from litellm.proxy.openai_files_endpoints.files_endpoints import (
     router as openai_files_router,
@@ -691,9 +693,7 @@ from litellm.proxy.public_endpoints.public_v1 import router as public_v1_router
 from litellm.proxy.rag_endpoints.endpoints import router as rag_router
 from litellm.proxy.rerank_endpoints.endpoints import router as rerank_router
 from litellm.proxy.response_api_endpoints.endpoints import router as response_router
-from litellm.proxy.claude_cli_sync import attach_claude_cli_sync, drain_claude_cli_sync
 from litellm.proxy.route_llm_request import route_request
-from litellm.proxy.oauth_credential_store import use_database_oauth_credentials
 from litellm.proxy.route_priority import hot_routes_first
 from litellm.proxy.search_endpoints.endpoints import router as search_router
 from litellm.proxy.sessions import (

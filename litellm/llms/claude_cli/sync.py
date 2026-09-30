@@ -9,9 +9,8 @@ part that has a database, registers what to do about it. Nothing is registered b
 a library call runs exactly as before.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 
 from litellm._logging import verbose_logger
 
@@ -30,7 +29,9 @@ class SyncRequest:
     """Where this deployment's Claude Code keeps its transcripts, if not the default"""
 
 
-TranscriptSync = Callable[[SyncRequest], None]
+class TranscriptSync(Protocol):
+    def __call__(self, request: SyncRequest, /) -> None: ...
+
 
 _SYNC: Final[list[TranscriptSync]] = []  # mutable-ok: single-slot registry
 

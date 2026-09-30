@@ -1527,7 +1527,7 @@ class LiteLLMProxyRequestSetup:
 
     @staticmethod
     def add_litellm_metadata_from_request_headers(
-        headers: dict,
+        headers: dict[str, str],
         data: dict,
         _metadata_variable_name: str,
     ) -> dict:
@@ -1550,6 +1550,7 @@ class LiteLLMProxyRequestSetup:
         agent_id_from_header: Final = headers.get("x-litellm-agent-id")
         # Explicit litellm headers take precedence; fall back to any x-*-session-id header.
         chain_id: Final = get_chain_id_from_headers(dict(headers))
+        normalized_headers: Final = MappingProxyType({k.lower(): v for k, v in headers.items()})
 
         if agent_id_from_header:
             metadata_from_headers["agent_id"] = agent_id_from_header
@@ -1558,7 +1559,11 @@ class LiteLLMProxyRequestSetup:
         if chain_id:
             metadata_from_headers["trace_id"] = chain_id
             metadata_from_headers["session_id"] = chain_id
-            data["litellm_session_id"] = chain_id
+            data["litellm_session_id"] = (
+                normalized_headers.get("x-litellm-session-id")
+                or _extract_bare_session_id_from_headers(normalized_headers)
+                or chain_id
+            )
             data["litellm_trace_id"] = chain_id
             verbose_proxy_logger.debug("Extracted chain_id from header (trace-id/session-id): %s", chain_id)
         else:
@@ -1578,7 +1583,6 @@ class LiteLLMProxyRequestSetup:
         # anything - but lets a caller's existing traceparent/baggage headers
         # (from real OTel instrumentation) correlate with litellm's own logs
         # instead of generating an unrelated trace_id.
-        normalized_headers: Final = MappingProxyType({k.lower(): v for k, v in headers.items() if isinstance(k, str)})
         if "litellm_trace_id" not in data:
             traceparent: Final = normalized_headers.get("traceparent")
             if isinstance(traceparent, str):

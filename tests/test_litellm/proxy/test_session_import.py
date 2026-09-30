@@ -1,8 +1,15 @@
 import json
 from datetime import UTC, datetime
+from typing import Final, cast
 
-from litellm.proxy.session_import import imported_response_id, imported_session_id, plan_import
-from litellm.repositories.conversation_session_repository import StoredTranscript
+import pytest
+
+from litellm.proxy.session_import import imported_response_id, imported_session_id, plan_import, run_import
+from litellm.repositories.conversation_session_repository import (
+    ConversationSessionRepository,
+    ImportWrite,
+    StoredTranscript,
+)
 from litellm.sessions.importers.common import ImportedItem, ImportedSession
 
 
@@ -65,3 +72,64 @@ def test_an_archive_only_session_can_be_adopted_by_a_key():
 
 def test_a_session_nobody_owns_yet_goes_to_the_importer():
     assert plan_import(_session("a"), "hashed-key", None).write.owner == "hashed-key"
+
+
+class _ImportRepository:
+    def __init__(self, stored: StoredTranscript | None) -> None:
+        self.stored = stored
+        self.reads: tuple[str, ...] = ()
+        self.writes: tuple[ImportWrite, ...] = ()
+
+    async def current_transcript(self, session_id: str) -> StoredTranscript | None:
+        self.reads += (session_id,)
+        return self.stored
+
+    async def import_session(self, write: ImportWrite) -> None:
+        self.writes += (write,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("texts,action", [(("a", "b", "c"), "appended"), (("a", "x"), "new version 4")])
+async def test_dry_run_reads_existing_history_and_reports_changes_without_writes(
+    texts: tuple[str, ...], action: str
+) -> None:
+    repository: Final = _ImportRepository(_stored(3, "a", "b"))
+    lines: Final = tuple(
+        await run_import((_session(*texts),), "owner", cast(ConversationSessionRepository, repository), write=False)
+    )
+
+    assert repository.reads == (imported_session_id("opencode", "ses_1"),)
+    assert repository.writes == ()
+    assert len(lines) == 1 and action in lines[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["owner", "another-owner"])
+async def test_unchanged_reimport_never_writes_even_when_preserving_another_owner(owner: str) -> None:
+    repository: Final = _ImportRepository(StoredTranscript(version=3, contents=_stored(3, "a").contents, owner="owner"))
+    lines: Final = tuple(await run_import((_session("a"),), owner, cast(ConversationSessionRepository, repository)))
+
+    assert repository.reads == (imported_session_id("opencode", "ses_1"),)
+    assert len(lines) == 1 and "unchanged" in lines[0]
+    assert repository.writes == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("texts", [("a", "b", "c"), ("a", "x")])
+@pytest.mark.parametrize("stored_owner", ["live-owner", "archive:opencode"])
+async def test_import_executes_the_planned_append_or_rewrite_and_preserves_live_ownership(
+    texts: tuple[str, ...], stored_owner: str
+) -> None:
+    stored: Final = StoredTranscript(version=3, contents=_stored(3, "a", "b").contents, owner=stored_owner)
+    repository: Final = _ImportRepository(stored)
+    session: Final = _session(*texts)
+    planned: Final = plan_import(session, "importer", stored)
+
+    lines: Final = tuple(await run_import((session,), "importer", cast(ConversationSessionRepository, repository)))
+
+    assert repository.reads == (planned.write.session_id,)
+    assert repository.writes == (planned.write,)
+    assert planned.write.owner == ("live-owner" if stored_owner == "live-owner" else "importer")
+    assert tuple(row.seq for row in planned.write.items) == ((2,) if texts[-1] == "c" else (0, 1))
+    assert planned.write.version == (3 if texts[-1] == "c" else 4)
+    assert planned.action in lines[0]

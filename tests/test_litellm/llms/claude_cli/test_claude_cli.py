@@ -992,6 +992,10 @@ def reconstruction_cli(tmp_path, monkeypatch):
         "names=[tool['name'] for tool in json.loads((base/'tools.json').read_text())]\n"
         "for line in sys.stdin:\n"
         " prompt=json.loads(line)['message']['content']\n"
+        " if prompt.endswith('start pending'):\n"
+        "  call={'type':'tool_use','id':'toolu_pending','name':'probe','input':{}}\n"
+        "  print(json.dumps({'type':'assistant','message':{'content':[call]}}),flush=True)\n"
+        "  continue\n"
         " answer=json.dumps({'prompt':prompt,'system':system,'tools':names,'pid':os.getpid()})\n"
         " print(json.dumps({'type':'stream_event','event':{'type':'content_block_delta',"
         "'delta':{'type':'text_delta','text':answer}}}),flush=True)\n"
@@ -1023,7 +1027,7 @@ def _completed_history():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ("new", "expiry", "restart", "model", "system", "tools"))
+@pytest.mark.parametrize("change", ("new", "expiry", "restart", "model", "system", "tools", "history", "timeout"))
 async def test_completed_history_is_restored_after_session_or_configuration_changes(reconstruction_cli, change):
     from litellm.llms.claude_cli.tool_bridge import _SESSIONS
 
@@ -1063,6 +1067,7 @@ async def test_completed_history_is_restored_after_session_or_configuration_chan
             messages=messages,
             optional_params={"tools": tools},
             litellm_params=params,
+            timeout=7 if change == "timeout" else None,
         )
         answer = json.loads(response.choices[0].message.content)
         assert "historical result" in answer["prompt"]
@@ -1073,6 +1078,8 @@ async def test_completed_history_is_restored_after_session_or_configuration_chan
         assert answer["tools"] == [tool["function"]["name"] for tool in tools]
         if change != "new":
             assert answer["pid"] != first_pid
+        if change == "timeout":
+            assert next(iter(_SESSIONS.values())).timeout == 7
     finally:
         for session in tuple(_SESSIONS.values()):
             await session.close()
@@ -1091,6 +1098,228 @@ async def test_restoration_rejects_unresolved_calls_without_executing(reconstruc
             litellm_params={"api_key": "synthetic", "session_id": "unresolved"},
         )
     assert not _SESSIONS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle_available", (True, False))
+async def test_capacity_evicts_only_idle_sessions(reconstruction_cli, idle_available):
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession, _MAX_SESSIONS, _SESSIONS
+
+    occupied = tuple(BridgeSession(f"occupied-{index}", "fingerprint", (), 600) for index in range(_MAX_SESSIONS))
+    for index, session in enumerate(occupied):
+        session.pending = frozenset() if idle_available and index == 0 else frozenset({"waiting-for-result"})
+        _SESSIONS[session.key] = session
+    try:
+        operation = ClaudeCLIHandler().acompletion(
+            model="claude_cli/model",
+            messages=_messages(("user", "capacity probe")),
+            optional_params={"tools": [{"type": "function", "function": {"name": "probe"}}]},
+            litellm_params={"api_key": "synthetic", "session_id": "capacity-probe"},
+        )
+        if not idle_available:
+            with pytest.raises(ClaudeCLIError, match="capacity reached") as failure:
+                await operation
+            assert failure.value.status_code == 503
+            assert not any(session.closed for session in occupied)
+            return
+        response = await operation
+        assert "capacity probe" in response.choices[0].message.content
+        assert occupied[0].closed
+        assert not any(session.closed for session in occupied[1:])
+        assert len(_SESSIONS) == _MAX_SESSIONS
+    finally:
+        for session in tuple(_SESSIONS.values()):
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_result_replay_never_reaches_stdin(reconstruction_cli):
+    from litellm.llms.claude_cli.tool_bridge import _SESSIONS, stream_bridge
+
+    messages = _completed_history()[:4]
+    params = {"session_id": "replay"}
+    tools = [{"type": "function", "function": {"name": "probe"}}]
+    try:
+        first = [chunk async for chunk in stream_bridge("model", messages, params, "synthetic", 5, tools)]
+        assert first[-1]["is_finished"]
+        session = next(iter(_SESSIONS.values()))
+        with pytest.raises(ClaudeCLIError, match="already completed") as rejected:
+            _ = [chunk async for chunk in stream_bridge("model", messages, params, "synthetic", 5, tools)]
+        assert rejected.value.status_code == 409
+        await asyncio.sleep(0.05)
+        assert session.events.empty()
+        assert not session.closed
+    finally:
+        for session in tuple(_SESSIONS.values()):
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_results_with_steering_restore_history(reconstruction_cli):
+    from litellm.llms.claude_cli.tool_bridge import _SESSIONS, stream_bridge
+
+    params = {"session_id": "steering"}
+    tools = [{"type": "function", "function": {"name": "probe"}}]
+    initial = [{"role": "user", "content": "start pending"}]
+    try:
+        chunks = [chunk async for chunk in stream_bridge("model", initial, params, "synthetic", 5, tools)]
+        assert chunks[-1]["finish_reason"] == "tool_calls"
+        old = next(iter(_SESSIONS.values()))
+        calls = [{"id": "toolu_pending", "type": "function", "function": {"name": "probe", "arguments": "{}"}}]
+        history = [*initial, {"role": "assistant", "content": None, "tool_calls": calls}]
+        with pytest.raises(ClaudeCLIError, match="unresolved tool calls"):
+            _ = [
+                chunk
+                async for chunk in stream_bridge(
+                    "model", [*history, {"role": "user", "content": "steer"}], params, "synthetic", 5, tools
+                )
+            ]
+        assert not old.closed
+        restored = [
+            chunk
+            async for chunk in stream_bridge(
+                "model",
+                [
+                    *history,
+                    {"role": "tool", "tool_call_id": "toolu_pending", "content": "operation completed"},
+                    {"role": "user", "content": "steer"},
+                ],
+                params,
+                "synthetic",
+                5,
+                tools,
+            )
+        ]
+        answer = json.loads("".join(chunk["text"] for chunk in restored))
+        assert "operation completed" in answer["prompt"]
+        assert '"content":"steer"' in answer["prompt"]
+        assert "do not execute those calls again" in answer["prompt"]
+        assert restored[-1]["finish_reason"] == "stop"
+        assert old.closed
+        assert next(iter(_SESSIONS.values())) is not old
+    finally:
+        for session in tuple(_SESSIONS.values()):
+            await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ("name", "arguments"))
+async def test_late_relay_validates_call_before_delivering_stored_result(tmp_path, mismatch):
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession, ToolCall, definitions_of
+
+    definitions = definitions_of([{"type": "function", "function": {"name": name}} for name in ("probe", "other")])
+    session = BridgeSession("late-validation", "fingerprint", definitions, 5)
+    session.pending = frozenset(("toolu_late",))
+    session.announced = {"toolu_late": ToolCall("toolu_late", "probe", {})}
+    socket = str(tmp_path / "relay.sock")
+    session.server = await asyncio.start_unix_server(session._relay, path=socket)
+
+    async def relay(name, arguments):
+        reader, writer = await asyncio.open_unix_connection(socket)
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "capability": session.capability,
+                        "id": "toolu_late",
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        try:
+            return await asyncio.wait_for(reader.readline(), 2)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        assert await session._accept_results((("toolu_late", "private result"),))
+        await session._announce_calls((ToolCall("toolu_next", "probe", {}),))
+        assert (
+            await relay(
+                "other" if mismatch == "name" else "probe", {"changed": True} if mismatch == "arguments" else {}
+            )
+            == b""
+        )
+        assert json.loads(await relay("probe", {})) == {"content": "private result"}
+        assert "toolu_late" not in session.retired
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ("message", "calls"))
+async def test_sdk_messages_restore_completed_history(reconstruction_cli, shape):
+    from litellm.llms.claude_cli.tool_bridge import _SESSIONS, stream_bridge
+    from litellm.types.utils import Message
+
+    messages = _completed_history()
+    sdk = Message(role="assistant", tool_calls=messages[2]["tool_calls"])
+    messages[2] = sdk if shape == "message" else {"role": "assistant", "content": None, "tool_calls": sdk.tool_calls}
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_bridge(
+                "model",
+                messages,
+                {"session_id": "sdk"},
+                "synthetic",
+                5,
+                [{"type": "function", "function": {"name": "probe"}}],
+            )
+        ]
+        answer = json.loads("".join(chunk["text"] for chunk in chunks))
+        assert "historical result" in answer["prompt"]
+        assert '"name":"retired_tool"' in answer["prompt"]
+    finally:
+        for session in tuple(_SESSIONS.values()):
+            await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("announce", "send"))
+async def test_midturn_state_loss_closes_session(failure):
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession, ToolCall
+
+    session = BridgeSession("midturn", "fingerprint", (), 5)
+    if failure == "announce":
+        session.announced = {"toolu_old": ToolCall("toolu_old", "probe", {})}
+        await session.events.put(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "id": "toolu_new", "name": "probe", "input": {}}]},
+            }
+        )
+    with pytest.raises(ClaudeCLIError) as rejected:
+        _ = [chunk async for chunk in session.run((), "new turn" if failure == "send" else None)]
+    assert rejected.value.status_code == 409
+    assert session.closed
+
+
+@pytest.mark.asyncio
+async def test_next_round_can_arrive_before_previous_relay_drain():
+    from litellm.llms.claude_cli.tool_bridge import BridgeSession, ToolCall
+
+    session = BridgeSession("drain-race", "fingerprint", (), 5)
+    session.pending = frozenset(("toolu_old",))
+    session.announced = {"toolu_old": ToolCall("toolu_old", "probe", {})}
+    session.calls = session.announced
+    await session.events.put(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "toolu_new", "name": "probe", "input": {}}]},
+        }
+    )
+    try:
+        chunks = [chunk async for chunk in session.run((("toolu_old", "done"),), None)]
+        assert chunks[-1]["finish_reason"] == "tool_calls"
+        assert session.pending == frozenset(("toolu_new",))
+    finally:
+        await session.close()
 
 
 @pytest.mark.parametrize("kind", ("image", "image_url", "input_image"))

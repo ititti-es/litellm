@@ -108,6 +108,7 @@ from litellm.llms.bedrock.common_utils import BedrockModelInfo
 from litellm.llms.cohere.common_utils import CohereModelInfo
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler, http2_enabled
 from litellm.llms.openai.chat.gpt_5_transformation import OpenAIGPT5Config
+from litellm.llms.openai.speech_references import SpeechReferenceBody, resolve_speech_input_references
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.llms.vertex_ai.common_utils import (
     VertexAIModelRoute,
@@ -8165,11 +8166,24 @@ def speech(
 
         headers = headers or litellm.headers
 
+        from pydantic import TypeAdapter
+
+        input_references: Final = resolve_speech_input_references(kwargs)
+        reference_body: Final[SpeechReferenceBody] = {"input_references": input_references or ()}
+        speech_optional_params: Final = (
+            TypeAdapter(dict[str, object]).validate_python(
+                MappingProxyType({**optional_params, "extra_body": reference_body})
+            )
+            if input_references
+            else optional_params
+        )
+        speech_voice: Final = openai.NOT_GIVEN if input_references else voice
+
         response = openai_chat_completions.audio_speech(
             model=model,
             input=input,
-            voice=voice,
-            optional_params=optional_params,
+            voice=speech_voice,
+            optional_params=speech_optional_params,
             api_key=api_key,
             api_base=api_base,
             organization=organization,

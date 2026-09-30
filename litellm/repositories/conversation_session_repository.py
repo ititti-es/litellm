@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Final, Protocol
 
 from pydantic import JsonValue, TypeAdapter
+from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm.repositories.prisma_protocols import DatabaseClient, TableActions
 from litellm.sessions.session import search_text
@@ -75,6 +76,14 @@ class TurnWrite:
     response_id: str
     item_count: int
     metadata: str | None = None
+
+
+class _TurnSessionFields(TypedDict):
+    owner: ReadOnly[str]
+    version: ReadOnly[int]
+    last_upstream_at: ReadOnly[datetime]
+    expires_at: ReadOnly[datetime | None]
+    metadata: NotRequired[ReadOnly[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,14 +161,13 @@ class ConversationSessionRepository:
                 f"session {write.session_id} is at version {stored.version}, this write is for {write.version}"
             )
         batch: Final = self._db.batch_()
-        fields: Final = {  # mutable-ok: Prisma payload must be a dict
+        fields: Final[_TurnSessionFields] = {
             "owner": write.owner,
             "version": write.version,
             "last_upstream_at": write.last_upstream_at,
             "expires_at": write.expires_at,
         }
-        # mutable-ok: Prisma payload must be a dict
-        session_fields: Final = {**fields, "metadata": write.metadata} if write.metadata is not None else fields
+        session_fields: Final = _turn_session_fields(fields, write.metadata)
         batch.litellm_conversationsession.upsert(
             where={"session_id": write.session_id},  # mutable-ok: Prisma where filter must be a dict
             data={  # mutable-ok: Prisma upsert payload must be a dict
@@ -328,6 +336,13 @@ class ConversationSessionRepository:
             where={"name": name}  # mutable-ok: Prisma where filter must be a dict
         )
         return deleted > 0
+
+
+def _turn_session_fields(fields: _TurnSessionFields, metadata: str | None) -> _TurnSessionFields:
+    if metadata is None:
+        return fields
+    with_metadata: Final[_TurnSessionFields] = {**fields, "metadata": metadata}
+    return with_metadata
 
 
 def _item_row(session_id: str, version: int, item: ItemRow) -> Mapping[str, object]:

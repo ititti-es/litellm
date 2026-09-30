@@ -262,9 +262,29 @@ def _external_tool_name(name: str) -> str:
 
 def _mapping(raw: object) -> Mapping[str, object] | None:
     try:
-        return _MAPPING_ADAPTER.validate_python(raw)
+        return _MAPPING_ADAPTER.validate_python(raw.model_dump(mode="json") if isinstance(raw, BaseModel) else raw)
     except ValidationError:
         return None
+
+
+def _normalized(raw: object) -> object:
+    mapping_input: Final = bool(isinstance(raw, (Mapping, BaseModel)))
+    mapped: Final = _mapping(raw) if mapping_input else None
+    if mapped is not None:
+        return {  # mutable-ok: JSON history requires plain dicts
+            key: _normalized(value) for key, value in mapped.items()
+        }
+    if isinstance(raw, (list, tuple)):
+        values: Final = _SEQUENCE_ADAPTER.validate_python(raw)
+        return tuple(_normalized(value) for value in values)
+    return raw
+
+
+def _messages_normalized(messages: Sequence[Mapping[str, object]]) -> tuple[Mapping[str, object], ...]:
+    normalized: Final = tuple(_mapping(_normalized(message)) for message in messages)
+    if any(message is None for message in normalized):
+        raise ClaudeCLIError("Invalid conversation message", status_code=400)
+    return tuple(message for message in normalized if message is not None)
 
 
 def _is_tool_block(raw: object) -> bool:
@@ -284,6 +304,7 @@ class BridgeSession:
         self.events: Final[asyncio.Queue[Mapping[str, object]]] = asyncio.Queue()
         self.calls: Mapping[str, ToolCall] = MappingProxyType({})
         self.announced: Mapping[str, ToolCall] = MappingProxyType({})
+        self.retired: Mapping[str, ToolCall] = MappingProxyType({})
         self.results: Mapping[str, str] = MappingProxyType({})
         self.call_ready: Final = asyncio.Condition()
         self.waiting: Mapping[str, asyncio.Future[str]] = MappingProxyType({})
@@ -294,6 +315,7 @@ class BridgeSession:
         self.expiry: asyncio.TimerHandle | None = None
         self.closed: bool = False
         self.capability: Final = secrets.token_urlsafe(32)
+        self.history: tuple[Mapping[str, object], ...] = ()
 
     async def start(self, model: str, system: str, prompt: str, env: Mapping[str, str], token: str) -> None:
         from .handler import (
@@ -420,7 +442,7 @@ class BridgeSession:
             jsonschema.validate(arguments, definition["parameters"])
             waiter: Final[asyncio.Future[str]] = asyncio.get_running_loop().create_future()
             async with self.call_ready:
-                announced: Final = self.announced.get(call_id)
+                announced: Final = self.retired.get(call_id) or self.announced.get(call_id)
                 if self.announced and announced is None:
                     raise ValueError("Claude announced no matching tool call")
                 if announced is not None and (announced.name != name or announced.arguments != arguments):
@@ -431,6 +453,8 @@ class BridgeSession:
                 self.call_ready.notify_all()
                 stored: Final = self.results.get(call_id)
                 if stored is not None:
+                    self.retired = MappingProxyType({key: call for key, call in self.retired.items() if key != call_id})
+                    self.calls = MappingProxyType({key: call for key, call in self.calls.items() if key != call_id})
                     self.results = MappingProxyType(
                         {key: content for key, content in self.results.items() if key != call_id}
                     )
@@ -442,9 +466,6 @@ class BridgeSession:
             response: Final[_RelayResponse] = {"content": content}
             writer.write((json.dumps(response) + "\n").encode())
             await writer.drain()
-            async with self.call_ready:
-                self.calls = MappingProxyType({key: call for key, call in self.calls.items() if key != call_id})
-                self.announced = MappingProxyType({key: call for key, call in self.announced.items() if key != call_id})
         except (ValueError, jsonschema.ValidationError, OSError, TimeoutError, asyncio.CancelledError):
             pass
         finally:
@@ -495,11 +516,27 @@ class BridgeSession:
         provided_ids: Final = frozenset(call_id for call_id, _ in provided)
         async with self.call_ready:
             waiters: Final = tuple((self.waiting.get(call_id), content) for call_id, content in provided)
+            self.retired = MappingProxyType(
+                {
+                    **self.retired,
+                    **MappingProxyType(
+                        {
+                            key: call
+                            for key, call in self.announced.items()
+                            if key in provided_ids and key not in self.seen
+                        }
+                    ),
+                }
+            )
             self.results = MappingProxyType({**self.results, **MappingProxyType(dict(provided))})
             self.waiting = MappingProxyType(
                 {call_id: waiter for call_id, waiter in self.waiting.items() if call_id not in provided_ids}
             )
             self.pending = frozenset()
+            self.calls = MappingProxyType({key: call for key, call in self.calls.items() if key not in provided_ids})
+            self.announced = MappingProxyType(
+                {key: call for key, call in self.announced.items() if key not in provided_ids}
+            )
             self.call_ready.notify_all()
         for waiter, content in waiters:
             if waiter is not None and not waiter.done():
@@ -544,6 +581,7 @@ class BridgeSession:
                 waiters: Final = tuple(self.waiting.values())
                 self.calls = MappingProxyType({})
                 self.announced = MappingProxyType({})
+                self.retired = MappingProxyType({})
                 self.results = MappingProxyType({})
                 self.waiting = MappingProxyType({})
                 self.pending = frozenset()
@@ -585,11 +623,11 @@ class BridgeSession:
             if self.expiry is not None:
                 self.expiry.cancel()
                 self.expiry = None
-            if resumed and prompt is not None:
-                raise ClaudeCLIError("tool results cannot be sent to Claude stdin", status_code=500)
-            if not resumed and prompt is not None:
-                await self.send(prompt)
             try:
+                if resumed and prompt is not None:
+                    raise ClaudeCLIError("tool results cannot be sent to Claude stdin", status_code=500)
+                if not resumed and prompt is not None:
+                    await self.send(prompt)
                 async with asyncio.timeout(self.timeout):
                     while True:
                         outcome = await self._event_outcome(  # rebind-ok: each loop iteration consumes a new event
@@ -600,7 +638,11 @@ class BridgeSession:
                         if outcome.terminal:
                             return
             except TimeoutError as exc:
+                await self.close()
                 raise ClaudeCLIError("tool bridge turn timed out", status_code=504) from exc
+            except BaseException:
+                await self.close()
+                raise
 
     async def close(self) -> None:
         if self.closed:
@@ -641,14 +683,15 @@ async def stream_bridge(
     tools: object,
 ) -> AsyncIterator[GenericStreamingChunk]:
     definitions: Final = definitions_of(tools)
-    render_prompt(messages, False)
+    normalized: Final = _messages_normalized(messages)
+    render_prompt(normalized, False)
     client_session: Final = _session_key(params)
     if client_session is None:
         raise ClaudeCLIError("function tools require litellm_session_id", status_code=400)
     owner: Final = _owner(params, token)
     key: Final = session_uuid(owner, client_session)
     provider_model: Final = model.split("/", 1)[-1]
-    system: Final = system_prompt_of(messages)
+    system: Final = system_prompt_of(normalized)
     fingerprint: Final = hashlib.sha256(
         json.dumps(
             (
@@ -659,16 +702,34 @@ async def stream_bridge(
                 definitions,
                 params.get("claude_cli_config_dir"),
                 hashlib.sha256(token.encode()).hexdigest(),
+                timeout,
             ),
             sort_keys=True,
         ).encode()
     ).hexdigest()
-    supplied: Final = _results(messages)
+    supplied: Final = _results(normalized)
     async with _START_LOCK:
         existing: Final = _SESSIONS.get(key)
-        rebuild: Final = existing is None or existing.closed or existing.fingerprint != fingerprint
+        if existing is not None and not existing.closed:
+            if existing.lock.locked():
+                raise ClaudeCLIError("tool bridge process is busy", status_code=409)
+            if not existing.pending and normalized and normalized[-1].get("role") == "tool":
+                raise ClaudeCLIError("tool results have already completed; supply a new user message", status_code=409)
+        steering: Final = (
+            existing is not None
+            and bool(existing.pending)
+            and any(message.get("role") == "user" for message in normalized[len(existing.history) :])
+        )
+        rebuild: Final = (
+            existing is None
+            or existing.closed
+            or existing.fingerprint != fingerprint
+            or not existing.pending
+            or steering
+            or normalized[: len(existing.history)] != existing.history
+        )
         if rebuild:
-            restored: Final = _reconstruction_prompt(messages)
+            restored: Final = _reconstruction_prompt(normalized)
             if existing is not None:
                 if existing.lock.locked():
                     raise ClaudeCLIError("tool bridge process is busy", status_code=409)
@@ -676,7 +737,17 @@ async def stream_bridge(
                     raise ClaudeCLIError("Configuration changes require all outstanding tool results", status_code=409)
                 await existing.close()
             if len(_SESSIONS) >= _MAX_SESSIONS:
-                raise ClaudeCLIError("tool bridge capacity reached", status_code=503)
+                idle: Final = next(
+                    (
+                        candidate
+                        for candidate in _SESSIONS.values()
+                        if not candidate.pending and not candidate.lock.locked()
+                    ),
+                    None,
+                )
+                if idle is None:
+                    raise ClaudeCLIError("tool bridge capacity reached", status_code=503)
+                await idle.close()
             session = BridgeSession(  # rebind-ok: mutually exclusive new/existing session selection
                 key, fingerprint, definitions, timeout
             )
@@ -691,9 +762,9 @@ async def stream_bridge(
         else:
             assert existing is not None
             session = existing  # rebind-ok: mutually exclusive new/existing session selection
-    prompt: Final = render_prompt(messages, True) if not rebuild and not session.pending else None
     try:
-        async for chunk in session.run(supplied, prompt):
+        async for chunk in session.run(supplied, None):
+            session.history = normalized
             yield chunk
     except ClaudeCLIError as exc:
         if exc.status_code != 409:

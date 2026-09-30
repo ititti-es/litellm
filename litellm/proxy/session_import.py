@@ -153,7 +153,7 @@ async def _import_one(
         else None
     )
     planned: Final = plan_import(session, owner, stored)
-    if write and repository is not None and planned.action != "unchanged":
+    if write and repository is not None and not planned.action.startswith("unchanged"):
         await repository.import_session(planned.write)
     title: Final = (session.title or "")[:60]
     return (

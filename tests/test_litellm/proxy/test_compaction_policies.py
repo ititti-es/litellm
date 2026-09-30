@@ -37,7 +37,7 @@ async def test_seeding_stores_editable_copies_and_never_overwrites_without_force
     await seed(repository, ("opencode",), force=True)
     assert await resolve(repository, "opencode") == OPENCODE
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="no built-in preset named nope"):
         await seed(repository, ("nope",), force=False)
 
 

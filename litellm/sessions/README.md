@@ -39,10 +39,13 @@ Checked against LiteLLM's Responses API documentation and this tree.
 - **`importers/`** – opencode, openclaw and Claude Code histories as neutral Responses items
   (see `../proxy/session_import.py`). The Claude Code reader is also what keeps the store level with the
   `claude_cli` provider, whose conversation lives in Claude Code rather than in anything the proxy saw.
-- **`MEMORY_DESIGN.md`** – direction only; nothing built.
+- **`MEMORY_DESIGN.md`** describes the memory design. Segment/session summary nodes and PostgreSQL
+  full-text search are implemented; project/scope summaries, vector search and expansion are deferred
 
 Proxy wiring lives in `litellm/proxy/sessions.py`, storage in
 `litellm/repositories/conversation_session_repository.py`.
+
+Deployment, database checks, provider recovery and verification are covered in [OPERATIONS.md](OPERATIONS.md)
 
 ## Session identity
 

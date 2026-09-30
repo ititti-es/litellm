@@ -5,6 +5,7 @@ import re
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from litellm._logging import format_base64_size, verbose_logger
@@ -309,11 +310,19 @@ def _set_duration_in_model_call_details(
 
 def speech_request_body(model: str, voice: str, optional_params: Mapping[str, object]) -> Mapping[str, object]:
     """Speech request body for telemetry, without the caller headers the provider SDKs
-    take as request kwargs rather than body fields."""
+    take as request kwargs rather than body fields, and without reference audio."""
+    from litellm.llms.openai.speech_references import redact_input_references
+
     return {  # mutable-ok: loggers isinstance-check the request body as a dict
         "model": model,
         "voice": voice,
-        **{key: value for key, value in optional_params.items() if key != "extra_headers"},
+        **MappingProxyType(
+            {
+                key: redact_input_references(value) if key == "extra_body" else value
+                for key, value in optional_params.items()
+                if key != "extra_headers"
+            }
+        ),
     }
 
 

@@ -264,7 +264,7 @@ def test_parse_authorization_input(value, expected):
 
 @pytest.mark.parametrize("value", ["", "   ", "http://127.0.0.1:56121/callback?state=only"])
 def test_parse_authorization_input_rejects_unusable_values(value):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"[Aa]uthorization code"):
         parse_authorization_input(value)
 
 
@@ -293,7 +293,7 @@ def test_pasting_the_authorization_url_back_is_rejected(url):
 
 
 def test_the_rejection_names_what_to_copy_instead():
-    with pytest.raises(ValueError, match="127.0.0.1 page it then fails to load"):
+    with pytest.raises(ValueError, match=r"127\.0\.0\.1 page it then fails to load"):
         parse_authorization_input(ANTHROPIC_AUTHORIZE_URL)
 
 

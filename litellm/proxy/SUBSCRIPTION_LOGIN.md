@@ -217,7 +217,7 @@ litellm_settings:
 model_list:
   - model_name: claude-sub
     litellm_params:
-      model: claude_cli/claude-sonnet-5
+      model: claude_cli/claude-sonnet-5-5
 ```
 
 It registers through `custom_provider_map`, so no core dispatch code changes and the fork stays easy to
@@ -231,9 +231,26 @@ rebase. `litellm anthropic-oauth login` supplies the credential; `ANTHROPIC_API_
 | `claude_cli_config_dir` | Claude Code's own | `CLAUDE_CONFIG_DIR` for the subprocess |
 | `CLAUDE_CLI_PATH` (env) | `claude` | where the binary lives |
 
-**Tools are off unless a deployment names them.** Claude Code can read files and run shell commands, so a
+**Claude Code's built-in host tools are off unless a deployment names them.** Claude Code can read files and run shell commands, so a
 gateway serving requests with tools enabled would hand every caller code execution on the proxy host. Enable
-them only where every caller is trusted.
+them only where every caller is trusted
+
+### Client-executed tools through the MCP sidecar
+
+Requests containing function tool schemas use a different path. Claude Code runs with built-in tools
+disabled and a generated, strict MCP configuration pointing to `llms/claude_cli/mcp_sidecar.py`.
+The sidecar forwards selected calls through a private Unix socket to the gateway's relay in
+`llms/claude_cli/tool_bridge.py`. The gateway returns structured function calls to the client, which
+executes them and returns correlated results. These function schemas never enable host file or shell tools
+
+The Claude subprocess remains alive while those tool rounds are pending. Completed turns reconstruct
+from the client's history on the next request, so edited or branched history does not accidentally
+continue an old subprocess context. Function tools require a client session ID and an async completion
+or streaming call. Only absent/default or `auto` tool choice is supported, and image input is rejected
+
+The gateway relay and the MCP sidecar are parts of the same design, not alternative execution modes.
+See [session-store operations](../sessions/OPERATIONS.md) for restart recovery, session ownership,
+steering input, worker affinity and verification
 
 The credential goes to the subprocess on a pipe, whose descriptor number is passed in
 `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` — never the token itself in its environment or argv, both of which
@@ -241,6 +258,9 @@ are readable through `/proc`. `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` 
 environment so an ambient one cannot be used by accident.
 
 ### How a conversation continues
+
+The text-only path without client function schemas uses the transcript behavior described here.
+Client-executed tools instead use the sidecar lifecycle above
 
 Claude Code owns the transcript. The first turn opens a session with `--session-id`; later turns pass
 `--resume` and send only the newest message, so Claude Code keeps its own prefix warm — a second turn costs
