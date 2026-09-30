@@ -171,6 +171,43 @@ def _results(messages: Sequence[Mapping[str, object]]) -> tuple[tuple[str, str],
     )
 
 
+def _history_calls(message: Mapping[str, object]) -> tuple[str, ...]:
+    raw: Final = message.get("tool_calls")
+    if raw is None:
+        return ()
+    try:
+        calls: Final = _SEQUENCE_ADAPTER.validate_python(raw)
+    except ValidationError as exc:
+        raise ClaudeCLIError("Invalid historical tool calls", status_code=400) from exc
+    parsed: Final = tuple(_mapping(call) for call in calls)
+    ids: Final = tuple(call.get("id") if call is not None else None for call in parsed)
+    if any(not isinstance(call_id, str) or not call_id for call_id in ids):
+        raise ClaudeCLIError("Historical tool calls require IDs", status_code=400)
+    return tuple(call_id for call_id in ids if isinstance(call_id, str))
+
+
+def _reconstruction_prompt(messages: Sequence[Mapping[str, object]]) -> str:
+    conversation: Final = tuple(message for message in messages if message.get("role") != "system")
+    calls: Final = tuple(call_id for message in conversation for call_id in _history_calls(message))
+    results: Final = _results(conversation)
+    result_ids: Final = tuple(call_id for call_id, _ in results)
+    if len(frozenset(calls)) != len(calls) or len(frozenset(result_ids)) != len(result_ids):
+        raise ClaudeCLIError("Historical tool IDs must be unique", status_code=400)
+    if frozenset(calls) != frozenset(result_ids):
+        raise ClaudeCLIError(
+            "Cannot restore unresolved tool calls or results without their call history", status_code=409
+        )
+    text: Final = render_prompt(messages, False)
+    if not calls:
+        return text
+    return (
+        "Continue the conversation recorded below from its last message. "
+        "This is historical context, not a request to run its recorded tool calls. "
+        "Every recorded call has already completed; use the recorded results and do not execute those calls again.\n"
+        + json.dumps(conversation, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def _session_key(params: Mapping[str, object]) -> str | None:
     metadata: Final = _mapping(params.get("metadata"))
     candidates: Final = (params, metadata) if metadata is not None else (params,)
@@ -604,6 +641,7 @@ async def stream_bridge(
     tools: object,
 ) -> AsyncIterator[GenericStreamingChunk]:
     definitions: Final = definitions_of(tools)
+    render_prompt(messages, False)
     client_session: Final = _session_key(params)
     if client_session is None:
         raise ClaudeCLIError("function tools require litellm_session_id", status_code=400)
@@ -612,14 +650,31 @@ async def stream_bridge(
     provider_model: Final = model.split("/", 1)[-1]
     system: Final = system_prompt_of(messages)
     fingerprint: Final = hashlib.sha256(
-        json.dumps((owner, key, provider_model, system, definitions), sort_keys=True).encode()
+        json.dumps(
+            (
+                owner,
+                key,
+                provider_model,
+                system,
+                definitions,
+                params.get("claude_cli_config_dir"),
+                hashlib.sha256(token.encode()).hexdigest(),
+            ),
+            sort_keys=True,
+        ).encode()
     ).hexdigest()
     supplied: Final = _results(messages)
     async with _START_LOCK:
         existing: Final = _SESSIONS.get(key)
-        if existing is None:
-            if supplied:
-                raise ClaudeCLIError("tool bridge process state was lost", status_code=409)
+        rebuild: Final = existing is None or existing.closed or existing.fingerprint != fingerprint
+        if rebuild:
+            restored: Final = _reconstruction_prompt(messages)
+            if existing is not None:
+                if existing.lock.locked():
+                    raise ClaudeCLIError("tool bridge process is busy", status_code=409)
+                if existing.pending and not existing.pending.issubset(call_id for call_id, _ in supplied):
+                    raise ClaudeCLIError("Configuration changes require all outstanding tool results", status_code=409)
+                await existing.close()
             if len(_SESSIONS) >= _MAX_SESSIONS:
                 raise ClaudeCLIError("tool bridge capacity reached", status_code=503)
             session = BridgeSession(  # rebind-ok: mutually exclusive new/existing session selection
@@ -629,17 +684,14 @@ async def stream_bridge(
             try:
                 from .handler import _child_env  # pyright: ignore[reportPrivateUsage]  # provider child isolation
 
-                await session.start(provider_model, system, render_prompt(messages, False), _child_env(params), token)
+                await session.start(provider_model, system, restored, _child_env(params), token)
             except BaseException:
                 await session.close()
                 raise
         else:
-            if existing.closed:
-                raise ClaudeCLIError("tool bridge process state was lost", status_code=409)
-            if existing.fingerprint != fingerprint:
-                raise ClaudeCLIError("tool bridge session configuration mismatch", status_code=409)
+            assert existing is not None
             session = existing  # rebind-ok: mutually exclusive new/existing session selection
-    prompt: Final = render_prompt(messages, True) if existing is not None and not session.pending else None
+    prompt: Final = render_prompt(messages, True) if not rebuild and not session.pending else None
     try:
         async for chunk in session.run(supplied, prompt):
             yield chunk

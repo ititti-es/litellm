@@ -977,6 +977,128 @@ async def collect_bridge(bridge, results):
     return [chunk async for chunk in bridge.run(results, None)]
 
 
+@pytest.fixture
+def reconstruction_cli(tmp_path, monkeypatch):
+    script = tmp_path / "claude"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os,pathlib,sys\n"
+        "args=sys.argv[1:]\n"
+        "assert args[args.index('--tools')+1]==''\n"
+        "assert '--disallowed-tools' not in args\n"
+        "os.read(int(os.environ['CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR']),4096)\n"
+        "system=pathlib.Path(args[args.index('--system-prompt-file')+1]).read_text()\n"
+        "base=pathlib.Path(args[args.index('--mcp-config')+1]).parent\n"
+        "names=[tool['name'] for tool in json.loads((base/'tools.json').read_text())]\n"
+        "for line in sys.stdin:\n"
+        " prompt=json.loads(line)['message']['content']\n"
+        " answer=json.dumps({'prompt':prompt,'system':system,'tools':names,'pid':os.getpid()})\n"
+        " print(json.dumps({'type':'stream_event','event':{'type':'content_block_delta',"
+        "'delta':{'type':'text_delta','text':answer}}}),flush=True)\n"
+        " print(json.dumps({'type':'result','result':answer,'is_error':False,'stop_reason':'end_turn'}),flush=True)\n"
+    )
+    script.chmod(0o700)
+    monkeypatch.setenv("CLAUDE_CLI_PATH", str(script))
+
+
+def _completed_history():
+    return [
+        {"role": "system", "content": "original instructions"},
+        {"role": "user", "content": "perform historical operation"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "historical-call",
+                    "type": "function",
+                    "function": {"name": "retired_tool", "arguments": '{"value":7}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "historical-call", "content": "historical result"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "continue from completed work"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("new", "expiry", "restart", "model", "system", "tools"))
+async def test_completed_history_is_restored_after_session_or_configuration_changes(reconstruction_cli, change):
+    from litellm.llms.claude_cli.tool_bridge import _SESSIONS
+
+    handler = ClaudeCLIHandler()
+    params = {"api_key": "synthetic", "session_id": "restore-" + change}
+    original = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object"}}}]
+    try:
+        if change != "new":
+            first = await handler.acompletion(
+                model="claude_cli/original-model",
+                messages=_messages(("system", "original instructions"), ("user", "first")),
+                optional_params={"tools": original},
+                litellm_params=params,
+            )
+            first_pid = json.loads(first.choices[0].message.content)["pid"]
+            session = next(iter(_SESSIONS.values()))
+            if change == "expiry":
+                session.expiry = asyncio.get_running_loop().call_later(
+                    0.01, lambda: asyncio.create_task(session.close())
+                )
+                async with asyncio.timeout(2):
+                    while not session.closed:
+                        await asyncio.sleep(0.01)
+            elif change == "restart":
+                await session.close()
+
+        messages = _completed_history()
+        if change == "system":
+            messages[0] = {"role": "system", "content": "updated instructions"}
+        tools = (
+            [{"type": "function", "function": {"name": "replacement", "parameters": {"type": "object"}}}]
+            if change == "tools"
+            else original
+        )
+        response = await handler.acompletion(
+            model="claude_cli/changed-model" if change == "model" else "claude_cli/original-model",
+            messages=messages,
+            optional_params={"tools": tools},
+            litellm_params=params,
+        )
+        answer = json.loads(response.choices[0].message.content)
+        assert "historical result" in answer["prompt"]
+        assert '"arguments":"{\\"value\\":7}"' in answer["prompt"]
+        assert "do not execute those calls again" in answer["prompt"]
+        assert "continue from completed work" in answer["prompt"]
+        assert answer["system"] == messages[0]["content"]
+        assert answer["tools"] == [tool["function"]["name"] for tool in tools]
+        if change != "new":
+            assert answer["pid"] != first_pid
+    finally:
+        for session in tuple(_SESSIONS.values()):
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_restoration_rejects_unresolved_calls_without_executing(reconstruction_cli):
+    from litellm.llms.claude_cli.tool_bridge import _SESSIONS
+
+    messages = [message for message in _completed_history() if message["role"] != "tool"]
+    with pytest.raises(ClaudeCLIError, match="unresolved tool calls"):
+        await ClaudeCLIHandler().acompletion(
+            model="claude_cli/model",
+            messages=messages,
+            optional_params={"tools": [{"type": "function", "function": {"name": "probe"}}]},
+            litellm_params={"api_key": "synthetic", "session_id": "unresolved"},
+        )
+    assert not _SESSIONS
+
+
+@pytest.mark.parametrize("kind", ("image", "image_url", "input_image"))
+def test_images_are_rejected_instead_of_silently_dropped(kind):
+    with pytest.raises(ClaudeCLIError, match="image input is not supported"):
+        render_prompt([{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": kind}]}], False)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("choice", (None, "auto"))
 async def test_async_completion_returns_calls_before_a_serial_second_relay_arrives(tmp_path, monkeypatch, choice):
@@ -1058,6 +1180,22 @@ async def test_async_completion_returns_calls_before_a_serial_second_relay_arriv
         ("toolu_first", "first", '{"value":1}'),
         ("toolu_second", "second", '{"value":2}'),
     ]
+
+    with pytest.raises(ClaudeCLIError, match="outstanding tool results"):
+        await handler.acompletion(
+            model="claude_cli/changed-model",
+            messages=_messages(("system", "keep this system prompt"), ("user", "run both")),
+            optional_params=optional_params,
+            litellm_params=params,
+        )
+
+    with pytest.raises(ClaudeCLIError, match="image input is not supported"):
+        await handler.acompletion(
+            model="claude_cli/fake-model",
+            messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "synthetic"}}]}],
+            optional_params=optional_params,
+            litellm_params=params,
+        )
 
     second_response = await handler.acompletion(
         model="claude_cli/fake-model",

@@ -54,6 +54,8 @@ def _text_of(content: object) -> str:
         for part in content:
             if isinstance(part, str):
                 parts.append(part)
+            elif isinstance(part, Mapping) and part.get("type") in ("image", "image_url", "input_image"):
+                raise ClaudeCLIError("Claude CLI image input is not supported by this bridge", status_code=400)
             elif isinstance(part, Mapping) and part.get("type") == "text":
                 text = part.get("text")
                 if isinstance(text, str):
