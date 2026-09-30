@@ -12,6 +12,7 @@ from litellm.llms.base_llm.anthropic_messages.transformation import (
 from litellm.types.llms.anthropic import (
     ANTHROPIC_ADVISOR_TOOL_TYPE,
     ANTHROPIC_BETA_HEADER_VALUES,
+    ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER,
     AnthropicMessagesRequest,
 )
 from litellm.types.llms.anthropic_messages.anthropic_response import (
@@ -638,6 +639,9 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             if piece.strip()
         )
         beta_values.update(existing_beta)
+
+        if AnthropicModelInfo().is_thinking_display_updates_used(optional_params.get("thinking")):
+            beta_values.add(ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER)
 
         if requires_native_compaction_beta(custom_llm_provider, optional_params, messages):
             beta_values.add(ANTHROPIC_BETA_HEADER_VALUES.COMPACT_2026_09_04.value)

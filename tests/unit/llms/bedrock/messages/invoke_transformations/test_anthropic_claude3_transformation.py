@@ -3547,3 +3547,24 @@ def test_bedrock_messages_removed_output_config_does_not_add_beta(explicit_beta:
 
     assert result["messages"] == [{"role": "user", "content": "Reply with OK"}]
     assert result.get("anthropic_beta", []).count(beta) == int(explicit_beta)
+
+
+@pytest.mark.usefixtures("local_model_cost_map", "local_beta_headers_config")
+@pytest.mark.parametrize("display", (None, "summarized", "omitted", "updates"))
+@pytest.mark.parametrize("explicit_beta", (False, True))
+def test_bedrock_messages_thinking_display_updates_beta(display: str | None, explicit_beta: bool) -> None:
+    from litellm.types.llms.anthropic import ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER
+    from litellm.types.router import GenericLiteLLMParams
+
+    beta: Final = ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER
+    thinking: Final = {"type": "adaptive", "display": display} if display else None
+    result: Final = AmazonAnthropicClaudeMessagesConfig().transform_anthropic_messages_request(
+        model="eu.anthropic.claude-opus-5",
+        messages=[{"role": "user", "content": "Reply with OK"}],
+        anthropic_messages_optional_request_params={"max_tokens": 512, **({"thinking": thinking} if thinking else {})},
+        litellm_params=GenericLiteLLMParams(),
+        headers={"anthropic-beta": beta} if explicit_beta else {},
+    )
+
+    assert result.get("anthropic_beta", []).count(beta) == int(display == "updates" or explicit_beta)
+    assert result.get("thinking") == thinking

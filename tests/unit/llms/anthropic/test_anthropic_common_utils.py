@@ -2376,3 +2376,51 @@ def test_validate_environment_adds_mid_conversation_output_config_beta(
 
     assert headers.get("anthropic-beta", "").split(",").count(beta) == int(nested_output_config or explicit_beta)
     assert headers["x-api-key"] == FAKE_REGULAR_KEY
+
+
+@pytest.mark.usefixtures("local_model_cost_map", "local_beta_headers_config")
+@pytest.mark.parametrize("display", (None, "summarized", "omitted", "updates"))
+@pytest.mark.parametrize("explicit_beta", (False, True))
+def test_validate_environment_adds_thinking_display_updates_beta(display: str | None, explicit_beta: bool) -> None:
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+    from litellm.types.llms.anthropic import ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER
+
+    beta: Final = ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER
+    headers: Final = AnthropicModelInfo().validate_environment(
+        headers={"anthropic-beta": beta} if explicit_beta else {},
+        model="claude-opus-5",
+        messages=[{"role": "user", "content": "Reply with OK"}],
+        optional_params={"thinking": {"type": "adaptive", "display": display}} if display else {},
+        litellm_params={},
+        api_key=FAKE_REGULAR_KEY,
+    )
+
+    assert headers.get("anthropic-beta", "").split(",").count(beta) == int(display == "updates" or explicit_beta)
+    assert headers["x-api-key"] == FAKE_REGULAR_KEY
+
+
+@pytest.mark.parametrize(
+    ("thinking", "expected"),
+    (
+        (None, False),
+        ({}, False),
+        ("updates", False),
+        ({"display": "updates"}, False),
+        ({"type": "disabled", "display": "updates"}, False),
+        ({"type": "enabled", "display": "updates", "budget_tokens": 1024}, True),
+    ),
+)
+def test_thinking_display_beta_requires_active_thinking(thinking: object, expected: bool) -> None:
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+    from litellm.types.llms.anthropic import ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER
+
+    headers: Final = AnthropicModelInfo().validate_environment(
+        headers={},
+        model="claude-opus-5",
+        messages=[{"role": "user", "content": "Reply with OK"}],
+        optional_params={"thinking": thinking},
+        litellm_params={},
+        api_key=FAKE_REGULAR_KEY,
+    )
+
+    assert (ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA_HEADER in headers.get("anthropic-beta", "").split(",")) is expected

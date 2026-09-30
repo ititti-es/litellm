@@ -535,6 +535,9 @@ class AmazonAnthropicClaudeMessagesConfig(
             ),
             custom_llm_provider="bedrock",
             is_mid_conversation_output_config_used=is_mid_conversation_output_config_used,
+            is_thinking_display_updates_used=anthropic_model_info.is_thinking_display_updates_used(
+                anthropic_messages_request.get("thinking")
+            ),
         )
         beta_set.update(auto_betas)
 
