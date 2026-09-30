@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, JsonValue
 
+from litellm._logging import verbose_logger
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.sessions.compaction import turn_usage
 from litellm.sessions.manager import Continuation, Forbidden, ReplayBase, Resolved, SessionManager
@@ -26,6 +27,8 @@ def provider_response_id(response_id: str) -> str:
 
 _CACHE_KEYED_PROVIDERS: Final = frozenset({"openai", "azure", "xai"})
 MANAGED_BY_CALLER: Final = "litellm_session_managed"
+# How long a finished reply waits for its turn to reach the store before going out anyway
+PERSIST_TIMEOUT_SECONDS: Final = 10.0
 
 
 _NO_AFFINITY: Final[Mapping[str, str]] = MappingProxyType({})
@@ -122,6 +125,20 @@ class PendingTurn:
             client_session_id=self.client_session_id,
             compactable=self.compactable,
         )
+
+    async def finish_durably(self, response: ResponsesAPIResponse, timeout: float = PERSIST_TIMEOUT_SECONDS) -> None:
+        """`finish`, then hold the reply until the turn is stored
+
+        The client may continue from this response id at any moment, and it may hold no other copy of the
+        conversation. A gateway that answers first and stores later loses the turn when it is killed in between.
+        A store that is down or slow does not fail the turn: the reply goes out and the miss is logged.
+        """
+        self.finish(response)
+        if not response.id:
+            return
+        response_id: Final = provider_response_id(response.id)
+        if not await self.manager.persisted(response_id, timeout):
+            verbose_logger.error("SessionManager: turn %s was answered but is not stored", response_id)
 
 
 def _as_item(item: object) -> Item | None:

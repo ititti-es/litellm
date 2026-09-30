@@ -2649,6 +2649,15 @@ class SessionManagerSettings(LiteLLMPydanticObjectBase):
             "the client's input is sent exactly as it arrived"
         ),
     )
+    refuse_unknown_previous_response: bool = Field(
+        True,
+        description=(
+            "Refuse a turn whose `previous_response_id` this gateway does not hold with a 404 naming the response id, "
+            "instead of sending the id upstream with only the new input. A client that keeps its own copy of the "
+            "conversation then resends it; passing the id through silently drops the history. `store: false` turns "
+            "are never refused, because their client owns the history"
+        ),
+    )
 
 
 class ConfigGeneralSettings(LiteLLMPydanticObjectBase):

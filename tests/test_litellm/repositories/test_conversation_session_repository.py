@@ -309,8 +309,8 @@ async def test_import_is_pinned_idempotent_and_preserves_source_on_update() -> N
     assert (db.batches, db.commits) == (2, 2)
 
 
-@pytest.mark.parametrize("session_version", (None, 1, 3))
-async def test_response_cannot_load_missing_or_different_version_session(session_version: int | None) -> None:
+@pytest.mark.parametrize("session_version", (None, 1))
+async def test_response_cannot_load_missing_or_older_version_session(session_version: int | None) -> None:
     db: Final = Database()
     db.litellm_conversationresponse.rows = (Row(response_id="response-test", version=2),)
     db.litellm_conversationsession.rows = () if session_version is None else (Row(version=session_version),)
@@ -355,6 +355,12 @@ async def test_replay_orders_current_version_items_and_keeps_outputs_metadata_an
     assert loaded.client_session_id == "client-test"
     assert (loaded.owner, loaded.version, loaded.last_upstream_at) == ("owner-test", 2, _NOW.timestamp())
     assert await store.load_session("session-test") == loaded
+    assert not loaded.superseded
+
+    earlier: Final = await store.load("response-old")
+    assert earlier is not None and earlier.superseded
+    assert (earlier.id, earlier.version, dict(earlier.responses)) == ("session-test~v1", 1, {"response-old": 0})
+    assert earlier.items == ({},)
 
 
 async def test_partial_transcript_is_refused_by_replay_store() -> None:

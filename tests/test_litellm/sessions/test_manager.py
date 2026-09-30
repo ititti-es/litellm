@@ -1,3 +1,7 @@
+import asyncio
+from dataclasses import replace
+from types import MappingProxyType
+
 from litellm.sessions import Forbidden, Resolved, SessionManager, Unknown
 from litellm.sessions.manager import client_session_key
 
@@ -258,3 +262,68 @@ async def test_a_named_session_is_found_again_after_a_restart():
     assert continuation.session_id == first.id
     assert continuation.prior is not None and continuation.turn_input == (NEXT,)
     assert restarted.stats().rehydrations == 1
+
+
+# --- a reply waits for its turn to be stored --------------------------------------------------------------
+
+
+class GatedStore(MemoryStore):
+    def __init__(self, fail: bool = False) -> None:
+        super().__init__(fail)
+        self.gate = asyncio.Event()
+
+    async def save(self, session, first_new, response_id):
+        await self.gate.wait()
+        await super().save(session, first_new, response_id)
+
+
+async def test_persisted_reports_the_write_once_the_store_has_it():
+    store = GatedStore()
+    manager = SessionManager()
+    manager.attach_store(store)
+    first_turn(manager)
+
+    assert await manager.persisted("r1", timeout=0.05) is False
+    store.gate.set()
+    assert await manager.persisted("r1", timeout=1) is True
+    assert store.saved == [(manager.resolve("r1", "key-a").session.id, 0, "r1")]
+
+
+async def test_persisted_is_false_when_the_store_refuses_the_turn():
+    manager = SessionManager()
+    manager.attach_store(MemoryStore(fail=True))
+    first_turn(manager)
+    assert await manager.persisted("r1", timeout=1) is False
+
+
+async def test_persisted_needs_nothing_without_a_store_and_knows_nothing_of_unqueued_turns():
+    assert await SessionManager().persisted("r1", timeout=0) is True
+    manager = SessionManager()
+    manager.attach_store(MemoryStore())
+    assert await manager.persisted("never-committed", timeout=0) is False
+
+
+# --- an earlier version a compaction replaced ---------------------------------------------------------------
+
+
+async def test_continuing_a_superseded_version_forks_and_leaves_the_live_session_alone():
+    manager = SessionManager()
+    store = MemoryStore()
+    manager.attach_store(store)
+    live = first_turn(manager)
+    old = replace(live, id=f"{live.id}~v0", superseded=True)
+    store.sessions["r1"] = old
+    manager._drop(live.id)
+    manager._hold(replace(live, responses=MappingProxyType({}), version=1))
+
+    resolved = await manager.resolve_async("r1", "key-a")
+    assert isinstance(resolved, Resolved) and resolved.session.superseded
+
+    forked = manager.commit(
+        owner="key-a", prior=resolved, turn_input=(CALL_OUTPUT,), output=(ASSISTANT,), response_id="r2", now=2.0
+    )
+    await manager.flush()
+    assert forked.id not in (live.id, old.id) and not forked.superseded
+    assert forked.items == (*live.items, CALL_OUTPUT, ASSISTANT)
+    assert store.saved[-1] == (forked.id, 0, "r2")
+    assert manager._sessions[live.id].version == 1

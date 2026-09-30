@@ -180,3 +180,39 @@ async def test_on_completed_fires_only_for_a_completed_response(event, notified)
     from litellm.sessions.responses import provider_response_id
 
     assert [(provider_response_id(r.id), r.output) for r in received] == ([("resp_x", output)] if notified else [])
+
+
+async def test_the_completed_event_is_held_until_the_async_completion_hook_finishes():
+    import json
+    from types import SimpleNamespace
+
+    from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+
+    iterator = ResponsesAPIStreamingIterator(
+        response=httpx.Response(200),
+        model="gpt-5.4-nano",
+        responses_api_provider_config=OpenAIResponsesAPIConfig(),
+        logging_obj=_make_logging_obj(),
+    )
+    output = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]
+    completed = {"type": "response.completed", "response": {"id": "resp_x", "created_at": 0, "status": "completed", "output": output}}
+
+    async def events():
+        yield SimpleNamespace(data=json.dumps(completed))
+
+    iterator.stream_iterator = events()
+    order: list = []
+    sync_calls: list = []
+
+    async def stored(response):
+        await asyncio.sleep(0.05)
+        order.append("stored")
+
+    iterator.on_completed = sync_calls.append
+    iterator.on_completed_async = stored
+
+    chunk = await iterator.__anext__()
+    order.append(chunk.type)
+
+    assert order == ["stored", "response.completed"]
+    assert sync_calls == []

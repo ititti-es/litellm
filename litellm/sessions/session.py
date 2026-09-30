@@ -30,6 +30,8 @@ class Session:
     """Item meta by position (e.g. what a compaction summary covers); stored beside the item, never replayed"""
     client_session_id: str | None = None
     """LiteLLM's `litellm_session_id` for this conversation, so the store shares the client's own identity"""
+    superseded: bool = False
+    """An earlier version a compaction replaced, loaded so its response ids still resolve; never extended in place"""
 
     def replayable_at(self, response_id: str) -> tuple[Item, ...]:
         """History up to *response_id*, with model output reduced to what a stateless upstream accepts back"""

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Final
 
 import pytest
@@ -425,3 +426,77 @@ async def test_store_false_is_still_not_recorded_by_default(manager):
     )
 
     assert manager.stats().commits == 0
+
+
+# --- the gateway owns the history: durable before the reply, loud when it does not hold an id --------------
+
+
+class _RecordingStore:
+    def __init__(self) -> None:
+        self.saved: list = []
+
+    async def save(self, session, first_new, response_id):
+        await asyncio.sleep(0.05)
+        self.saved.append(response_id)
+
+    async def load(self, response_id):
+        return None
+
+    async def load_session(self, session_id):
+        return None
+
+
+async def test_a_reply_is_handed_back_only_once_its_turn_is_stored(manager):
+    store = _RecordingStore()
+    manager.attach_store(store)
+
+    response = await litellm.aresponses(
+        model="openai/gpt-4.1", input="hi", mock_response="yo", litellm_metadata={"user_api_key_hash": "k"}
+    )
+
+    assert store.saved == [_provider_id(response.id)]
+
+
+async def test_an_id_the_gateway_does_not_hold_is_refused_with_a_404_naming_it(manager):
+    with pytest.raises(litellm.NotFoundError) as refused:
+        await litellm.aresponses(
+            model="openai/gpt-4.1",
+            input="two",
+            previous_response_id="resp_unknown",
+            mock_response="a2",
+            litellm_metadata={"user_api_key_hash": "k"},
+        )
+
+    assert refused.value.status_code == 404
+    assert "response id resp_unknown" in str(refused.value)
+    assert "previous_response_not_found" in str(refused.value)
+    assert manager.stats().commits == 0
+
+
+async def test_unknown_ids_still_pass_through_when_refusal_is_turned_off(manager, upstream_inputs):
+    manager.refuse_unknown_previous_response = False
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="two",
+        previous_response_id="resp_unknown",
+        mock_response="a2",
+        litellm_metadata={"user_api_key_hash": "k"},
+    )
+
+    assert upstream_inputs[-1] == "two"
+
+
+async def test_a_store_false_client_is_never_refused_for_an_id_it_owns(manager, upstream_inputs):
+    manager.record_store_false = True
+
+    await litellm.aresponses(
+        model="openai/gpt-4.1",
+        input="two",
+        store=False,
+        previous_response_id="resp_theirs",
+        mock_response="a2",
+        litellm_metadata={"user_api_key_hash": "k"},
+    )
+
+    assert upstream_inputs[-1] == "two"

@@ -719,6 +719,15 @@ async def aresponses(
                 model=model,
                 llm_provider=custom_llm_provider or "",
             )
+        if session_turn is None and previous_response_id and not record_only and _refuses_unknown(kwargs):
+            raise litellm.NotFoundError(
+                message=(
+                    f"Previous response id {previous_response_id} is not held by this gateway "
+                    "(previous_response_not_found). Resend the conversation without previous_response_id."
+                ),
+                model=model,
+                llm_provider=custom_llm_provider or "",
+            )
         session_input: Final = (
             session_turn.upstream_input()
             if isinstance(session_turn, PendingTurn) and session_turn.prior is not None and not record_only
@@ -817,7 +826,9 @@ async def aresponses(
 
         if managed_turn is not None:
             if isinstance(response, ResponsesAPIResponse):
-                managed_turn.finish(response)
+                await managed_turn.finish_durably(response)
+            elif getattr(response, "settles_completion", False):
+                response.on_completed_async = managed_turn.finish_durably
             else:
                 response.on_completed = managed_turn.finish
         return response
@@ -851,6 +862,14 @@ def _deployment_id(kwargs: Mapping[str, object]) -> str | None:
 def _records_store_false() -> bool:
     manager: Final = litellm.session_manager
     return manager is not None and manager.record_store_false
+
+
+def _refuses_unknown(kwargs: Mapping[str, object]) -> bool:
+    """Whether the session manager owns this turn's history, so an id it does not hold must not pass upstream"""
+    manager: Final = litellm.session_manager
+    metadata: Final = kwargs.get("litellm_metadata")
+    managed_by_caller: Final = isinstance(metadata, dict) and bool(metadata.get(MANAGED_BY_CALLER))
+    return manager is not None and manager.refuse_unknown_previous_response and not managed_by_caller
 
 
 async def _begin_session_turn(

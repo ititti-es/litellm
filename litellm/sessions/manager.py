@@ -135,6 +135,12 @@ class _PendingWrite:
     session: Session
     first_new: int
     response_id: str
+    settled: asyncio.Future[bool] | None = None
+    """Resolved True once stored, False if the store refused it; what `persisted` waits on"""
+
+
+# Write outcomes kept for `persisted`; a turn nobody waits on (a websocket or sync stream) ages out
+_SETTLED_KEPT: Final = 1024
 
 
 class SessionManager:
@@ -145,12 +151,18 @@ class SessionManager:
     """
 
     def __init__(
-        self, budget_bytes: int = 256 << 20, clock: CacheClock | None = None, record_store_false: bool = False
+        self,
+        budget_bytes: int = 256 << 20,
+        clock: CacheClock | None = None,
+        record_store_false: bool = False,
+        refuse_unknown_previous_response: bool = True,
     ) -> None:
         self._budget: Final = budget_bytes
         self._clock: Final = clock or CacheClock()
         self.record_store_false = record_store_false  # writable-ok: a config reload may change it
         """Record `store: false` turns without rewriting them; see SessionManagerSettings.record_store_false"""
+        self.refuse_unknown_previous_response = refuse_unknown_previous_response  # writable-ok: reloadable
+        """See SessionManagerSettings.refuse_unknown_previous_response"""
         self._turns: Final[dict[str, TurnRecord]] = {}  # mutable-ok: latest upstream turn per held session
         self._sessions: Final[OrderedDict[str, Session]] = OrderedDict()  # mutable-ok: LRU order of held sessions
         self._sizes: Final[dict[str, int]] = {}  # mutable-ok: byte size per held session, kept beside the LRU
@@ -163,6 +175,7 @@ class SessionManager:
         self._store: TranscriptStore | None = None
         self._writes: asyncio.Queue[_PendingWrite] | None = None
         self._writer: asyncio.Task[None] | None = None
+        self._settled: Final[OrderedDict[str, asyncio.Future[bool]]] = OrderedDict()  # mutable-ok: by response id
 
     def attach_store(self, store: TranscriptStore) -> None:
         self._store = store
@@ -408,6 +421,22 @@ class SessionManager:
         if self._writes is not None:
             await self._writes.join()
 
+    async def persisted(self, response_id: str, timeout: float) -> bool:
+        """Whether the turn that returned *response_id* is in the durable store, waiting up to *timeout* for it
+
+        True when there is no store to wait for. False when the write failed, did not finish in time, or was
+        never queued (an in-memory-only commit, or an outcome old enough to have aged out).
+        """
+        if self._store is None:
+            return True
+        settled: Final = self._settled.get(response_id)
+        if settled is None:
+            return False
+        try:
+            return await asyncio.wait_for(asyncio.shield(settled), timeout)
+        except TimeoutError:
+            return False
+
     def _hold(self, session: Session) -> None:
         self._sessions[session.id] = session
         self._sessions.move_to_end(session.id)
@@ -425,18 +454,27 @@ class SessionManager:
         if self._writes is None:
             self._writes = asyncio.Queue()
             self._writer = loop.create_task(self._drain(self._writes))
-        self._writes.put_nowait(write)
+        settled: Final[asyncio.Future[bool]] = loop.create_future()
+        self._settled[write.response_id] = settled
+        self._settled.move_to_end(write.response_id)
+        while len(self._settled) > _SETTLED_KEPT:
+            self._settled.popitem(last=False)
+        self._writes.put_nowait(replace(write, settled=settled))
 
     async def _drain(self, writes: asyncio.Queue[_PendingWrite]) -> None:
         while True:
             write: _PendingWrite = await writes.get()  # rebind-ok: one pending write per loop iteration
+            stored = False  # rebind-ok: one outcome per write
             try:
                 if self._store is not None:
                     await self._store.save(write.session, write.first_new, write.response_id)
+                stored = True
             except Exception as exc:
                 self._unpersisted += 1
                 verbose_logger.exception("SessionManager: failed to persist session %s: %s", write.session.id, exc)
             finally:
+                if write.settled is not None and not write.settled.done():
+                    write.settled.set_result(stored)
                 writes.task_done()
 
     def stats(self) -> ManagerStats:
@@ -477,7 +515,7 @@ class SessionManager:
             )
         base: Final = self._sessions.get(prior.session.id, prior.session)
         end: Final = prior.session.responses[prior.response_id]
-        if end == len(base.items):
+        if end == len(base.items) and not base.superseded:
             return _built(
                 base.id,
                 owner,

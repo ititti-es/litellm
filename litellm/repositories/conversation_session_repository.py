@@ -95,6 +95,8 @@ class StoredSession:
     items: tuple["prisma_models.LiteLLM_ConversationItem", ...]
     responses: tuple["prisma_models.LiteLLM_ConversationResponse", ...]
     metadata: object = None
+    superseded: bool = False
+    """An earlier version than the session's current one; compaction keeps those rows"""
 
 
 class _BatchWriteTable(Protocol):
@@ -254,9 +256,9 @@ class ConversationSessionRepository:
         session: Final = await self._db.litellm_conversationsession.find_unique(
             where={"session_id": response.session_id}  # mutable-ok: Prisma where filter must be a dict
         )
-        if session is None or session.version != response.version:
+        if session is None or session.version < response.version:
             return None
-        return await self._transcript(session)
+        return await self._transcript(session, response.version)
 
     async def load_session(self, session_id: str) -> StoredSession | None:
         """A session by its own id, for a client that names the conversation rather than the turn it follows"""
@@ -293,10 +295,14 @@ class ConversationSessionRepository:
             responses=tuple(responses),
         )
 
-    async def _transcript(self, session: "prisma_models.LiteLLM_ConversationSession") -> StoredSession:
+    async def _transcript(
+        self, session: "prisma_models.LiteLLM_ConversationSession", version: int | None = None
+    ) -> StoredSession:
+        """The session's items at *version*, its current one unless an earlier one is asked for"""
+        at: Final = session.version if version is None else version
         scope: Final = {  # mutable-ok: Prisma where filter must be a dict
             "session_id": session.session_id,
-            "version": session.version,
+            "version": at,
         }
         items: Final = await self._db.litellm_conversationitem.find_many(
             where=scope,
@@ -306,11 +312,12 @@ class ConversationSessionRepository:
         return StoredSession(
             session_id=session.session_id,
             owner=session.owner,
-            version=session.version,
+            version=at,
             last_upstream_at=session.last_upstream_at,
             metadata=session.metadata,
             items=tuple(items),
             responses=tuple(responses),
+            superseded=at != session.version,
         )
 
     async def delete_session(self, session_id: str) -> None:

@@ -279,6 +279,11 @@ class BaseResponsesAPIStreamingIterator:
     """
 
     on_completed: Callable[[ResponsesAPIResponse], None] | None = None
+    on_completed_async: Callable[[ResponsesAPIResponse], Awaitable[None]] | None = None
+    """Awaited before the completed event is handed on; set only where `settles_completion` is True"""
+    settles_completion: bool = False
+    """Whether this iterator awaits `on_completed_async` itself"""
+    _completion_pending: ResponsesAPIResponse | None = None
 
     def __init__(
         self,
@@ -658,8 +663,20 @@ class BaseResponsesAPIStreamingIterator:
 
     def _notify_completed(self) -> None:
         completed: Final = self._get_completed_response_object()
-        if self.on_completed is not None and completed is not None:
+        if completed is None:
+            return
+        if self.on_completed_async is not None and self.settles_completion:
+            self._completion_pending = completed
+        elif self.on_completed is not None:
             self.on_completed(completed)
+
+    async def _settle_completion(self) -> None:
+        """Run the async completion hook before the completed event goes to the client"""
+        pending: Final = self._completion_pending
+        if pending is None or self.on_completed_async is None:
+            return
+        self._completion_pending = None
+        await self.on_completed_async(pending)
 
     def _get_completed_response_object(self) -> ResponsesAPIResponse | None:
         openai_types: Final = _get_openai_response_types()
@@ -914,6 +931,8 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
     Async iterator for processing streaming responses from the Responses API.
     """
 
+    settles_completion = True
+
     def __init__(
         self,
         response: httpx.Response,
@@ -953,6 +972,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
 
                 self._check_max_streaming_duration()
                 result = self._process_chunk(sse.data)
+                await self._settle_completion()
 
                 if self.finished:
                     raise StopAsyncIteration

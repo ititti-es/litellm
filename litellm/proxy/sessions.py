@@ -50,11 +50,17 @@ def configured_session_manager(raw: object, current: SessionManager | None) -> S
     budget: Final = settings.budget_mb << 20
     if current is not None and current.budget_bytes == budget:
         current.record_store_false = settings.record_store_false
+        current.refuse_unknown_previous_response = settings.refuse_unknown_previous_response
         return current
     clock: Final = CacheClock(
         target=settings.compaction.target_hit_rate, half_life_seconds=settings.compaction.evidence_half_life_seconds
     )
-    return SessionManager(budget_bytes=budget, clock=clock, record_store_false=settings.record_store_false)
+    return SessionManager(
+        budget_bytes=budget,
+        clock=clock,
+        record_store_false=settings.record_store_false,
+        refuse_unknown_previous_response=settings.refuse_unknown_previous_response,
+    )
 
 
 class PrismaTranscriptStore:
@@ -115,8 +121,10 @@ def _session_from(stored: StoredSession) -> Session | None:
         )
     except ValidationError:
         return None
+    superseded: Final = bool(getattr(stored, "superseded", False))
     return Session(
-        id=stored.session_id,
+        # Held beside the live session, never in its place: the next turn forks it into a session of its own
+        id=f"{stored.session_id}~v{stored.version}" if superseded else stored.session_id,
         owner=stored.owner,
         items=items,
         outputs=frozenset(row.seq for row in stored.items if row.is_output),
@@ -125,6 +133,7 @@ def _session_from(stored: StoredSession) -> Session | None:
         last_upstream_at=stored.last_upstream_at.timestamp(),
         annotations=annotations,
         client_session_id=_client_session_id(getattr(stored, "metadata", None)),
+        superseded=superseded,
     )
 
 
