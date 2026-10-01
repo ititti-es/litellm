@@ -432,6 +432,8 @@ class LiteLLMRoutes(enum.Enum):
         "/responses/{response_id}/input_items",
         "/v1/responses/{response_id}/input_items",
         "/openai/v1/responses/{response_id}/input_items",
+        # gateway-owned session transcripts, scoped to the caller's key (proxy/session_endpoints.py)
+        "/v1/sessions/{client_session_id}/items",
         "/responses/{response_id}/cancel",
         "/v1/responses/{response_id}/cancel",
         "/openai/v1/responses/{response_id}/cancel",
