@@ -265,6 +265,34 @@ class ConversationSessionRepository:
         )
         return await self._transcript(session) if session is not None else None
 
+    async def load_session_history(self, session_id: str) -> StoredSession | None:
+        """A session with the items of every stored version, oldest first
+
+        Compaction rebases a session onto a summary as a new version and leaves the earlier versions' rows in
+        place, so this is the whole conversation as it was had, not just what the next turn replays.
+        """
+        session: Final = await self._db.litellm_conversationsession.find_unique(
+            where={"session_id": session_id}  # mutable-ok: Prisma where filter must be a dict
+        )
+        if session is None:
+            return None
+        items: Final = await self._db.litellm_conversationitem.find_many(
+            where={"session_id": session_id},  # mutable-ok: Prisma where filter must be a dict
+            order=[{"version": "asc"}, {"seq": "asc"}],  # mutable-ok: Prisma order clause must be a list of dicts
+        )
+        responses: Final = await self._db.litellm_conversationresponse.find_many(
+            where={"session_id": session_id}  # mutable-ok: Prisma where filter must be a dict
+        )
+        return StoredSession(
+            session_id=session.session_id,
+            owner=session.owner,
+            version=session.version,
+            last_upstream_at=session.last_upstream_at,
+            metadata=session.metadata,
+            items=tuple(items),
+            responses=tuple(responses),
+        )
+
     async def _transcript(self, session: "prisma_models.LiteLLM_ConversationSession") -> StoredSession:
         scope: Final = {  # mutable-ok: Prisma where filter must be a dict
             "session_id": session.session_id,

@@ -19,10 +19,24 @@ CREATED = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
 def _stored(owner: str, client_session_id: str) -> StoredSession:
     items = (
-        SimpleNamespace(seq=1, is_output=True, created_at=CREATED, content='{"type": "message", "role": "assistant"}'),
-        SimpleNamespace(seq=0, is_output=False, created_at=CREATED, content={"type": "message", "role": "user"}),
+        SimpleNamespace(
+            version=3,
+            seq=1,
+            is_output=True,
+            created_at=CREATED,
+            meta=None,
+            content='{"type": "message", "role": "assistant"}',
+        ),
+        SimpleNamespace(
+            version=3,
+            seq=0,
+            is_output=False,
+            created_at=CREATED,
+            meta=None,
+            content={"type": "message", "role": "user"},
+        ),
     )
-    responses = (SimpleNamespace(response_id="resp_1", item_count=2),)
+    responses = (SimpleNamespace(response_id="resp_1", version=3, item_count=2),)
     return StoredSession(
         session_id=client_session_key(owner, client_session_id),
         owner=owner,
@@ -36,7 +50,7 @@ def _stored(owner: str, client_session_id: str) -> StoredSession:
 @pytest.fixture
 def repository(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     repo = MagicMock()
-    repo.load_session = AsyncMock(return_value=None)
+    repo.load_session_history = AsyncMock(return_value=None)
     monkeypatch.setattr(session_endpoints, "_repository", lambda: repo)
     return repo
 
@@ -59,7 +73,7 @@ def _client(api_key: str | None) -> TestClient:
 
 
 def test_returns_items_in_order_with_response_boundaries(repository: MagicMock, manager: MagicMock) -> None:
-    repository.load_session.return_value = _stored("hash-a", "oc-session-1")
+    repository.load_session_history.return_value = _stored("hash-a", "oc-session-1")
 
     response = _client("hash-a").get("/v1/sessions/oc-session-1/items")
 
@@ -69,13 +83,13 @@ def test_returns_items_in_order_with_response_boundaries(repository: MagicMock, 
     assert body["version"] == 3
     assert [item["seq"] for item in body["items"]] == [0, 1]
     assert body["items"][1]["content"] == {"type": "message", "role": "assistant"}
-    assert body["responses"] == [{"id": "resp_1", "item_count": 2}]
+    assert body["responses"] == [{"id": "resp_1", "version": 3, "item_count": 2}]
     manager.flush.assert_awaited_once()
-    repository.load_session.assert_awaited_once_with(client_session_key("hash-a", "oc-session-1"))
+    repository.load_session_history.assert_awaited_once_with(client_session_key("hash-a", "oc-session-1"))
 
 
 def test_another_key_cannot_read_the_session(repository: MagicMock, manager: MagicMock) -> None:
-    repository.load_session.return_value = _stored("hash-a", "oc-session-1")
+    repository.load_session_history.return_value = _stored("hash-a", "oc-session-1")
 
     response = _client("hash-b").get("/v1/sessions/oc-session-1/items")
 
@@ -90,7 +104,7 @@ def test_disabled_store_is_not_found(repository: MagicMock, monkeypatch: pytest.
     monkeypatch.setattr(litellm, "session_manager", None)
 
     assert _client("hash-a").get("/v1/sessions/oc-session-1/items").status_code == 404
-    repository.load_session.assert_not_awaited()
+    repository.load_session_history.assert_not_awaited()
 
 
 def test_requires_an_api_key(repository: MagicMock, manager: MagicMock) -> None:
@@ -100,7 +114,7 @@ def test_requires_an_api_key(repository: MagicMock, manager: MagicMock) -> None:
 def test_post_maps_advertised_ids_onto_stored_responses(
     repository: MagicMock, manager: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repository.load_session.return_value = _stored("hash-a", "oc-session-1")
+    repository.load_session_history.return_value = _stored("hash-a", "oc-session-1")
     monkeypatch.setattr(session_endpoints, "stored_response_ids", lambda ids, caller: {"resp_1": ids[0]} if ids else {})
 
     response = _client("hash-a").post(
@@ -108,10 +122,47 @@ def test_post_maps_advertised_ids_onto_stored_responses(
     )
 
     assert response.status_code == 200
-    assert response.json()["responses"] == [{"id": "resp_1", "item_count": 2, "client_id": "resp_advertised_1"}]
+    assert response.json()["responses"] == [
+        {"id": "resp_1", "version": 3, "item_count": 2, "client_id": "resp_advertised_1"}
+    ]
 
 
 def test_plain_advertised_ids_map_to_the_provider_id() -> None:
     mapping = session_endpoints.stored_response_ids(["resp_plain"], UserAPIKeyAuth(api_key="hash-a"))
 
     assert mapping == {"resp_plain": "resp_plain"}
+
+
+def test_flags_compaction_summaries_and_keeps_earlier_versions() -> None:
+    summary_meta = '{"kind": "compaction_summary", "summary": "s"}'
+    items = (
+        SimpleNamespace(version=1, seq=0, is_output=False, created_at=CREATED, meta=None, content={"role": "user"}),
+        SimpleNamespace(version=1, seq=1, is_output=True, created_at=CREATED, meta=None, content={"role": "assistant"}),
+        SimpleNamespace(
+            version=2, seq=0, is_output=False, created_at=CREATED, meta=summary_meta, content={"role": "user"}
+        ),
+        SimpleNamespace(version=2, seq=1, is_output=False, created_at=CREATED, meta=None, content={"role": "user"}),
+        SimpleNamespace(version=2, seq=2, is_output=True, created_at=CREATED, meta=None, content={"role": "assistant"}),
+    )
+    stored = StoredSession(
+        session_id="cs_x",
+        owner="hash-a",
+        version=2,
+        last_upstream_at=CREATED,
+        items=items,  # pyright: ignore[reportArgumentType]
+        responses=(  # pyright: ignore[reportArgumentType]
+            SimpleNamespace(response_id="resp_2", version=2, item_count=3),
+            SimpleNamespace(response_id="resp_1", version=1, item_count=2),
+        ),
+    )
+
+    body = session_endpoints.session_items("oc", stored)
+
+    assert [(item["version"], item["seq"], item["summary"]) for item in body["items"]] == [
+        (1, 0, False),
+        (1, 1, False),
+        (2, 0, True),
+        (2, 1, False),
+        (2, 2, False),
+    ]
+    assert [(r["id"], r["version"]) for r in body["responses"]] == [("resp_1", 1), ("resp_2", 2)]

@@ -3,7 +3,7 @@
 GET  /v1/sessions/{client_session_id}/items
 POST /v1/sessions/{client_session_id}/items  {"response_ids": [...]}
 
-Returns the current transcript of a conversation a client named with its session id (the
+Returns the whole stored history of a conversation a client named with its session id (the
 ``litellm_session_id`` taken from ``x-litellm-session-id``, ``session_id`` and the other recognised
 headers), so a client that delegates history to this gateway can show it without keeping its own copy.
 
@@ -15,6 +15,11 @@ The store keys responses by the provider's own id, while a client only ever saw 
 (possibly encrypted by the response-id security hook). POST names the advertised ids the client holds, and
 each stored response it can be matched to carries that id back as ``client_id``, so the client can join its
 own records to the stored turns without decoding gateway ids itself.
+
+Compaction rebases a session onto a summary as a new version. Every version's items are returned, each with its
+``version``, and each response carries the version its ``item_count`` counts in. Items that a compaction wrote
+(the summary and any lead-in before it) are flagged ``summary`` so a client showing the conversation can leave
+them out; the conversation they replaced is still there under the earlier version.
 """
 
 import json
@@ -40,14 +45,17 @@ router: Final = APIRouter()
 
 
 class SessionItem(TypedDict):
+    version: int
     seq: int
     is_output: bool
+    summary: bool
     created_at: str
     content: object
 
 
 class SessionResponse(TypedDict, total=False):
     id: str
+    version: int
     item_count: int
     client_id: str
 
@@ -100,20 +108,37 @@ def stored_response_ids(advertised_ids: list[str], caller: UserAPIKeyAuth) -> di
     return mapping
 
 
+_SUMMARY_KIND: Final = "compaction_summary"
+
+
+def summary_ends(items: "list[object] | tuple[object, ...]") -> dict[int, int]:
+    """For each version a compaction wrote, the seq of its summary item; items up to it are the summary"""
+    ends: Final[dict[int, int]] = {}
+    for item in items:
+        meta = _decoded(getattr(item, "meta", None))
+        if isinstance(meta, dict) and meta.get("kind") == _SUMMARY_KIND:
+            version: int = getattr(item, "version")
+            ends[version] = max(ends.get(version, -1), getattr(item, "seq"))
+    return ends
+
+
 def session_items(
     client_session_id: str, stored: StoredSession, advertised: dict[str, str] | None = None
 ) -> SessionItems:
-    """The wire shape: items in transcript order, and each response id with the prefix length it completed"""
-    items: Final = sorted(stored.items, key=lambda item: item.seq)
-    responses: Final = sorted(stored.responses, key=lambda response: response.item_count)
+    """The wire shape: items in version and transcript order, and each response with the prefix it completed"""
+    items: Final = sorted(stored.items, key=lambda item: (item.version, item.seq))
+    responses: Final = sorted(stored.responses, key=lambda response: (response.version, response.item_count))
+    summaries: Final = summary_ends(items)
     return {
         "object": "session.items",
         "session_id": client_session_id,
         "version": stored.version,
         "items": [
             {
+                "version": item.version,
                 "seq": item.seq,
                 "is_output": item.is_output,
+                "summary": item.seq <= summaries.get(item.version, -1),
                 "created_at": _timestamp(item.created_at),
                 "content": _decoded(item.content),
             }
@@ -122,6 +147,7 @@ def session_items(
         "responses": [
             {
                 "id": response.response_id,
+                "version": response.version,
                 "item_count": response.item_count,
                 **(
                     {"client_id": advertised[response.response_id]}
@@ -168,7 +194,7 @@ async def _load_owned(client_session_id: str, user_api_key_dict: UserAPIKeyAuth)
         raise HTTPException(status_code=404, detail="The session store is not enabled on this gateway")
     # Turns are persisted by a background writer; drain it so a just-finished turn is readable.
     await litellm.session_manager.flush()
-    stored: Final = await _repository().load_session(client_session_key(owner, client_session_id))
+    stored: Final = await _repository().load_session_history(client_session_key(owner, client_session_id))
     if stored is None or stored.owner != owner:
         raise HTTPException(status_code=404, detail="Session not found")
     return stored
