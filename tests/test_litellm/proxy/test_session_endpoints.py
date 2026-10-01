@@ -95,3 +95,23 @@ def test_disabled_store_is_not_found(repository: MagicMock, monkeypatch: pytest.
 
 def test_requires_an_api_key(repository: MagicMock, manager: MagicMock) -> None:
     assert _client(None).get("/v1/sessions/oc-session-1/items").status_code == 401
+
+
+def test_post_maps_advertised_ids_onto_stored_responses(
+    repository: MagicMock, manager: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository.load_session.return_value = _stored("hash-a", "oc-session-1")
+    monkeypatch.setattr(session_endpoints, "stored_response_ids", lambda ids, caller: {"resp_1": ids[0]} if ids else {})
+
+    response = _client("hash-a").post(
+        "/v1/sessions/oc-session-1/items", json={"response_ids": ["resp_advertised_1", "resp_other"]}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["responses"] == [{"id": "resp_1", "item_count": 2, "client_id": "resp_advertised_1"}]
+
+
+def test_plain_advertised_ids_map_to_the_provider_id() -> None:
+    mapping = session_endpoints.stored_response_ids(["resp_plain"], UserAPIKeyAuth(api_key="hash-a"))
+
+    assert mapping == {"resp_plain": "resp_plain"}
