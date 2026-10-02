@@ -1355,6 +1355,57 @@ class TestProxyInitializationHelpers:
                 timeout_worker_healthcheck=15,
             )
 
+    @pytest.mark.parametrize(
+        ("cli_args", "env", "expected"),
+        (
+            (["--timeout_graceful_shutdown", "20"], {}, 20),
+            ([], {"TIMEOUT_GRACEFUL_SHUTDOWN": "15"}, 15),
+            ([], {}, None),
+        ),
+    )
+    @patch("uvicorn.run")
+    @patch("builtins.print")
+    @patch("litellm.proxy.db.prisma_client.PrismaManager.setup_database")
+    @patch(
+        "litellm.proxy.db.prisma_client.should_update_prisma_schema", return_value=False
+    )
+    def test_timeout_graceful_shutdown_reaches_uvicorn(
+        self, mock_should_update, mock_setup_db, mock_print, mock_uvicorn_run, cli_args, env, expected
+    ):
+        """A capped wait lets the proxy's own shutdown run even while a connection stays open"""
+        from click.testing import CliRunner
+
+        from litellm.proxy.proxy_cli import run_server
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("DATABASE_URL", "DIRECT_URL", "TIMEOUT_GRACEFUL_SHUTDOWN")
+        }
+
+        with (
+            patch.dict(os.environ, {**clean_env, **env}, clear=True),
+            patch.dict(
+                "sys.modules",
+                {
+                    "proxy_server": MagicMock(
+                        app=MagicMock(),
+                        ProxyConfig=MagicMock(),
+                        KeyManagementSettings=MagicMock(),
+                        save_worker_config=MagicMock(),
+                    )
+                },
+            ),
+            patch(
+                "litellm.proxy.proxy_cli.ProxyInitializationHelpers._is_port_in_use",
+                return_value=False,
+            ),
+        ):
+            result = CliRunner().invoke(run_server, ["--local", *cli_args])
+
+        assert result.exit_code == 0, result.output
+        assert mock_uvicorn_run.call_args[1].get("timeout_graceful_shutdown") == expected
+
     @patch("uvicorn.run")
     @patch("builtins.print")
     @patch("litellm.proxy.db.prisma_client.PrismaManager.setup_database")

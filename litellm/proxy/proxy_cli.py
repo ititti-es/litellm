@@ -890,6 +890,17 @@ class ProxyInitializationHelpers:
     envvar="TIMEOUT_WORKER_HEALTHCHECK",
 )
 @click.option(
+    "--timeout_graceful_shutdown",
+    default=None,
+    type=int,
+    help=(
+        "Seconds uvicorn waits for open connections to close on shutdown before cancelling them (uvicorn "
+        "timeout_graceful_shutdown parameter). Unset waits indefinitely, so one long-lived connection keeps the "
+        "proxy's own shutdown (request drain, session store flush) from ever running. Uvicorn only."
+    ),
+    envvar="TIMEOUT_GRACEFUL_SHUTDOWN",
+)
+@click.option(
     "--max_requests_before_restart",
     default=None,
     type=int,
@@ -1002,6 +1013,7 @@ def run_server(
     skip_server_startup,
     keepalive_timeout,
     timeout_worker_healthcheck,
+    timeout_graceful_shutdown: int | None,
     max_requests_before_restart,
     max_requests_before_restart_jitter: int | None,
     limit_concurrency: int | None,
@@ -1454,6 +1466,8 @@ def run_server(
         if run_gunicorn is False and run_hypercorn is False and run_granian is False:
             if limit_concurrency is not None:
                 uvicorn_args["limit_concurrency"] = limit_concurrency
+            if timeout_graceful_shutdown is not None:
+                uvicorn_args["timeout_graceful_shutdown"] = timeout_graceful_shutdown
             if max_requests_before_restart_jitter is not None:
                 ProxyInitializationHelpers._apply_uvicorn_max_requests_jitter(
                     uvicorn_args=uvicorn_args,
