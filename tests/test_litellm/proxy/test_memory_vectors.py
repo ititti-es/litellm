@@ -306,6 +306,6 @@ def test_a_session_that_recorded_nothing_takes_its_labels_from_the_key(store: ps
 
 
 def test_prisma_pool_parameters_are_dropped_and_the_rest_kept() -> None:
-    url: Final = "postgresql://u:p@localhost:5433/db?connection_limit=11&sslmode=disable&pool_timeout=60"
+    url: Final = "postgresql://u:p@localhost:5433/db?connection_limit=11&sslmode=disable&max_idle_connection_lifetime=5"
     assert psycopg_url(url) == "postgresql://u:p@localhost:5433/db?sslmode=disable"
     assert psycopg_url("postgresql://u@h/db") == "postgresql://u@h/db"

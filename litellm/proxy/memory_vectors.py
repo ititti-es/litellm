@@ -367,14 +367,14 @@ class DeepInfra:
         return scores
 
 
-_PRISMA_ONLY_PARAMS: Final = frozenset(("connection_limit", "pool_timeout", "schema", "pgbouncer", "socket_timeout"))
-
-
 def psycopg_url(url: str) -> str:
-    """DATABASE_URL without the query parameters Prisma adds (the proxy appends connection_limit and pool_timeout),
-    which libpq rejects"""
+    """DATABASE_URL with only the query parameters libpq knows: the proxy appends Prisma pool settings
+    (connection_limit, pool_timeout, max_idle_connection_lifetime, ...) that libpq rejects"""
+    from psycopg import pq
+
+    known: Final = frozenset(option.keyword.decode() for option in pq.Conninfo.get_defaults())
     parts: Final = urlsplit(url)
-    kept: Final = tuple((key, value) for key, value in parse_qsl(parts.query) if key not in _PRISMA_ONLY_PARAMS)
+    kept: Final = tuple((key, value) for key, value in parse_qsl(parts.query) if key in known)
     return urlunsplit(parts._replace(query=urlencode(kept)))
 
 
