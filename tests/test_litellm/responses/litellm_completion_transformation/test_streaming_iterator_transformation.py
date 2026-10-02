@@ -132,14 +132,14 @@ def test_tool_call_delta_is_emitted_as_responses_events():
     evt1 = iterator._transform_chat_completion_chunk_to_response_api_chunk(chunk)
     assert evt1 is not None
     assert evt1.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
-    assert evt1.output_index == 1
+    assert evt1.output_index == 0  # a tool call that opens the reply takes index 0
 
     # The arguments are now chunked, so we get the first delta chunk
     evt2 = iterator._transform_chat_completion_chunk_to_response_api_chunk(chunk)
     assert evt2 is not None
     assert evt2.type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA
     assert evt2.item_id == "fc_call_1"
-    assert evt2.output_index == 1
+    assert evt2.output_index == 0
     # The delta will be a chunk of the arguments, not the full arguments
     assert len(evt2.delta) <= 10  # Chunks are max 10 characters
 
@@ -391,7 +391,7 @@ def test_tool_calls_present_only_in_final_response_are_emitted_before_completed(
     # First common_done_event_logic call should yield tool events, not response.completed.
     evt1 = iterator.common_done_event_logic(sync_mode=True)
     assert evt1.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
-    assert evt1.output_index == 1
+    assert evt1.output_index == 0  # a tool call that opens the reply takes index 0
 
     # Now delta events are emitted (arguments split into chunks)
     # Collect all delta events
@@ -412,12 +412,12 @@ def test_tool_calls_present_only_in_final_response_are_emitted_before_completed(
     # The last event should be FUNCTION_CALL_ARGUMENTS_DONE
     assert evt.type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE
     assert evt.item_id == "fc_call_2"
-    assert evt.output_index == 1
+    assert evt.output_index == 0
     assert evt.arguments == '{"y":2}'
 
     evt_final = iterator.common_done_event_logic(sync_mode=True)
     assert evt_final.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
-    assert evt_final.output_index == 1
+    assert evt_final.output_index == 0
 
 
 def test_tool_call_arguments_are_chunked_to_match_openai_behavior():
@@ -472,7 +472,7 @@ def test_tool_call_arguments_are_chunked_to_match_openai_behavior():
     # First event should be OUTPUT_ITEM_ADDED
     assert evt is not None
     assert evt.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
-    assert evt.output_index == 1
+    assert evt.output_index == 0  # a tool call that opens the reply takes index 0
     assert hasattr(evt, "__dict__") and "sequence_number" in evt.__dict__
 
     # Collect all remaining delta events from the pending queue by creating empty chunks
@@ -506,7 +506,7 @@ def test_tool_call_arguments_are_chunked_to_match_openai_behavior():
     for evt in delta_events:
         assert len(evt.delta) <= 10
         assert evt.item_id == "fc_call_test"
-        assert evt.output_index == 1
+        assert evt.output_index == 0
         assert hasattr(evt, "__dict__") and "sequence_number" in evt.__dict__
 
     # Verify all deltas concatenated equal the original arguments
@@ -1182,3 +1182,36 @@ async def test_tool_only_snapshot_carries_only_streamed_items(sync_mode: bool):
     completed: Final = events[-1].response
     assert [item.type for item in completed.output] == ["function_call"]
     assert [item.id for item in completed.output] == streamed
+
+
+def _snapshot_positions_match_streamed_indexes(events) -> None:
+    streamed: Final = {
+        event.item.id: event.output_index
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
+    }
+    completed: Final = events[-1].response
+    assert {item.id: position for position, item in enumerate(completed.output) if item.id in streamed} == streamed
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        pytest.param(lambda: [_tool_call_chunk(), _chunk("", finish_reason="tool_calls")], id="tool-only"),
+        pytest.param(lambda: [_chunk("Let me check."), _tool_call_chunk(), _chunk("", finish_reason="tool_calls")], id="text-then-tool"),
+        pytest.param(lambda: [_tool_call_chunk(), _chunk("Done."), _chunk("", finish_reason="stop")], id="tool-then-text"),
+        pytest.param(
+            lambda: [_tool_call_chunk(), _reasoning_chunk("thinking"), _chunk("Hello"), _chunk("!", finish_reason="stop")],
+            id="tool-reasoning-text",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_completed_snapshot_positions_match_streamed_output_indexes(sync_mode: bool, chunks):
+    """OpenClaw pairs response.completed items with streamed ones by output_index. A tool-only reply streamed its
+    call at index 1 and listed it at position 0, so OpenClaw ran it twice and Claude rejected the extra result."""
+    events: Final = await _collect_events(_build_iterator(chunks()), sync_mode)
+
+    assert getattr(events[-1], "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+    _snapshot_positions_match_streamed_indexes(events)
