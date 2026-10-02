@@ -326,13 +326,26 @@ def _v2_user_content(message: Mapping[str, JsonValue]) -> tuple[Item, ...]:
     text: Final = message.get("text")
     files: Final = message.get("files")
     attachments: Final = tuple(
-        input_image(str(file.get("uri", "")))
-        if str(file.get("mime", "")).startswith("image/")
-        else input_text(f"[file: {file.get('name') or file.get('uri')} ({file.get('mime')})]")
-        for file in (files if isinstance(files, list) else ())
-        if isinstance(file, dict)
+        _v2_attachment(file) for file in (files if isinstance(files, list) else ()) if isinstance(file, dict)
     )
     return (*((input_text(str(text)),) if text else ()), *attachments)
+
+
+def _v2_attachment(file: Mapping[str, JsonValue]) -> Item:
+    """A v2 attachment names its file by `uri`, or carries it inline as base64 `data` (source type "inline")"""
+    mime: Final = str(file.get("mime", ""))
+    uri: Final = file.get("uri")
+    data: Final = file.get("data")
+    url: Final = (
+        uri
+        if isinstance(uri, str) and uri
+        else f"data:{mime};base64,{data}"
+        if isinstance(data, str) and data
+        else ""
+    )
+    if mime.startswith("image/") and url:
+        return input_image(url)
+    return input_text(f"[file: {file.get('name') or uri or 'inline'} ({mime or 'unknown type'})]")
 
 
 def _v2_note(message: Mapping[str, JsonValue], kind: str, source: Meta) -> ImportedItem:

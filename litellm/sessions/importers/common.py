@@ -13,7 +13,7 @@ import sqlite3
 import tempfile
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -92,6 +92,35 @@ class ImportedSession:
     turn_ends: tuple[int, ...]
     metadata: Meta
     skipped: int
+    first_turn: int = 0
+    """The turn number of `turn_ends[0]`: above zero once the turns before a compaction were cut away"""
+
+
+def from_last_compaction(session: ImportedSession) -> ImportedSession:
+    """The session as its harness last sent it: from its latest compaction (request, then summary) onward
+
+    A harness that compacted never sends the history before its summary again, and that history can be far larger
+    than the model's context window, so a session meant to be continued starts here, the way the session manager
+    rebases its own compactions. Kept turns keep their numbers, so each keeps its response id; turns that ended
+    before the cut belong to the version that holds the whole history.
+    """
+    summaries: Final = [
+        index for index, item in enumerate(session.items) if item.meta.get("kind") == "compaction_summary"
+    ]
+    if not summaries:
+        return session
+    last: Final = summaries[-1]
+    lead_in: Final = last > 0 and session.items[last - 1].meta.get("kind") == "compaction_request"
+    cut: Final = last - 1 if lead_in else last
+    kept: Final = [(turn, end - cut) for turn, end in enumerate(session.turn_ends) if end > cut]
+    if not kept:
+        return session
+    return replace(
+        session,
+        items=session.items[cut:],
+        turn_ends=tuple(end for _, end in kept),
+        first_turn=session.first_turn + kept[0][0],
+    )
 
 
 def user_message(content: tuple[Item, ...], meta: Meta) -> ImportedItem:
@@ -165,3 +194,21 @@ def _no_copy() -> Generator[str]:
 
 def loads(raw: object) -> JsonValue:
     return json.loads(raw) if isinstance(raw, str | bytes) else None
+
+
+def with_tool_outputs_capped(session: ImportedSession, limit: int) -> ImportedSession:
+    """The session with every tool output longer than `limit` characters cut to its head and a note saying so
+
+    An imported session has no upstream state to continue from, so every turn replays it whole, and one page dump
+    can outweigh the rest of the conversation. A harness that continued upstream never had to resend those
+    outputs; a continued import does, so it keeps their opening and says how much was left out.
+    """
+    return replace(session, items=tuple(_capped(item, limit) for item in session.items))
+
+
+def _capped(imported: ImportedItem, limit: int) -> ImportedItem:
+    output: Final = imported.item.get("output")
+    if imported.item.get("type") != "function_call_output" or not isinstance(output, str) or len(output) <= limit:
+        return imported
+    note: Final = f"\n[import: output cut to its first {limit} of {len(output)} characters]"
+    return replace(imported, item={**imported.item, "output": output[:limit] + note})
