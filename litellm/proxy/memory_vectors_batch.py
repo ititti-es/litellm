@@ -217,8 +217,10 @@ class BatchClient:
     def create(self, input_file_id: str) -> _Batch:
         response: Final = self.client.post(
             f"{DEEPINFRA_BASE_URL}/openai/batches",
-            headers=self._headers(),
-            json=MappingProxyType({"input_file_id": input_file_id, "endpoint": _ENDPOINT, "completion_window": "24h"}),
+            headers=MappingProxyType({**self._headers(), "Content-Type": "application/json"}),
+            content=json.dumps(
+                {"input_file_id": input_file_id, "endpoint": _ENDPOINT, "completion_window": "24h"}
+            ),  # mutable-ok: JSON
         )
         _ = response.raise_for_status()
         return _Batch.model_validate_json(response.content)
