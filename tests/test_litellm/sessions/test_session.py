@@ -76,6 +76,28 @@ def test_a_tool_call_is_compared_on_what_it_asked_for():
     assert _forms(call) != _forms(elsewhere)
 
 
+def test_a_tool_call_re_encoded_by_the_harness_still_compares_equal():
+    """xAI sent 50.0 and opencode resent 50; the conversation forked into a full copy on that alone."""
+    recorded = [
+        {"type": "function_call", "call_id": "c1", "name": "read", "arguments": '{"limit": 50.0, "path": "/a"}'}
+    ]
+    resent = [{"type": "function_call", "call_id": "c1", "name": "read", "arguments": '{"path":"/a","limit":50}'}]
+    wrapped = [
+        {
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "read",
+            "arguments": '"{\\"path\\":\\"/a\\",\\"limit\\":50}"',
+        }
+    ]
+    other = [{"type": "function_call", "call_id": "c1", "name": "read", "arguments": '{"path":"/a","limit":51}'}]
+    text = [{"type": "function_call", "call_id": "c1", "name": "read", "arguments": "not json"}]
+
+    assert _forms(recorded) == _forms(resent) == _forms(wrapped)
+    assert _forms(recorded) != _forms(other)
+    assert _forms(text) == [("function_call", "c1", "read", "not json")]
+
+
 def test_a_tool_result_is_compared_on_what_it_returned():
     output = [{"type": "function_call_output", "call_id": "c1", "output": "a b"}]
 

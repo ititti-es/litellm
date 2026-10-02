@@ -5,7 +5,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Final, TypeAlias
+from typing import Final, TypeAlias, cast
 
 from pydantic import JsonValue
 
@@ -99,7 +99,12 @@ def _form(item: Item) -> Form | None:
     if kind == "reasoning":
         return None
     if kind == "function_call":
-        return ("function_call", _string(item, "call_id"), _string(item, "name"), _string(item, "arguments"))
+        return (
+            "function_call",
+            _string(item, "call_id"),
+            _string(item, "name"),
+            _arguments(_string(item, "arguments")),
+        )
     if kind == "function_call_output":
         return ("function_call_output", _string(item, "call_id"), _text_of(item.get("output")))
     role: Final = _string(item, "role")
@@ -107,6 +112,36 @@ def _form(item: Item) -> Form | None:
     if role == "assistant" and not text:
         return None
     return ("message", role, text)
+
+
+def _arguments(arguments: str) -> str:
+    """A tool call's arguments as what they ask for rather than how they were encoded
+
+    A harness that parses a call and re-encodes it resends the same request in other bytes: 50.0 comes back as
+    50, keys in another order, an argument string that was itself JSON-encoded comes back as the object. Text
+    that is not JSON is compared as it is.
+    """
+    try:
+        decoded = _decoded_json(arguments)  # rebind-ok: unwrapped once more if it was a JSON string
+        if isinstance(decoded, str):
+            decoded = _decoded_json(decoded)
+    except ValueError:
+        return arguments
+    return json.dumps(_integral(decoded), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _decoded_json(text: str) -> JsonValue:
+    return cast(JsonValue, json.loads(text))
+
+
+def _integral(value: JsonValue) -> JsonValue:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_integral(entry) for entry in value]  # mutable-ok: rebuilt JSON, only serialized
+    if isinstance(value, dict):
+        return {key: _integral(entry) for key, entry in value.items()}  # mutable-ok: same
+    return value
 
 
 def _string(item: Item, key: str) -> str:
