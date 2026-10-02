@@ -21,7 +21,8 @@ import argparse
 import hashlib
 import os
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import groupby, islice
 from types import MappingProxyType
@@ -54,6 +55,8 @@ EMBED_BATCH_CHARS: Final = 120_000
 EMBED_BATCH_SIZE: Final = 64
 ITEM_SCAN_BATCH: Final = 2000
 RRF_K: Final = 60
+RETRY_ATTEMPTS: Final = 8
+RETRYABLE_STATUSES: Final = frozenset((429, 500, 502, 503, 504))
 LEG_LIMIT: Final = 100
 RERANK_CANDIDATES: Final = 40
 RERANK_DOC_CHARS: Final = 4000
@@ -264,19 +267,32 @@ class _RerankResponse(BaseModel):
     scores: tuple[float, ...]
 
 
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    retry_after: Final = str(response.headers.get("retry-after") or "")
+    return float(retry_after) if retry_after.isdigit() else min(2.0 * 2.0**attempt, 60.0)
+
+
 @dataclass(frozen=True, slots=True)
 class DeepInfra:
     client: httpx.Client
     api_key: str
+    sleep: Callable[[float], None] = time.sleep
 
     def _post(self, path: str, body: _EmbeddingBody | _RerankBody) -> bytes:
+        response: Final = self._send(path, body, attempt=0)
+        _ = response.raise_for_status()
+        return response.content
+
+    def _send(self, path: str, body: _EmbeddingBody | _RerankBody, *, attempt: int) -> httpx.Response:
         response: Final = self.client.post(
             f"{DEEPINFRA_BASE_URL}{path}",
             json=body,
             headers=MappingProxyType({"Authorization": f"Bearer {self.api_key}"}),
         )
-        response.raise_for_status()
-        return response.content
+        if response.status_code not in RETRYABLE_STATUSES or attempt == RETRY_ATTEMPTS - 1:
+            return response
+        self.sleep(_retry_delay(response, attempt))
+        return self._send(path, body, attempt=attempt + 1)
 
     def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         body: Final[_EmbeddingBody] = {

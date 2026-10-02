@@ -5,6 +5,7 @@ import re
 from collections.abc import Sequence
 from typing import Final
 
+import httpx
 import psycopg
 import pytest
 from pytest_postgresql import factories
@@ -14,7 +15,9 @@ from litellm.proxy.memory_vectors import (
     DIMENSIONS,
     EMBED_BATCH_CHARS,
     EMBED_BATCH_SIZE,
+    RETRY_ATTEMPTS,
     SCHEMA_SQL,
+    DeepInfra,
     chunk,
     embedding_batches,
     index_pass,
@@ -204,4 +207,42 @@ def test_search_returns_a_text_shared_by_two_versions_once(store: psycopg.Connec
     hits: Final = search(store, _Embedder(), _overlap_rerank, "tomato wilting", owner=None, limit=5)
     tomato: Final = next(hit for hit in hits if "tomato" in hit.content)
     assert (tomato.session_id, tomato.seq) == ("ses_garden", 0)
-    assert len([hit for hit in hits if "tomato" in hit.content]) == 1
+    assert sum(1 for hit in hits if "tomato" in hit.content) == 1
+
+
+class _Waits:
+    def __init__(self) -> None:
+        self.seconds: tuple[float, ...] = ()
+
+    def __call__(self, seconds: float) -> None:
+        self.seconds = (*self.seconds, seconds)
+
+
+def _deepinfra(statuses: Sequence[int]) -> tuple[DeepInfra, _Waits]:
+    remaining: Final = iter(statuses)
+    waits: Final = _Waits()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        status: Final = next(remaining)
+        return httpx.Response(status, content=b'{"scores": [0.5]}') if status == 200 else httpx.Response(status)
+
+    client: Final = httpx.Client(transport=httpx.MockTransport(respond))
+    return DeepInfra(client=client, api_key="test", sleep=waits), waits
+
+
+def test_rerank_retries_rate_limits_until_it_succeeds() -> None:
+    deepinfra, waits = _deepinfra((429, 503, 200))
+    assert deepinfra.rerank("query", ("document",)) == (0.5,)
+    assert len(waits.seconds) == 2
+    assert waits.seconds[1] > waits.seconds[0]
+
+
+def test_rerank_gives_up_after_the_last_attempt_and_never_retries_a_client_error() -> None:
+    limited, limited_waits = _deepinfra((429,) * RETRY_ATTEMPTS)
+    with pytest.raises(httpx.HTTPStatusError):
+        _ = limited.rerank("query", ("document",))
+    assert len(limited_waits.seconds) == RETRY_ATTEMPTS - 1
+    rejected, rejected_waits = _deepinfra((400,))
+    with pytest.raises(httpx.HTTPStatusError):
+        _ = rejected.rerank("query", ("document",))
+    assert rejected_waits.seconds == ()
