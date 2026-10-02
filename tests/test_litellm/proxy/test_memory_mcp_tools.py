@@ -84,7 +84,7 @@ def test_hits_render_with_the_ids_memory_context_needs() -> None:
 async def test_search_runs_in_the_callers_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: Final[list[tuple[str, int, Scope]]] = []  # mutable-ok: records each search
 
-    def fake_search(args: memory_mcp_tools._SearchArgs, scope: Scope) -> str:
+    def fake_search(args: memory_mcp_tools.SearchArgs, scope: Scope) -> str:
         seen.append((args.query, args.limit, scope))
         return "found"
 
@@ -100,7 +100,7 @@ async def test_search_runs_in_the_callers_scope(monkeypatch: pytest.MonkeyPatch)
 async def test_context_runs_in_the_callers_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: Final[list[tuple[str, int, int, Scope]]] = []  # mutable-ok: records each read
 
-    def fake_context(args: memory_mcp_tools._ContextArgs, scope: Scope) -> str:
+    def fake_context(args: memory_mcp_tools.ContextArgs, scope: Scope) -> str:
         seen.append((args.session_id, args.seq, args.before, scope))
         return "window"
 

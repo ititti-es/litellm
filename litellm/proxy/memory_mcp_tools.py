@@ -124,7 +124,7 @@ MEMORY_TOOL_DEFINITIONS: Final = (
 )
 
 
-class _SearchArgs(BaseModel):
+class SearchArgs(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     query: str = Field(min_length=1, max_length=2000)
@@ -133,7 +133,7 @@ class _SearchArgs(BaseModel):
     harness: str | None = None
 
 
-class _ContextArgs(BaseModel):
+class ContextArgs(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     session_id: str = Field(min_length=1)
@@ -235,17 +235,35 @@ def _item_text(content: object) -> str:
     return _clip(text, CONTEXT_TOOL_OUTPUT_CHARS if is_tool_output else CONTEXT_ITEM_CHARS)
 
 
-def read_context(conn: psycopg.Connection, args: _ContextArgs, scope: Scope) -> str:
+class ContextMissing(LookupError):
+    """The session or message a context read asked for is not in the caller's memory"""
+
+
+@dataclass(frozen=True, slots=True)
+class ContextItem:
+    seq: int
+    text: str
+    hit: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ContextWindow:
+    session: _Session
+    last_seq: int | None
+    items: tuple[ContextItem, ...]
+
+
+def context_window(conn: psycopg.Connection, args: ContextArgs, scope: Scope) -> ContextWindow:
     session: Final = _sessions(conn, (args.session_id,), scope).get(args.session_id)
     if session is None:
-        return f"No session {args.session_id} in your memory."
+        raise ContextMissing(f"No session {args.session_id} in your memory.")
     with conn.cursor() as cursor:
         found: Final = cursor.execute(
             _HIT_VERSION_SQL, {"session_id": session.session_id, "version": session.version, "seq": args.seq}
         ).fetchone()
     version: Final = found[0] if found else None
     if version is None:
-        return f"Session {args.session_id} has no message at seq {args.seq}."
+        raise ContextMissing(f"Session {args.session_id} has no message at seq {args.seq}.")
     with conn.cursor(row_factory=class_row(_WindowItem)) as cursor:
         window: Final = cursor.execute(
             _WINDOW_SQL,
@@ -256,15 +274,31 @@ def read_context(conn: psycopg.Connection, args: _ContextArgs, scope: Scope) -> 
                 "high": args.seq + args.after,
             },
         ).fetchall()
+    return ContextWindow(
+        session=session,
+        last_seq=window[-1].last_seq if window else None,
+        items=tuple(
+            ContextItem(seq=item.seq, text=_item_text(item.content), hit=item.seq == args.seq) for item in window
+        ),
+    )
+
+
+def format_context(window: ContextWindow) -> str:
+    session: Final = window.session
     header: Final = (
         f"session_id={session.session_id} title: {session.title or '(untitled)'}\n"
         f"started={_day(session.created_at)} harness={session.harness or '-'} agent={session.agent or '-'} "
-        f"messages 0..{window[-1].last_seq if window else '?'}"
+        f"messages 0..{window.last_seq if window.last_seq is not None else '?'}"
     )
-    lines: Final = tuple(
-        f"{'>>' if item.seq == args.seq else '  '} seq={item.seq} {_item_text(item.content)}" for item in window
-    )
+    lines: Final = tuple(f"{'>>' if item.hit else '  '} seq={item.seq} {item.text}" for item in window.items)
     return "\n".join((header, *lines))
+
+
+def read_context(conn: psycopg.Connection, args: ContextArgs, scope: Scope) -> str:
+    try:
+        return format_context(context_window(conn, args, scope))
+    except ContextMissing as missing:
+        return str(missing)
 
 
 def _environment() -> tuple[str, str]:
@@ -275,7 +309,7 @@ def _environment() -> tuple[str, str]:
     return database_url, api_key
 
 
-def _search(args: _SearchArgs, scope: Scope) -> str:
+def _search(args: SearchArgs, scope: Scope) -> str:
     import psycopg
 
     database_url, api_key = _environment()
@@ -287,7 +321,7 @@ def _search(args: _SearchArgs, scope: Scope) -> str:
     return format_hits(hits, {key: row.created_at for key, row in sessions.items() if row.created_at})
 
 
-def _context(args: _ContextArgs, scope: Scope) -> str:
+def _context(args: ContextArgs, scope: Scope) -> str:
     import psycopg
 
     database_url, _ = _environment()
@@ -309,10 +343,10 @@ async def call_memory_tool(name: str, arguments: Mapping[str, object], caller: U
     master_key_user: Final = os.environ.get("MEMORY_MASTER_KEY_USER") or None
     try:
         if name == MEMORY_SEARCH_TOOL_NAME:
-            search_args: Final = _SearchArgs.model_validate(arguments)
+            search_args: Final = SearchArgs.model_validate(arguments)
             scope = recall_scope(caller, search_args.agent, search_args.harness, master_key_user)
             return _result(await asyncio.to_thread(_search, search_args, scope))
-        context_args: Final = _ContextArgs.model_validate(arguments)
+        context_args: Final = ContextArgs.model_validate(arguments)
         scope = recall_scope(caller, None, None, master_key_user)
         return _result(await asyncio.to_thread(_context, context_args, scope))
     except ValidationError as error:
