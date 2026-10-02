@@ -68,13 +68,21 @@ def comparable(items: Sequence[Item]) -> tuple[tuple[int, Form], ...]:
     return tuple((index, form) for index, item in enumerate(items) if (form := _form(item)) is not None)
 
 
+# Postgres refuses a tsvector over 1 MiB, and the full-text index covers this column, so one huge tool output
+# would fail the whole write. The cap is far below that limit even for text made of distinct words.
+SEARCH_TEXT_LIMIT: Final = 200_000
+
+
 def search_text(item: Item) -> str | None:
     kind: Final = item.get("type", "message")
     if kind == "reasoning":
         return None
-    if kind == "function_call":
-        return _string(item, "arguments") or None
-    return _searchable_text(item.get("output") if kind == "function_call_output" else item.get("content")) or None
+    text: Final = (
+        _string(item, "arguments")
+        if kind == "function_call"
+        else _searchable_text(item.get("output") if kind == "function_call_output" else item.get("content"))
+    )
+    return text[:SEARCH_TEXT_LIMIT] or None
 
 
 def _searchable_text(content: JsonValue) -> str:
