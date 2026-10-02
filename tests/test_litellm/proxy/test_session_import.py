@@ -10,7 +10,7 @@ from litellm.repositories.conversation_session_repository import (
     ImportWrite,
     StoredTranscript,
 )
-from litellm.sessions.importers.common import ImportedItem, ImportedSession
+from litellm.sessions.importers.common import ImportedItem, ImportedSession, from_last_compaction
 
 
 def _session(*texts):
@@ -133,3 +133,39 @@ async def test_import_executes_the_planned_append_or_rewrite_and_preserves_live_
     assert tuple(row.seq for row in planned.write.items) == ((2,) if texts[-1] == "c" else (0, 1))
     assert planned.write.version == (3 if texts[-1] == "c" else 4)
     assert planned.action in lines[0]
+
+
+def _compacted_session():
+    kinds = ("user", "text", "compaction_request", "compaction_summary", "user", "text", "user", "text")
+    return ImportedSession(
+        source="opencode",
+        source_id="ses_1",
+        title="t",
+        parent_source_id=None,
+        created_at=datetime(2026, 9, 19, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 19, tzinfo=UTC),
+        items=tuple(
+            ImportedItem({"role": "user", "content": str(seq)}, False, {"kind": kind}) for seq, kind in enumerate(kinds)
+        ),
+        turn_ends=(2, 4, 6, 8),
+        metadata={"harness": "opencode"},
+        skipped=0,
+    )
+
+
+def test_a_continued_session_starts_at_its_last_compaction_and_keeps_response_ids():
+    full = _compacted_session()
+    continued = from_last_compaction(full)
+    assert [item.item["content"] for item in continued.items] == ["2", "3", "4", "5", "6", "7"]
+    assert continued.turn_ends == (2, 4, 6) and continued.first_turn == 1
+    planned = plan_import(continued, "o", _stored(0, *(str(seq) for seq in range(8))))
+    assert planned.action == "new version 1"
+    assert planned.write.responses == tuple(
+        (imported_response_id("opencode", "ses_1", turn), end) for turn, end in ((1, 2), (2, 4), (3, 6))
+    )
+    assert planned.write.responses[-1][0] == plan_import(full, "o", None).write.responses[-1][0]
+
+
+def test_a_session_without_a_compaction_is_left_whole():
+    session = _session("a", "b")
+    assert from_last_compaction(session) is session

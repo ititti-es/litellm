@@ -1,6 +1,7 @@
 """Import harness sessions into the session manager's transcript store
 
     python -m litellm.proxy.session_import opencode [--source ~/.local/share/opencode/opencode.db] [--owner-key sk-...]
+        [--from-last-compaction]
     python -m litellm.proxy.session_import openclaw [--source ~/.openclaw] [--owner-key sk-...]
     python -m litellm.proxy.session_import claude-code [--source ~/.claude/projects] [--owner-key sk-...]
     python -m litellm.proxy.session_import pin|unpin SESSION_ID
@@ -35,7 +36,7 @@ from litellm.repositories.conversation_session_repository import (
     jsonb_text,
 )
 from litellm.sessions.importers.claude_code import DEFAULT_PROJECTS_DIR, read_claude_code
-from litellm.sessions.importers.common import ImportedSession
+from litellm.sessions.importers.common import ImportedSession, from_last_compaction
 from litellm.sessions.importers.openclaw import read_openclaw
 from litellm.sessions.importers.opencode import read_opencode
 from litellm.sessions.session import canonical
@@ -120,7 +121,7 @@ def plan_import(session: ImportedSession, owner: str, stored: StoredTranscript |
         ),
         responses=tuple(
             (imported_response_id(session.source, session.source_id, turn), end)
-            for turn, end in enumerate(session.turn_ends)
+            for turn, end in enumerate(session.turn_ends, start=session.first_turn)
         ),
     )
     change: Final = (
@@ -199,7 +200,9 @@ async def _main(args: argparse.Namespace) -> int:
         owner: Final = hash_token(args.owner_key) if args.owner_key else f"{ARCHIVE_OWNER_PREFIX}{args.command}"
         reader: Final = _READERS[args.command]
         scratch: Final = Path(args.scratch_dir).expanduser() if args.scratch_dir else None
-        for line in await run_import(reader(source, scratch), owner, repository, write=not dry_run):
+        sessions: Final = reader(source, scratch)
+        continued: Final = map(from_last_compaction, sessions) if args.from_last_compaction else sessions
+        for line in await run_import(continued, owner, repository, write=not dry_run):
             sys.stdout.write(line + "\n")
         return 0
 
@@ -215,6 +218,11 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("--source", help=f"defaults to {_DEFAULT_SOURCES[name]}")
         sub.add_argument("--owner-key", help="the virtual key that may continue these sessions")
         sub.add_argument("--dry-run", action="store_true", help="read and convert, write nothing")
+        sub.add_argument(
+            "--from-last-compaction",
+            action="store_true",
+            help="store each session from its latest compaction on, as its harness last sent it (for continuing)",
+        )
         sub.add_argument(
             "--scratch-dir", help="read a private copy made here instead of the live file (read-only either way)"
         )
