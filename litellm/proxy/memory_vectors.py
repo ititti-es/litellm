@@ -130,8 +130,8 @@ _SESSION_IN_SCOPE: Final = """
         v.user_id, CASE WHEN s.owner = 'litellm_proxy_master_key' THEN %(master_key_user)s::text END
     ) = %(user)s)
     AND (%(team)s::text IS NULL OR v.team_id = %(team)s)
-    AND (%(agent)s::text IS NULL OR s.metadata->>'agent' = %(agent)s)
-    AND (%(harness)s::text IS NULL OR COALESCE(s.metadata->>'harness', s.source) = %(harness)s)
+    AND (%(agent)s::text IS NULL OR COALESCE(s.metadata->>'agent', v.metadata->>'agent') = %(agent)s)
+    AND (%(harness)s::text IS NULL OR COALESCE(s.metadata->>'harness', s.source, v.metadata->>'harness') = %(harness)s)
 """
 
 _OWNER_FILTER: Final = f"""
@@ -162,7 +162,8 @@ LIMIT %(limit)s
 
 _OCCURRENCE_SQL: Final = f"""
 SELECT DISTINCT ON (t.text_sha) t.text_sha, t.session_id, t.seq, s.title, s.source,
-       s.metadata->>'agent' AS agent, COALESCE(s.metadata->>'harness', s.source) AS harness
+       COALESCE(s.metadata->>'agent', v.metadata->>'agent') AS agent,
+       COALESCE(s.metadata->>'harness', s.source, v.metadata->>'harness') AS harness
 FROM "LiteLLM_ConversationItemText" t
 JOIN "LiteLLM_ConversationSession" s ON s.session_id = t.session_id
 LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.owner

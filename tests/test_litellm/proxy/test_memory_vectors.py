@@ -37,8 +37,9 @@ CREATE TABLE "LiteLLM_ConversationSession" (
     session_id TEXT PRIMARY KEY, owner TEXT NOT NULL, version INTEGER NOT NULL,
     title TEXT, source TEXT, metadata JSONB, updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE "LiteLLM_VerificationToken" (token TEXT PRIMARY KEY, user_id TEXT, team_id TEXT);
-INSERT INTO "LiteLLM_VerificationToken" VALUES ('alice', 'u_alice', 't_garden'), ('bob', 'u_bob', NULL);
+CREATE TABLE "LiteLLM_VerificationToken" (token TEXT PRIMARY KEY, user_id TEXT, team_id TEXT, metadata JSONB);
+INSERT INTO "LiteLLM_VerificationToken" VALUES
+    ('alice', 'u_alice', 't_garden', NULL), ('bob', 'u_bob', NULL, '{"agent": "dba", "harness": "claude_code"}');
 CREATE TABLE "LiteLLM_ConversationItem" (
     session_id TEXT NOT NULL REFERENCES "LiteLLM_ConversationSession" ON DELETE CASCADE,
     version INTEGER NOT NULL, seq INTEGER NOT NULL, content JSONB NOT NULL,
@@ -293,3 +294,11 @@ def test_master_key_sessions_count_as_the_configured_user(store: psycopg.Connect
     _ = index_pass(store, _Embedder(), dry_run=False, max_chars=None)
     assert "ses_admin" not in _sessions_found(store, "rotate master key", Scope(user="u_alice"))
     assert "ses_admin" in _sessions_found(store, "rotate master key", Scope(user="u_alice", master_key_user="u_alice"))
+
+
+def test_a_session_that_recorded_nothing_takes_its_labels_from_the_key(store: psycopg.Connection) -> None:
+    _ = index_pass(store, _Embedder(), dry_run=False, max_chars=None)
+    query: Final = "greenhouse postgres tomato vacuum"
+    assert _sessions_found(store, query, Scope(agent="dba")) == {"ses_db"}
+    assert _sessions_found(store, query, Scope(harness="claude_code")) == frozenset()
+    assert _sessions_found(store, query, Scope(harness="opencode")) == {"ses_db"}
