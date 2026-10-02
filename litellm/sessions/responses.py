@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -174,13 +175,69 @@ async def begin_turn(
             manager,
             owner,
             resolution,
-            items,
+            paired_tool_outputs(resolution.history, items),
             resolution.session.id,
             started_at,
             client_session_id=client or resolution.session.client_session_id,
             provenance=provenance,
         )
     return resolution if isinstance(resolution, Forbidden) else None
+
+
+_UNSAFE_CALL_ID_CHARS: Final = re.compile(r"[^A-Za-z0-9_-]")
+_ALIAS_HASH_SUFFIX: Final = re.compile(r"_[0-9a-f]{10}$")
+# Shortest clipped alias body still specific enough to name one call
+_MIN_ALIAS_CORE: Final = 16
+
+
+def _carries_call_id(alias: str, call_id: str) -> bool:
+    """Whether a client's rewritten call id was derived from this one
+
+    OpenClaw replays Responses tool ids in OpenAI's `call_*` shape: a call id such as Claude's `toolu_...` or
+    xAI's `call-...-0` comes back as `call_<call_id|item_id, unsafe characters as _, clipped>_<10 hex>`.
+    """
+    safe: Final = _UNSAFE_CALL_ID_CHARS.sub("_", call_id)
+    if safe in alias:
+        return True
+    core: Final = _ALIAS_HASH_SUFFIX.sub("", alias.removeprefix("call_"))
+    return len(core) >= _MIN_ALIAS_CORE and _UNSAFE_CALL_ID_CHARS.sub("_", call_id.removeprefix("call_")).startswith(core)
+
+
+def paired_tool_outputs(history: Sequence[Item], turn_input: tuple[Item, ...]) -> tuple[Item, ...]:
+    """The turn's tool outputs, each under the call id the held history gave its call
+
+    The gateway owns this history, so the provider sees the calls exactly as they were stored. A client that rewrote
+    a call id in its own copy (OpenClaw normalizes ids to OpenAI's shape) sends its output under the rewritten id,
+    and the provider then finds an unanswered call beside an orphaned output: OpenAI's "No tool output found for
+    function call", claude_cli's "tool result IDs do not match pending Claude calls". An output whose id names no
+    open call is moved to the one open call its id was derived from; anything ambiguous is left as sent.
+    """
+    answered: Final = {item.get("call_id") for item in history if item.get("type") == "function_call_output"}
+    open_calls: Final = tuple(
+        call_id
+        for item in history
+        if item.get("type") == "function_call"
+        and isinstance(call_id := item.get("call_id"), str)
+        and call_id not in answered
+    )
+    if not open_calls:
+        return turn_input
+    sent: Final = {item.get("call_id") for item in turn_input if item.get("type") == "function_call_output"}
+    unclaimed: Final = [call_id for call_id in open_calls if call_id not in sent]  # mutable-ok: claimed one by one
+    paired: Final[list[Item]] = []  # mutable-ok: built once, returned as a tuple
+    for item in turn_input:
+        alias = item.get("call_id")  # rebind-ok: per item
+        owners = (  # rebind-ok: per item
+            [call_id for call_id in unclaimed if _carries_call_id(alias, call_id)]
+            if item.get("type") == "function_call_output" and isinstance(alias, str) and alias not in open_calls
+            else []
+        )
+        if len(owners) != 1:
+            paired.append(item)
+            continue
+        unclaimed.remove(owners[0])
+        paired.append({**item, "call_id": owners[0]})
+    return tuple(paired) if paired != list(turn_input) else turn_input
 
 
 def _continuing(
@@ -197,7 +254,9 @@ def _continuing(
         manager,
         owner,
         continuation.prior,
-        continuation.turn_input,
+        paired_tool_outputs(continuation.prior.history, continuation.turn_input)
+        if continuation.prior is not None
+        else continuation.turn_input,
         continuation.session_id,
         started_at,
         client_session_id=client,

@@ -550,3 +550,60 @@ async def test_a_turn_begun_with_provenance_commits_it():
     )
     assert pending is not None and not isinstance(pending, Forbidden)
     assert pending.provenance == Provenance(agent="sett", harness="openclaw")
+
+
+def _openclaw_alias(call_id: str, item_id: str) -> str:
+    """OpenClaw's normalizeOpenAIResponsesFunctionCallId for a call id outside OpenAI's call_* shape"""
+    import hashlib
+    import re
+
+    original = f"{call_id}|{item_id}"
+    tail = re.sub(r"[^A-Za-z0-9_-]", "_", original.removeprefix("call_")).strip("_")
+    suffix = "_" + hashlib.sha256(original.encode()).hexdigest()[:10]
+    return "call_" + (tail[: 59 - len(suffix)] + suffix)[:59]
+
+
+def _tool_turn(call_id: str) -> ResponsesAPIResponse:
+    return ResponsesAPIResponse(
+        id="resp_1",
+        created_at=0,
+        output=[{"type": "function_call", "id": f"fc_{call_id}", "call_id": call_id, "name": "probe", "arguments": "{}"}],
+    )
+
+
+@pytest.mark.parametrize(
+    "call_id",
+    ["toolu_01EPHeygGyE3fC13D29X8YE3", "call-74379d1e-b2fa-4405-ba94-12226ccabc13-0"],
+    ids=["claude", "xai"],
+)
+async def test_a_tool_output_under_a_client_rewritten_id_is_paired_with_its_held_call(call_id: str):
+    """OpenClaw answered Claude's toolu_ call as call_toolu_..._<hash>; claude_cli refused it and GPT, replaying
+    a composer turn, found "No tool output found for function call". The stored call keeps its id, so must the output."""
+    manager: Final = SessionManager()
+    first: Final = await begin_turn(manager, None, "run probe", "key-a")
+    assert isinstance(first, PendingTurn)
+    first.finish(_tool_turn(call_id))
+
+    alias: Final = _openclaw_alias(call_id, f"fc_{call_id}")
+    second: Final = await begin_turn(
+        manager, "resp_1", [{"type": "function_call_output", "call_id": alias, "output": "ok"}], "key-a"
+    )
+
+    assert isinstance(second, PendingTurn)
+    assert alias != call_id
+    assert [item["call_id"] for item in second.turn_input] == [call_id]
+    assert second.upstream_input()[-1] == {"type": "function_call_output", "call_id": call_id, "output": "ok"}
+
+
+async def test_tool_outputs_that_already_match_or_name_no_held_call_are_left_alone():
+    manager: Final = SessionManager()
+    first: Final = await begin_turn(manager, None, "run probe", "key-a")
+    assert isinstance(first, PendingTurn)
+    first.finish(_tool_turn("toolu_A1234567890"))
+
+    exact: Final = ({"type": "function_call_output", "call_id": "toolu_A1234567890", "output": "ok"},)
+    unrelated: Final = ({"type": "function_call_output", "call_id": "call_somethingelse_0123456789", "output": "ok"},)
+    for turn_input in (exact, unrelated):
+        second = await begin_turn(manager, "resp_1", list(turn_input), "key-a")
+        assert isinstance(second, PendingTurn)
+        assert second.turn_input == turn_input
