@@ -75,8 +75,8 @@ def _message(role: str, text: str) -> str:
     return json.dumps({"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]})
 
 
-@pytest.fixture
-def store(_vectors_postgresql: psycopg.Connection) -> psycopg.Connection:
+@pytest.fixture(name="store")
+def store_fixture(_vectors_postgresql: psycopg.Connection) -> psycopg.Connection:
     conn: Final = _vectors_postgresql
     conn.autocommit = True
     conn.execute(_STORE_SQL)

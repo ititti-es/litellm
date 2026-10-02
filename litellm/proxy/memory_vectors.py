@@ -334,7 +334,7 @@ class IndexStats:
     chars: int
 
 
-_CONTENT: Final = TypeAdapter[dict[str, JsonValue] | None](dict[str, JsonValue] | None)
+ITEM_CONTENT: Final = TypeAdapter[dict[str, JsonValue] | None](dict[str, JsonValue] | None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,7 +375,7 @@ class _Occurrence:
 
 
 def _labeled(row: _UnlinkedItem) -> _LabeledItem:
-    parsed: Final = _CONTENT.validate_python(row.content)
+    parsed: Final = ITEM_CONTENT.validate_python(row.content)
     content: Final = MappingProxyType(parsed) if parsed is not None else None
     return _LabeledItem(
         session_id=row.session_id,
