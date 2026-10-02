@@ -35,6 +35,7 @@ from litellm.proxy._experimental.mcp_server.tool_search import (
 )
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.common_utils.semantic_text_index import EmbeddingFailed, SemanticTextIndex, Vector
+from litellm.proxy.memory_mcp_tools import MEMORY_TOOL_DEFINITIONS, MEMORY_TOOL_NAMES
 from litellm.types.mcp import MCPToolSearchSettings
 
 
@@ -1239,7 +1240,53 @@ class TestHandleListToolsVirtual:
             MCP_TOOL_CALL_TOOL_NAME,
             AGENT_SEARCH_TOOL_NAME,
             SKILL_SEARCH_TOOL_NAME,
+            *MEMORY_TOOL_NAMES,
         }
+
+    @pytest.mark.asyncio
+    async def test_memory_tools_ride_along_with_upstream_tools(self) -> None:
+        from litellm.proxy._experimental.mcp_server import server as srv
+
+        upstream = Tool(name="cua_soraka-click", description="click", inputSchema={"type": "object"})
+        uak = UserAPIKeyAuth(api_key="k")
+        with (
+            patch(
+                "litellm.proxy._experimental.mcp_server.server.get_or_extract_auth_context",
+                new_callable=AsyncMock,
+                return_value=(uak, None, None, None, None, None, None),
+            ),
+            patch(
+                "litellm.proxy._experimental.mcp_server.server._list_mcp_tools",
+                new_callable=AsyncMock,
+                return_value=AggregateToolListing(tools=[upstream], outcomes={}),
+            ),
+        ):
+            tools = await srv.handle_list_tools()
+
+        assert [t.name for t in tools] == ["cua_soraka-click", *(d["name"] for d in MEMORY_TOOL_DEFINITIONS)]
+
+    @pytest.mark.asyncio
+    async def test_memory_tool_calls_run_as_the_caller(self) -> None:
+        from mcp.types import CallToolResult, TextContent
+
+        from litellm.proxy._experimental.mcp_server import server as srv
+
+        uak = UserAPIKeyAuth(api_key="k", user_id="page")
+        answer = CallToolResult(content=[TextContent(type="text", text="recalled")])
+        with (
+            patch(
+                "litellm.proxy._experimental.mcp_server.server.get_or_extract_auth_context",
+                new_callable=AsyncMock,
+                return_value=(uak, None, None, None, None, None, None),
+            ),
+            patch(
+                "litellm.proxy.memory_mcp_tools.call_memory_tool", new_callable=AsyncMock, return_value=answer
+            ) as call,
+        ):
+            result = await srv.mcp_server_tool_call("memory_search", {"query": "tomatoes"})
+
+        assert result is answer
+        call.assert_awaited_once_with("memory_search", {"query": "tomatoes"}, uak)
 
 
 class TestMcpServerToolCallErrorHandling:

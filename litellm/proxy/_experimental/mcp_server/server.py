@@ -862,6 +862,7 @@ if MCP_AVAILABLE:
                 get_mcp_proxy_tool_definitions,
                 get_virtual_tool_definitions,
             )
+            from litellm.proxy.memory_mcp_tools import MEMORY_TOOL_DEFINITIONS
 
             if _mcp_proxy_mode.get():
                 return [Tool.model_validate(d) for d in get_mcp_proxy_tool_definitions()]  # mutable-ok: MCP SDK list
@@ -870,7 +871,7 @@ if MCP_AVAILABLE:
                 "mcp_tool_search_enabled",
                 False,
             ):
-                return [Tool.model_validate(d) for d in get_virtual_tool_definitions()]
+                return [Tool.model_validate(d) for d in (*get_virtual_tool_definitions(), *MEMORY_TOOL_DEFINITIONS)]
 
             # Get mcp_servers from context variable
             verbose_logger.debug("MCP list_tools - Calling _list_mcp_tools")
@@ -885,14 +886,19 @@ if MCP_AVAILABLE:
                 list_tools_log_source="mcp_protocol",
             )
             verbose_logger.info("MCP list_tools - Successfully returned %s tools", len(listing.tools))
+            # Built-in recall tools ride along with every authenticated listing (see memory_mcp_tools).
+            tools: Final = [  # mutable-ok: MCP SDK list
+                *listing.tools,
+                *(Tool.model_validate(d) for d in MEMORY_TOOL_DEFINITIONS if user_api_key_auth is not None),
+            ]
             if not listing.outcomes:
-                return listing.tools
+                return tools
             outcome_meta: Final = {
                 SERVER_OUTCOMES_META_KEY: {
                     key: outcome_wire_value(outcome) for key, outcome in listing.outcomes.items()
                 }
             }
-            return ListToolsResult.model_validate({"tools": listing.tools, "_meta": outcome_meta})
+            return ListToolsResult.model_validate({"tools": tools, "_meta": outcome_meta})
         except HTTPException as e:
             from mcp.shared.exceptions import McpError
             from mcp.types import INVALID_REQUEST, ErrorData
@@ -1016,6 +1022,7 @@ if MCP_AVAILABLE:
             handle_mcp_tool_search,
             handle_skill_search,
         )
+        from litellm.proxy.memory_mcp_tools import MEMORY_TOOL_NAMES, call_memory_tool
 
         if _mcp_proxy_mode.get() and name not in MCP_PROXY_TOOL_NAMES:
             return CallToolResult(
@@ -1088,6 +1095,9 @@ if MCP_AVAILABLE:
                     request_data=types.MappingProxyType({"name": name, "arguments": arguments}),
                 )
             return proxy_result
+
+        if name in MEMORY_TOOL_NAMES:
+            return await call_memory_tool(name, arguments or {}, user_api_key_auth)
 
         if name not in VIRTUAL_TOOL_NAMES:
             return None
