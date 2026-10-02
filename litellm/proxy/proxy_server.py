@@ -621,6 +621,7 @@ from litellm.proxy.management_helpers.team_metadata_validation import (
     parse_team_metadata_schema,
 )
 from litellm.proxy.memory.memory_endpoints import router as memory_router
+from litellm.proxy.memory_search_endpoints import router as memory_search_router
 from litellm.proxy.session_endpoints import router as session_endpoints_router
 from litellm.proxy.middleware.billable_request_metrics_middleware import (
     BillableRequestMetricsMiddleware,
@@ -19079,6 +19080,7 @@ app.include_router(tag_management_router)
 app.include_router(workflow_management_router)
 app.include_router(memory_router)
 app.include_router(session_endpoints_router)
+app.include_router(memory_search_router)
 app.include_router(plugin_router)
 app.include_router(cost_tracking_settings_router)
 app.include_router(router_settings_router)
