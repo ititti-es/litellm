@@ -142,6 +142,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         )
         self._web_search_calls: dict[str, object] = {}  # mutable-ok: latest call by provider id
         self._queued_web_search_call_ids: set[str] = set()  # mutable-ok: emitted call ids
+        # The base __init__ needs an httpx response this bridge does not have, so the state its
+        # completion hook reads (_notify_completed) is set here; without it on_completed raised AttributeError.
+        self._streamed_output_items: dict[int, object] = {}  # mutable-ok: output_item.done items by output_index
 
     def _get_or_assign_tool_output_index(self, call_id: str) -> int:
         existing: Final = self._tool_output_index_by_call_id.get(call_id)

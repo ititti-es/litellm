@@ -1131,3 +1131,19 @@ async def test_plain_text_stream_announces_exactly_one_message_item(sync_mode: b
             ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
         ):
             assert event.item_id == message_item_adds[0].item.id
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_completion_hook_receives_the_bridged_reply(sync_mode: bool):
+    """The session store's on_completed hook also runs on bridged streams (claude_cli, chat-only providers).
+    The bridge skips the base __init__, so the hook used to raise AttributeError on _streamed_output_items."""
+    iterator: Final = _build_iterator([_chunk("Hel"), _chunk("lo", finish_reason="stop")])
+    completed: Final[list[object]] = []
+    iterator.on_completed = completed.append
+
+    events: Final = await _collect_events(iterator, sync_mode)
+
+    assert getattr(events[-1], "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+    assert len(completed) == 1
+    assert completed[0].output
