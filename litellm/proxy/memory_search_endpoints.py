@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import TYPE_CHECKING, Annotated, Final
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TYPE_CHECKING, Annotated, Final, NamedTuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -50,6 +52,7 @@ class MemoryHit(TypedDict):
     session_id: ReadOnly[str]
     seq: ReadOnly[int]
     title: ReadOnly[str | None]
+    started: ReadOnly[str | None]
     source: ReadOnly[str | None]
     agent: ReadOnly[str | None]
     harness: ReadOnly[str | None]
@@ -95,12 +98,14 @@ def caller_scope(caller: UserAPIKeyAuth, request: MemorySearchRequest, master_ke
     return Scope(owner=caller.api_key, agent=request.agent, harness=request.harness)
 
 
-def _hit(hit: Hit) -> MemoryHit:
+def _hit(hit: Hit, started: Mapping[str, datetime]) -> MemoryHit:
+    began: Final = started.get(hit.session_id)
     found: Final[MemoryHit] = {
         "score": hit.score,
         "session_id": hit.session_id,
         "seq": hit.seq,
         "title": hit.title,
+        "started": began.isoformat() if began else None,
         "source": hit.source,
         "agent": hit.agent,
         "harness": hit.harness,
@@ -110,13 +115,26 @@ def _hit(hit: Hit) -> MemoryHit:
     return found
 
 
-def _run(database_url: str, api_key: str, query: str, scope: Scope, limit: int) -> tuple[Hit, ...]:
+class SearchOutcome(NamedTuple):
+    hits: tuple[Hit, ...]
+    started: Mapping[str, datetime]
+    """When each hit's session began"""
+
+
+_STARTED_SQL: Final = 'SELECT session_id, created_at FROM "LiteLLM_ConversationSession" WHERE session_id = ANY(%s)'
+
+
+def _run(database_url: str, api_key: str, query: str, scope: Scope, limit: int) -> SearchOutcome:
     import psycopg
 
     deepinfra: Final = DeepInfra(client=httpx.Client(timeout=60), api_key=api_key)
     conn: psycopg.Connection
     with deepinfra.client, psycopg.connect(psycopg_url(database_url), autocommit=True) as conn:
-        return search(conn, deepinfra.embed, deepinfra.rerank, query, scope=scope, limit=limit)
+        hits: Final = search(conn, deepinfra.embed, deepinfra.rerank, query, scope=scope, limit=limit)
+        rows: Final = conn.execute(
+            _STARTED_SQL, [list({hit.session_id for hit in hits})]
+        ).fetchall()  # mutable-ok: psycopg adapts only a list to an array
+    return SearchOutcome(hits, {row[0]: row[1] for row in rows})
 
 
 @router.post("/v1/memory/search", tags=["memory"])  # mutable-ok: FastAPI takes tags as a list
@@ -128,6 +146,9 @@ async def memory_search(
     if not database_url or not api_key:
         raise HTTPException(status_code=503, detail="Memory search needs DATABASE_URL and DEEPINFRA_API_KEY")
     scope: Final = caller_scope(user_api_key_dict, request, os.environ.get("MEMORY_MASTER_KEY_USER") or None)
-    hits: Final = await asyncio.to_thread(_run, database_url, api_key, request.query, scope, request.limit)
-    response: Final[MemorySearchResponse] = {"object": "list", "data": tuple(_hit(hit) for hit in hits)}
+    outcome: Final = await asyncio.to_thread(_run, database_url, api_key, request.query, scope, request.limit)
+    response: Final[MemorySearchResponse] = {
+        "object": "list",
+        "data": tuple(_hit(hit, outcome.started) for hit in outcome.hits),
+    }
     return response

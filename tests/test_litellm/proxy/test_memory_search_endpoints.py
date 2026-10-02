@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Final
 
 import pytest
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 from litellm.proxy import memory_search_endpoints
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.memory_search_endpoints import MemorySearchRequest, caller_scope
+from litellm.proxy.memory_search_endpoints import MemorySearchRequest, SearchOutcome, caller_scope
 from litellm.proxy.memory_vectors import Hit, Scope
 
 ADMIN: Final = UserAPIKeyAuth(api_key="litellm_proxy_master_key", user_role=LitellmUserRoles.PROXY_ADMIN)
@@ -56,9 +57,9 @@ def _client(caller: UserAPIKeyAuth) -> TestClient:
 def test_the_endpoint_searches_in_the_callers_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: Final[list[Scope]] = []  # mutable-ok: records the scope the endpoint searched with
 
-    def fake_run(database_url: str, api_key: str, query: str, scope: Scope, limit: int) -> tuple[Hit, ...]:
+    def fake_run(database_url: str, api_key: str, query: str, scope: Scope, limit: int) -> SearchOutcome:
         seen.append(scope)
-        return (
+        hits = (
             Hit(
                 score=0.9,
                 session_id="ses_1",
@@ -71,6 +72,7 @@ def test_the_endpoint_searches_in_the_callers_scope(monkeypatch: pytest.MonkeyPa
                 content="user: water the seedlings",
             ),
         )
+        return SearchOutcome(hits, {"ses_1": datetime(2026, 9, 3, 8, tzinfo=timezone.utc)})
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
     monkeypatch.setenv("DEEPINFRA_API_KEY", "unused")
@@ -83,6 +85,7 @@ def test_the_endpoint_searches_in_the_callers_scope(monkeypatch: pytest.MonkeyPa
         "session_id": "ses_1",
         "seq": 4,
         "title": "garden",
+        "started": "2026-09-03T08:00:00+00:00",
         "source": None,
         "agent": "sett",
         "harness": "openclaw",
