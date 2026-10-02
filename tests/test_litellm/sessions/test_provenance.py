@@ -14,7 +14,9 @@ def test_known_clients_are_named_and_others_keep_their_product_token() -> None:
     assert harness_of("opencode/latest/2.0.12/cli") == "opencode"
     assert harness_of("claude-cli/2.1.0 (external, cli)") == "claude_code"
     assert harness_of("codex_cli_rs/0.40.0") == "codex"
-    assert harness_of("Python-urllib/3.14") == "python-urllib"
+    assert harness_of("LangGraph/0.4 (python)") == "langgraph"
+    assert harness_of("Python-urllib/3.14") is None
+    assert harness_of("OpenAI/JS 7.15.0") is None
     assert harness_of("") is None
     assert harness_of(None) is None
 

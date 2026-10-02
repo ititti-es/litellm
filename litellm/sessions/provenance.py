@@ -28,6 +28,20 @@ _KNOWN_HARNESSES: Final = (
     ("claude-code", "claude_code"),
     ("codex", "codex"),
 )
+_GENERIC_CLIENTS: Final = frozenset(
+    (
+        "openai",
+        "python-urllib",
+        "python-httpx",
+        "python-requests",
+        "undici",
+        "node-fetch",
+        "axios",
+        "curl",
+        "go-http-client",
+    )
+)
+"""HTTP libraries and SDKs, which say nothing about the harness using them; the key or a header names it instead"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +69,8 @@ def harness_of(user_agent: object) -> str | None:
         return None
     lowered: Final = user_agent.lower()
     known: Final = next((name for marker, name in _KNOWN_HARNESSES if lowered.startswith(marker)), None)
-    return known or _label(user_agent.split("/", 1)[0])
+    product: Final = _label(user_agent.split("/", 1)[0])
+    return known or (product if product not in _GENERIC_CLIENTS else None)
 
 
 def _mapping(value: object) -> Mapping[str, object]:
