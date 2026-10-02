@@ -2,7 +2,7 @@ from typing import Final
 
 import pytest
 
-from litellm.sessions.session import Item, comparable, search_text
+from litellm.sessions.session import SEARCH_TEXT_LIMIT, Item, comparable, search_text
 
 
 def _forms(items):
@@ -159,3 +159,9 @@ def test_search_text_keeps_only_text_from_mixed_message_parts() -> None:
 )
 def test_search_text_indexes_message_text_tool_arguments_and_tool_results(item: Item, expected: str) -> None:
     assert search_text(item) == expected
+
+
+def test_search_text_is_capped_so_a_huge_output_still_indexes():
+    huge: Item = {"type": "function_call_output", "call_id": "c", "output": "word " * SEARCH_TEXT_LIMIT}
+    text = search_text(huge)
+    assert text is not None and len(text) == SEARCH_TEXT_LIMIT

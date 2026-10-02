@@ -181,3 +181,28 @@ def test_the_v2_store_format_is_read_with_types_from_their_column(tmp_path):
     assert session.items[2].meta["provenance"]["provider_response_id"] == "resp_up"
     assert session.parent_source_id == "ses_root" and session.metadata["format"] == "v2"
     assert session.turn_ends == (7,) and session.skipped == 1
+
+
+def test_v2_inline_attachments_become_data_urls_and_unusable_ones_text(tmp_path):
+    _v2_db(
+        tmp_path / "v2.db",
+        [
+            (
+                "user",
+                {
+                    "text": "look",
+                    "files": [
+                        {"data": "/9j/AA", "mime": "image/jpeg", "source": {"type": "inline"}},
+                        {"mime": "image/png", "source": {"type": "inline"}},
+                        {"data": "JVBE", "mime": "application/pdf", "name": "a.pdf"},
+                    ],
+                },
+            ),
+        ],
+    )
+    (session,) = read_opencode(tmp_path / "v2.db")
+    assert session.items[0].item["content"][1:] == [
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,/9j/AA"},
+        {"type": "input_text", "text": "[file: inline (image/png)]"},
+        {"type": "input_text", "text": "[file: a.pdf (application/pdf)]"},
+    ]
