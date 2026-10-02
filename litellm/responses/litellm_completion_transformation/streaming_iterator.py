@@ -73,6 +73,18 @@ def _output_items_with_id(items: tuple[Any, ...], item_type: str, item_id: str |
     )
 
 
+def _field(value: object, name: str) -> object:
+    return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
+def _is_empty_message(item: object) -> bool:
+    """A message output item without any text, as the chat transform adds beside tool calls"""
+    if _field(item, "type") != "message":
+        return False
+    parts: Final = _field(item, "content")
+    return not any(_field(part, "text") for part in parts or ()) if isinstance(parts, (list, tuple)) else not parts
+
+
 class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
     """
     Async iterator for processing streaming responses from the Responses API.
@@ -1070,7 +1082,12 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         return self._pending_response_events.pop(0)
 
                 except StopAsyncIteration:
-                    return self.common_done_event_logic(sync_mode=False)
+                    done: Final = self.common_done_event_logic(sync_mode=False)
+                    # Inherited settles_completion=True makes the caller hand the session store's hook in as
+                    # on_completed_async; _notify_completed only parks the turn, so store it here, before the
+                    # client can continue from this response id.
+                    await self._settle_completion()
+                    return done
 
         except Exception as e:
             # Handle HTTP errors
@@ -1260,7 +1277,13 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             "reasoning",
             self._cached_reasoning_item_id,
         )
-        return reasoning_aligned
+        kept: Final = tuple(item for item in reasoning_aligned if not _is_empty_message(item))
+        if self.sent_message_item_added_event or not kept:
+            return reasoning_aligned
+        # Clients check the snapshot against the items they were streamed (OpenClaw fails the turn with
+        # "Responses stream omitted an output item"), and a tool-only reply streamed no message item.
+        # A reply with nothing else keeps its empty message, which carries the incomplete status.
+        return kept
 
     def _emit_response_completed_event(self, litellm_model_response: ModelResponse) -> ResponseCompletedEvent | None:
         if litellm_model_response:

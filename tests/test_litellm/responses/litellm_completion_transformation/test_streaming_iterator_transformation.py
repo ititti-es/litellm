@@ -1147,3 +1147,38 @@ async def test_completion_hook_receives_the_bridged_reply(sync_mode: bool):
     assert getattr(events[-1], "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
     assert len(completed) == 1
     assert completed[0].output
+
+
+@pytest.mark.asyncio
+async def test_session_hook_settles_before_the_completed_event_goes_out():
+    """Wired as liminal's aresponses wires it: settles_completion makes it on_completed_async (finish_durably).
+    The bridge parked the turn and never stored it, so a follow-up previous_response_id got a 404."""
+    iterator: Final = _build_iterator([_chunk("Hel"), _chunk("lo", finish_reason="stop")])
+    assert iterator.settles_completion
+    seen: Final[list[str]] = []
+
+    async def store(response) -> None:
+        seen.append(f"stored {response.id}")
+
+    iterator.on_completed_async = store
+    async for event in iterator:
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
+            seen.append(f"completed {event.response.id}")
+
+    response_id: Final = seen[-1].split(" ", 1)[1]
+    assert seen == [f"stored {response_id}", f"completed {response_id}"]
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_tool_only_snapshot_carries_only_streamed_items(sync_mode: bool):
+    iterator: Final = _build_iterator([_tool_call_chunk(), _chunk("", finish_reason="tool_calls")])
+
+    events: Final = await _collect_events(iterator, sync_mode)
+
+    streamed: Final = [
+        event.item.id for event in events if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+    ]
+    completed: Final = events[-1].response
+    assert [item.type for item in completed.output] == ["function_call"]
+    assert [item.id for item in completed.output] == streamed
