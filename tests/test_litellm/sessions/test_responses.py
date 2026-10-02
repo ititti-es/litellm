@@ -532,3 +532,21 @@ async def test_interleaved_conversations_under_one_client_session_id_are_each_st
     rows = [s for s in manager._sessions.values() if s.client_session_id == "ses_parent"]
     assert len(rows) == 2
     assert [len(s.items) for s in rows] == [6, 6]  # the mock reuses one response id, so count items
+
+
+async def test_a_turn_begun_with_provenance_commits_it():
+    from litellm.sessions import SessionManager
+    from litellm.sessions.provenance import Provenance
+    from litellm.sessions.responses import begin_turn
+
+    manager = SessionManager()
+    pending = await begin_turn(
+        manager,
+        None,
+        "hello",
+        "key-a",
+        "thread-1",
+        Provenance(agent="sett", harness="openclaw"),
+    )
+    assert pending is not None and not isinstance(pending, Forbidden)
+    assert pending.provenance == Provenance(agent="sett", harness="openclaw")

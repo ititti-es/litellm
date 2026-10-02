@@ -27,6 +27,7 @@ from litellm.sessions.compaction import CallUpstream, CompactionReply, compact, 
 from litellm.sessions.compaction_policy import CompactionPolicy, policy_from
 from litellm.sessions.compaction_presets import DEFAULT, PRESETS
 from litellm.sessions.compaction_thresholds import ThresholdOverrides, Thresholds, layered, worth_compacting
+from litellm.sessions.provenance import provenance_from_stored, stored_fields
 from litellm.sessions.responses import MANAGED_BY_CALLER
 
 if TYPE_CHECKING:
@@ -89,11 +90,7 @@ class PrismaTranscriptStore:
                 ),
                 response_id=response_id,
                 item_count=session.responses[response_id],
-                metadata=(
-                    jsonb_text(MappingProxyType({"litellm_session_id": session.client_session_id}))
-                    if session.client_session_id is not None
-                    else None
-                ),
+                metadata=_session_metadata(session),
             )
         )
 
@@ -136,8 +133,19 @@ def _session_from(stored: StoredSession) -> Session | None:
         last_upstream_at=stored.last_upstream_at.timestamp(),
         annotations=annotations,
         client_session_id=_client_session_id(getattr(stored, "metadata", None)),
+        provenance=provenance_from_stored(_decoded(getattr(stored, "metadata", None))),
         superseded=superseded,
     )
+
+
+def _session_metadata(session: Session) -> str | None:
+    fields: Final = MappingProxyType(
+        {
+            **({"litellm_session_id": session.client_session_id} if session.client_session_id is not None else {}),
+            **stored_fields(session.provenance),
+        }
+    )
+    return jsonb_text(fields) if fields else None
 
 
 def _client_session_id(metadata: object) -> str | None:

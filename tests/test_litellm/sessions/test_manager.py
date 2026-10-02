@@ -458,3 +458,45 @@ async def test_continuing_a_superseded_version_forks_and_leaves_the_live_session
     assert forked.items == (*live.items, CALL_OUTPUT, ASSISTANT)
     assert store.saved[-1] == (forked.id, 0, "r2")
     assert manager._sessions[live.id].version == 1
+
+
+def test_provenance_is_kept_across_turns_and_updated_by_what_a_turn_says():
+    from litellm.sessions.provenance import Provenance
+
+    manager = SessionManager()
+    manager.commit(
+        owner="key-a",
+        prior=None,
+        turn_input=(USER,),
+        output=(ASSISTANT,),
+        response_id="r1",
+        now=1.0,
+        provenance=Provenance(agent="sett", harness="openclaw"),
+    )
+    second_prior = manager.resolve("r1", "key-a")
+    assert isinstance(second_prior, Resolved)
+    second = manager.commit(
+        owner="key-a", prior=second_prior, turn_input=(NEXT,), output=(ASSISTANT,), response_id="r2", now=2.0
+    )
+    assert second.provenance == Provenance(agent="sett", harness="openclaw")
+
+    third_prior = manager.resolve("r2", "key-a")
+    assert isinstance(third_prior, Resolved)
+    third = manager.commit(
+        owner="key-a",
+        prior=third_prior,
+        turn_input=(NEXT,),
+        output=(ASSISTANT,),
+        response_id="r3",
+        now=3.0,
+        provenance=Provenance(harness="opencode"),
+    )
+    assert third.provenance == Provenance(agent="sett", harness="opencode")
+
+    fork_prior = manager.resolve("r1", "key-a")
+    assert isinstance(fork_prior, Resolved)
+    fork = manager.commit(
+        owner="key-a", prior=fork_prior, turn_input=(NEXT,), output=(ASSISTANT,), response_id="r4", now=4.0
+    )
+    assert fork.id != third.id
+    assert fork.provenance == Provenance(agent="sett", harness="opencode")

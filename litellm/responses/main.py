@@ -71,6 +71,7 @@ else:
 from litellm.sessions import Forbidden
 from litellm.sessions.compaction import replay_params
 from litellm.sessions.manager import ReplayBase
+from litellm.sessions.provenance import provenance_of
 from litellm.sessions.responses import (
     MANAGED_BY_CALLER,
     PendingTurn,
@@ -888,6 +889,7 @@ async def _begin_session_turn(
         turn_input,
         owner if isinstance(owner, str) else "",
         client_session_id_of(kwargs.get("litellm_session_id"), metadata),
+        provenance_of(kwargs.get("litellm_metadata")),
     )
 
 

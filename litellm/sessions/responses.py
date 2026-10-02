@@ -14,6 +14,7 @@ from litellm._logging import verbose_logger
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.sessions.compaction import turn_usage
 from litellm.sessions.manager import Continuation, Forbidden, ReplayBase, Resolved, SessionManager
+from litellm.sessions.provenance import Provenance
 from litellm.sessions.session import Item
 
 if TYPE_CHECKING:
@@ -95,6 +96,7 @@ class PendingTurn:
     replay: ReplayBase | None = None
     client_session_id: str | None = None
     compactable: bool = True
+    provenance: Provenance | None = None
 
     @property
     def cache_key(self) -> str:
@@ -124,6 +126,7 @@ class PendingTurn:
             replay=self.replay,
             client_session_id=self.client_session_id,
             compactable=self.compactable,
+            provenance=self.provenance,
         )
 
     async def finish_durably(self, response: ResponsesAPIResponse, timeout: float = PERSIST_TIMEOUT_SECONDS) -> None:
@@ -153,16 +156,17 @@ async def begin_turn(
     turn_input: object,
     owner: str,
     client_session_id: str | None = None,
+    provenance: Provenance | None = None,
 ) -> PendingTurn | Forbidden | None:
     """None leaves the request to the existing continuation paths: the id predates the manager or was evicted"""
     items: Final = input_items(turn_input)
     started_at: Final = time.time()
     client: Final = client_session_id or None
     if not previous_response_id and client is None:
-        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at)
+        return PendingTurn(manager, owner, None, items, uuid.uuid4().hex, started_at, provenance=provenance)
     if not previous_response_id:
         continuation: Final = await manager.continue_client_session(owner, client or "", items)
-        return _continuing(manager, owner, client, continuation, started_at)
+        return replace(_continuing(manager, owner, client, continuation, started_at), provenance=provenance)
     resolution: Final = await manager.resolve_async(provider_response_id(previous_response_id), owner)
     if isinstance(resolution, Resolved):
         manager.begin(resolution.session.id, started_at)
@@ -174,6 +178,7 @@ async def begin_turn(
             resolution.session.id,
             started_at,
             client_session_id=client or resolution.session.client_session_id,
+            provenance=provenance,
         )
     return resolution if isinstance(resolution, Forbidden) else None
 

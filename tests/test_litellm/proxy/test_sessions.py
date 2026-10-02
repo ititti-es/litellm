@@ -366,3 +366,33 @@ def test_a_reload_can_change_record_store_false_without_dropping_held_sessions()
     reloaded = configured_session_manager({"enabled": True, "record_store_false": True}, live)
 
     assert reloaded is live and live.record_store_false is True
+
+
+async def test_the_agent_and_harness_are_stored_beside_the_session_id_and_read_back():
+    import json
+    from types import MappingProxyType
+
+    from litellm.proxy.sessions import PrismaTranscriptStore
+    from litellm.sessions import Session
+    from litellm.sessions.provenance import Provenance
+
+    repository = FakeRepository()
+    session = Session(
+        id="s1",
+        owner="k",
+        items=({"role": "user", "content": "a"},),
+        outputs=frozenset(),
+        responses=MappingProxyType({"r1": 1}),
+        version=0,
+        last_upstream_at=0.0,
+        client_session_id="ses_client_9",
+        provenance=Provenance(agent="sett", harness="openclaw"),
+    )
+    await PrismaTranscriptStore(repository, retention=None).save(session, first_new=0, response_id="r1")
+    (write,) = repository.writes
+    assert json.loads(write.metadata) == {"litellm_session_id": "ses_client_9", "agent": "sett", "harness": "openclaw"}
+
+    stored = _stored([0])
+    with_metadata = stored.__class__(**{**_fields(stored), "metadata": write.metadata})
+    loaded = await PrismaTranscriptStore(FakeRepository(with_metadata), None).load("r1")
+    assert loaded is not None and loaded.provenance == Provenance(agent="sett", harness="openclaw")

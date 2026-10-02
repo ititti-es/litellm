@@ -11,6 +11,7 @@ from typing import Final, Protocol, TypeAlias
 
 from litellm._logging import verbose_logger
 from litellm.sessions.cache_clock import CacheClock, CacheEstimate, retention_hint
+from litellm.sessions.provenance import Provenance
 from litellm.sessions.session import Item, Meta, Session, comparable
 
 
@@ -298,9 +299,10 @@ class SessionManager:
         replay: ReplayBase | None = None,
         client_session_id: str | None = None,
         compactable: bool = True,
+        provenance: Provenance | None = None,
     ) -> Session:
         session: Final = self._next_session(
-            owner, prior, turn_input, output, response_id, now, new_session_id, client_session_id
+            owner, prior, turn_input, output, response_id, now, new_session_id, client_session_id, provenance
         )
         held: Final = self._sessions.get(session.id)
         first_new: Final = len(held.items) if held is not None and held.version == session.version else 0
@@ -444,6 +446,7 @@ class SessionManager:
             last_upstream_at=now,
             annotations=_rebased_annotations(live.annotations, job.tail_start, head, summary_at, summary_meta),
             client_session_id=live.client_session_id,
+            provenance=live.provenance,
         )
         self._hold(compacted)
         record: Final = self._turns.get(live.id)
@@ -538,6 +541,7 @@ class SessionManager:
         now: float,
         new_session_id: str | None,
         client_session_id: str | None,
+        provenance: Provenance | None = None,
     ) -> Session:
         if prior is None:
             # Two first turns under one client session id both resolve to its derived key while neither has
@@ -556,8 +560,10 @@ class SessionManager:
                 response_id,
                 now,
                 client_session_id=client_session_id,
+                provenance=provenance,
             )
         base: Final = self._sessions.get(prior.session.id, prior.session)
+        carried: Final = provenance.over(base.provenance) if provenance is not None else base.provenance
         end: Final = prior.session.responses[prior.response_id]
         if end == len(base.items) and not base.superseded:
             return _built(
@@ -573,6 +579,7 @@ class SessionManager:
                 now,
                 base.annotations,
                 client_session_id or base.client_session_id,
+                provenance=carried,
             )
         self._forks += 1
         return _built(
@@ -588,6 +595,7 @@ class SessionManager:
             now,
             MappingProxyType({index: meta for index, meta in base.annotations.items() if index < end}),
             client_session_id or base.client_session_id,
+            provenance=carried,
         )
 
     def _evict_over_budget(self, keep: str) -> None:
@@ -663,6 +671,8 @@ def _built(
     now: float,
     annotations: Mapping[int, Meta] | None = None,
     client_session_id: str | None = None,
+    *,
+    provenance: Provenance | None = None,
 ) -> Session:
     new_items: Final = (*items, *turn_input, *output)
     first_output: Final = len(items) + len(turn_input)
@@ -676,6 +686,7 @@ def _built(
         last_upstream_at=now,
         annotations=annotations if annotations is not None else MappingProxyType({}),
         client_session_id=client_session_id,
+        provenance=provenance,
     )
 
 

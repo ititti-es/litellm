@@ -40,6 +40,7 @@ from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequest
 from litellm.sessions import Forbidden, Item, Resolution, Resolved, SessionManager
 from litellm.sessions.compaction import replay_params, turn_usage
 from litellm.sessions.manager import ReplayBase
+from litellm.sessions.provenance import provenance_of
 from litellm.sessions.responses import (
     MANAGED_BY_CALLER,
     affinity_key,
@@ -2641,6 +2642,7 @@ class ManagedResponsesWebSocketHandler:
             usage=turn_usage(resp_obj.get("usage")) if _is_json_object(resp_obj) else None,
             replay=replay,
             client_session_id=client_session_id,
+            provenance=provenance_of(self.litellm_metadata),
         )
 
     def _deployment_id(self) -> str | None:
