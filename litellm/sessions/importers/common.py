@@ -194,3 +194,21 @@ def _no_copy() -> Generator[str]:
 
 def loads(raw: object) -> JsonValue:
     return json.loads(raw) if isinstance(raw, str | bytes) else None
+
+
+def with_tool_outputs_capped(session: ImportedSession, limit: int) -> ImportedSession:
+    """The session with every tool output longer than `limit` characters cut to its head and a note saying so
+
+    An imported session has no upstream state to continue from, so every turn replays it whole, and one page dump
+    can outweigh the rest of the conversation. A harness that continued upstream never had to resend those
+    outputs; a continued import does, so it keeps their opening and says how much was left out.
+    """
+    return replace(session, items=tuple(_capped(item, limit) for item in session.items))
+
+
+def _capped(imported: ImportedItem, limit: int) -> ImportedItem:
+    output: Final = imported.item.get("output")
+    if imported.item.get("type") != "function_call_output" or not isinstance(output, str) or len(output) <= limit:
+        return imported
+    note: Final = f"\n[import: output cut to its first {limit} of {len(output)} characters]"
+    return replace(imported, item={**imported.item, "output": output[:limit] + note})

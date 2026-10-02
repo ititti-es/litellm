@@ -1,7 +1,7 @@
 """Import harness sessions into the session manager's transcript store
 
     python -m litellm.proxy.session_import opencode [--source ~/.local/share/opencode/opencode.db] [--owner-key sk-...]
-        [--from-last-compaction]
+        [--from-last-compaction] [--max-tool-output CHARS]
     python -m litellm.proxy.session_import openclaw [--source ~/.openclaw] [--owner-key sk-...]
     python -m litellm.proxy.session_import claude-code [--source ~/.claude/projects] [--owner-key sk-...]
     python -m litellm.proxy.session_import pin|unpin SESSION_ID
@@ -36,7 +36,7 @@ from litellm.repositories.conversation_session_repository import (
     jsonb_text,
 )
 from litellm.sessions.importers.claude_code import DEFAULT_PROJECTS_DIR, read_claude_code
-from litellm.sessions.importers.common import ImportedSession, from_last_compaction
+from litellm.sessions.importers.common import ImportedSession, from_last_compaction, with_tool_outputs_capped
 from litellm.sessions.importers.openclaw import read_openclaw
 from litellm.sessions.importers.opencode import read_opencode
 from litellm.sessions.session import canonical
@@ -202,7 +202,9 @@ async def _main(args: argparse.Namespace) -> int:
         scratch: Final = Path(args.scratch_dir).expanduser() if args.scratch_dir else None
         sessions: Final = reader(source, scratch)
         continued: Final = map(from_last_compaction, sessions) if args.from_last_compaction else sessions
-        for line in await run_import(continued, owner, repository, write=not dry_run):
+        limit: Final = args.max_tool_output
+        capped: Final = (with_tool_outputs_capped(session, limit) for session in continued) if limit else continued
+        for line in await run_import(capped, owner, repository, write=not dry_run):
             sys.stdout.write(line + "\n")
         return 0
 
@@ -222,6 +224,12 @@ def _parser() -> argparse.ArgumentParser:
             "--from-last-compaction",
             action="store_true",
             help="store each session from its latest compaction on, as its harness last sent it (for continuing)",
+        )
+        sub.add_argument(
+            "--max-tool-output",
+            type=int,
+            metavar="CHARS",
+            help="cut longer tool outputs to their head, so a continued session fits the model's context",
         )
         sub.add_argument(
             "--scratch-dir", help="read a private copy made here instead of the live file (read-only either way)"

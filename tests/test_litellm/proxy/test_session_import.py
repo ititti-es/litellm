@@ -10,7 +10,12 @@ from litellm.repositories.conversation_session_repository import (
     ImportWrite,
     StoredTranscript,
 )
-from litellm.sessions.importers.common import ImportedItem, ImportedSession, from_last_compaction
+from litellm.sessions.importers.common import (
+    ImportedItem,
+    ImportedSession,
+    from_last_compaction,
+    with_tool_outputs_capped,
+)
 
 
 def _session(*texts):
@@ -169,3 +174,17 @@ def test_a_continued_session_starts_at_its_last_compaction_and_keeps_response_id
 def test_a_session_without_a_compaction_is_left_whole():
     session = _session("a", "b")
     assert from_last_compaction(session) is session
+
+
+def test_capping_cuts_only_long_tool_outputs_and_says_so():
+    session = _session("a")
+    long_output = ImportedItem({"type": "function_call_output", "call_id": "c", "output": "x" * 50}, False, {})
+    short_output = ImportedItem({"type": "function_call_output", "call_id": "d", "output": "ok"}, False, {})
+    capped = with_tool_outputs_capped(
+        ImportedSession(
+            **{**{f: getattr(session, f) for f in session.__slots__}, "items": (long_output, short_output)}
+        ),
+        10,
+    )
+    assert capped.items[0].item["output"] == "x" * 10 + "\n[import: output cut to its first 10 of 50 characters]"
+    assert capped.items[0].item["call_id"] == "c" and capped.items[1] is short_output
