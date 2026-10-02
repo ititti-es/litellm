@@ -43,6 +43,7 @@ from litellm.proxy.memory_vectors import (
     embedding_batches,
     index_pass,
     labeled_text,
+    psycopg_url,
     text_digest,
 )
 
@@ -399,7 +400,7 @@ def _connect(args: _Args) -> psycopg.Connection:
     url: Final = args.database_url or os.environ.get("DATABASE_URL")
     if not url:
         raise SystemExit("DATABASE_URL (or --database-url) is required")
-    return psycopg.connect(url, autocommit=True)
+    return psycopg.connect(psycopg_url(url), autocommit=True)
 
 
 def main() -> int:

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from itertools import groupby, islice
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, Protocol, TypedDict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from psycopg.rows import class_row
@@ -366,6 +367,17 @@ class DeepInfra:
         return scores
 
 
+_PRISMA_ONLY_PARAMS: Final = frozenset(("connection_limit", "pool_timeout", "schema", "pgbouncer", "socket_timeout"))
+
+
+def psycopg_url(url: str) -> str:
+    """DATABASE_URL without the query parameters Prisma adds (the proxy appends connection_limit and pool_timeout),
+    which libpq rejects"""
+    parts: Final = urlsplit(url)
+    kept: Final = tuple((key, value) for key, value in parse_qsl(parts.query) if key not in _PRISMA_ONLY_PARAMS)
+    return urlunsplit(parts._replace(query=urlencode(kept)))
+
+
 def query_text(query: str) -> str:
     return f"Instruct: {QUERY_INSTRUCTION}\nQuery:{query}"
 
@@ -583,7 +595,7 @@ def _connect(args: _Args) -> psycopg.Connection:
     url: Final = args.database_url or os.environ.get("DATABASE_URL")
     if not url:
         raise SystemExit("DATABASE_URL (or --database-url) is required")
-    return psycopg.connect(url, autocommit=True)
+    return psycopg.connect(psycopg_url(url), autocommit=True)
 
 
 def _deepinfra() -> DeepInfra:

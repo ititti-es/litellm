@@ -24,7 +24,7 @@ from typing_extensions import ReadOnly, TypedDict
 
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.memory_vectors import DeepInfra, Hit, Scope, search
+from litellm.proxy.memory_vectors import DeepInfra, Hit, Scope, psycopg_url, search
 
 if TYPE_CHECKING:
     import psycopg
@@ -115,7 +115,7 @@ def _run(database_url: str, api_key: str, query: str, scope: Scope, limit: int) 
 
     deepinfra: Final = DeepInfra(client=httpx.Client(timeout=60), api_key=api_key)
     conn: psycopg.Connection
-    with deepinfra.client, psycopg.connect(database_url, autocommit=True) as conn:
+    with deepinfra.client, psycopg.connect(psycopg_url(database_url), autocommit=True) as conn:
         return search(conn, deepinfra.embed, deepinfra.rerank, query, scope=scope, limit=limit)
 
 

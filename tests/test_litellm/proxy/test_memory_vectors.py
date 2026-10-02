@@ -25,6 +25,7 @@ from litellm.proxy.memory_vectors import (
     embedding_batches,
     index_pass,
     labeled_text,
+    psycopg_url,
     reciprocal_rank_fusion,
     search,
 )
@@ -302,3 +303,9 @@ def test_a_session_that_recorded_nothing_takes_its_labels_from_the_key(store: ps
     assert _sessions_found(store, query, Scope(agent="dba")) == {"ses_db"}
     assert _sessions_found(store, query, Scope(harness="claude_code")) == frozenset()
     assert _sessions_found(store, query, Scope(harness="opencode")) == {"ses_db"}
+
+
+def test_prisma_pool_parameters_are_dropped_and_the_rest_kept() -> None:
+    url: Final = "postgresql://u:p@localhost:5433/db?connection_limit=11&sslmode=disable&pool_timeout=60"
+    assert psycopg_url(url) == "postgresql://u:p@localhost:5433/db?sslmode=disable"
+    assert psycopg_url("postgresql://u@h/db") == "postgresql://u@h/db"
