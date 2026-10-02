@@ -3,7 +3,8 @@ litellm/sessions/MEMORY_DESIGN.md plans, next to the tsvector-only memory_search
 
     python -m litellm.proxy.memory_vectors init-schema
     python -m litellm.proxy.memory_vectors index [--dry-run] [--max-chars N]
-    python -m litellm.proxy.memory_vectors search "<query>" [--owner-key sk-...] [--limit N]
+    python -m litellm.proxy.memory_vectors search "<query>" [--user ID] [--team ID] [--agent NAME] [--harness NAME]
+        [--owner-key sk-...] [--limit N]
 
 Every item's searchable text (litellm/sessions/session.py:search_text) is labeled with who said it, split into
 overlapping chunks and embedded once per distinct text: a session's versions and opencode retries copy the same
@@ -120,11 +121,25 @@ VALUES (%s, %s, %s, %s)
 ON CONFLICT (session_id, version, seq) DO NOTHING
 """
 
-_OWNER_FILTER: Final = """
-(%(owner)s::text IS NULL OR EXISTS (
+MASTER_KEY_OWNER: Final = "litellm_proxy_master_key"
+"""The owner the store records for turns made with the proxy master key, which has no key row or user of its own"""
+
+_SESSION_IN_SCOPE: Final = """
+    (%(owner)s::text IS NULL OR s.owner = %(owner)s)
+    AND (%(user)s::text IS NULL OR COALESCE(
+        v.user_id, CASE WHEN s.owner = 'litellm_proxy_master_key' THEN %(master_key_user)s::text END
+    ) = %(user)s)
+    AND (%(team)s::text IS NULL OR v.team_id = %(team)s)
+    AND (%(agent)s::text IS NULL OR s.metadata->>'agent' = %(agent)s)
+    AND (%(harness)s::text IS NULL OR COALESCE(s.metadata->>'harness', s.source) = %(harness)s)
+"""
+
+_OWNER_FILTER: Final = f"""
+(%(unscoped)s OR EXISTS (
     SELECT 1 FROM "LiteLLM_ConversationItemText" t
     JOIN "LiteLLM_ConversationSession" s ON s.session_id = t.session_id
-    WHERE t.text_sha = c.text_sha AND s.owner = %(owner)s
+    LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.owner
+    WHERE t.text_sha = c.text_sha AND {_SESSION_IN_SCOPE}
 ))
 """
 
@@ -145,13 +160,45 @@ ORDER BY ts_rank(to_tsvector('english', c.content), websearch_to_tsquery('englis
 LIMIT %(limit)s
 """
 
-_OCCURRENCE_SQL: Final = """
-SELECT DISTINCT ON (t.text_sha) t.text_sha, t.session_id, t.seq, s.title, s.source
+_OCCURRENCE_SQL: Final = f"""
+SELECT DISTINCT ON (t.text_sha) t.text_sha, t.session_id, t.seq, s.title, s.source,
+       s.metadata->>'agent' AS agent, COALESCE(s.metadata->>'harness', s.source) AS harness
 FROM "LiteLLM_ConversationItemText" t
 JOIN "LiteLLM_ConversationSession" s ON s.session_id = t.session_id
-WHERE t.text_sha = ANY(%(shas)s) AND (%(owner)s::text IS NULL OR s.owner = %(owner)s)
+LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.owner
+WHERE t.text_sha = ANY(%(shas)s) AND {_SESSION_IN_SCOPE}
 ORDER BY t.text_sha, (t.version = s.version) DESC, s.updated_at DESC, t.seq
 """
+
+
+@dataclass(frozen=True, slots=True)
+class Scope:
+    """Which sessions a search may return; every field left None is unrestricted"""
+
+    owner: str | None = None
+    user: str | None = None
+    team: str | None = None
+    agent: str | None = None
+    harness: str | None = None
+    master_key_user: str | None = None
+    """The human the master key's sessions count as, since that key has no user of its own"""
+
+    def params(self) -> Mapping[str, object]:
+        restricting: Final = (self.owner, self.user, self.team, self.agent, self.harness)
+        return MappingProxyType(
+            {
+                "owner": self.owner,
+                "user": self.user,
+                "team": self.team,
+                "agent": self.agent,
+                "harness": self.harness,
+                "master_key_user": self.master_key_user,
+                "unscoped": all(value is None for value in restricting),
+            }
+        )
+
+
+EVERYTHING: Final = Scope()
 
 
 def labeled_text(item: Item) -> str | None:
@@ -372,6 +419,8 @@ class _Occurrence:
     seq: int
     title: str | None
     source: str | None
+    agent: str | None
+    harness: str | None
 
 
 def _labeled(row: _UnlinkedItem) -> _LabeledItem:
@@ -444,14 +493,16 @@ class Hit:
     seq: int
     title: str | None
     source: str | None
+    agent: str | None
+    harness: str | None
     chunk_no: int
     content: str
 
 
 def _legs(
-    conn: psycopg.Connection, query: str, vector: Sequence[float], owner: str | None
+    conn: psycopg.Connection, query: str, vector: Sequence[float], scope: Scope
 ) -> tuple[tuple[_ChunkRow, ...], tuple[_ChunkRow, ...]]:
-    params: Final = MappingProxyType({"model": EMBEDDING_MODEL, "owner": owner, "limit": LEG_LIMIT, "query": query})
+    params: Final = MappingProxyType({**scope.params(), "model": EMBEDDING_MODEL, "limit": LEG_LIMIT, "query": query})
     with conn.transaction(), conn.cursor(row_factory=class_row(_ChunkRow)) as cursor:
         _ = cursor.execute("SET LOCAL hnsw.ef_search = 200")
         _ = cursor.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
@@ -462,19 +513,19 @@ def _legs(
     return by_vector, by_text
 
 
-def _occurrences(conn: psycopg.Connection, shas: Sequence[bytes], owner: str | None) -> Mapping[bytes, _Occurrence]:
+def _occurrences(conn: psycopg.Connection, shas: Sequence[bytes], scope: Scope) -> Mapping[bytes, _Occurrence]:
     with conn.cursor(row_factory=class_row(_Occurrence)) as cursor:
         rows: Final = cursor.execute(
             _OCCURRENCE_SQL,
-            {"shas": list(shas), "owner": owner},  # mutable-ok: psycopg adapts only a list to a Postgres array
+            {**scope.params(), "shas": list(shas)},  # mutable-ok: psycopg adapts only a list to a Postgres array
         ).fetchall()
     return MappingProxyType({row.text_sha: row for row in rows})
 
 
 def search(
-    conn: psycopg.Connection, embed: Embedder, rerank: Reranker, query: str, *, owner: str | None, limit: int
+    conn: psycopg.Connection, embed: Embedder, rerank: Reranker, query: str, *, scope: Scope, limit: int
 ) -> tuple[Hit, ...]:
-    legs: Final = _legs(conn, query, embed((query_text(query),))[0], owner)
+    legs: Final = _legs(conn, query, embed((query_text(query),))[0], scope)
     contents: Final = MappingProxyType({(row.text_sha, row.chunk_no): row.content for leg in legs for row in leg})
     fused: Final = reciprocal_rank_fusion(tuple(tuple((row.text_sha, row.chunk_no) for row in leg) for leg in legs))
     candidates: Final = fused[:RERANK_CANDIDATES]
@@ -484,7 +535,7 @@ def search(
     by_text: Final = sorted(zip(scores, candidates, strict=True), key=lambda pair: (pair[1][0], -pair[0]))
     best_per_text: Final = tuple(next(group) for _, group in groupby(by_text, key=lambda pair: pair[1][0]))
     top: Final = tuple(islice(sorted(best_per_text, key=lambda pair: pair[0], reverse=True), limit))
-    occurrences: Final = _occurrences(conn, tuple(sha for _, (sha, _) in top), owner)
+    occurrences: Final = _occurrences(conn, tuple(sha for _, (sha, _) in top), scope)
     return tuple(
         Hit(
             score=score,
@@ -492,6 +543,8 @@ def search(
             seq=occurrences[sha].seq,
             title=occurrences[sha].title,
             source=occurrences[sha].source,
+            agent=occurrences[sha].agent,
+            harness=occurrences[sha].harness,
             chunk_no=number,
             content=contents[(sha, number)],
         )
@@ -515,6 +568,11 @@ class _Args(BaseModel):
     max_chars: int | None = None
     query: str = ""
     owner_key: str | None = None
+    user: str | None = None
+    team: str | None = None
+    agent: str | None = None
+    harness: str | None = None
+    master_key_user: str | None = None
     limit: int = 10
 
 
@@ -565,8 +623,15 @@ def _run_index(conn: psycopg.Connection, args: _Args) -> int:
 
 def _run_search(conn: psycopg.Connection, args: _Args) -> int:
     deepinfra: Final = _deepinfra()
-    owner: Final = hash_token(args.owner_key) if args.owner_key else None
-    hits: Final = search(conn, deepinfra.embed, deepinfra.rerank, args.query, owner=owner, limit=args.limit)
+    scope: Final = Scope(
+        owner=hash_token(args.owner_key) if args.owner_key else None,
+        user=args.user,
+        team=args.team,
+        agent=args.agent,
+        harness=args.harness,
+        master_key_user=args.master_key_user or os.environ.get("MEMORY_MASTER_KEY_USER"),
+    )
+    hits: Final = search(conn, deepinfra.embed, deepinfra.rerank, args.query, scope=scope, limit=args.limit)
     if not hits:
         sys.stdout.write("no matches\n")
         return 1
@@ -587,6 +652,13 @@ def _parser() -> argparse.ArgumentParser:
     search_command: Final = commands.add_parser("search", help="hybrid vector and full-text search, reranked")
     _ = search_command.add_argument("query")
     _ = search_command.add_argument("--owner-key", help="restrict to sessions owned by this virtual key")
+    _ = search_command.add_argument("--user", help="restrict to sessions whose key belongs to this user id")
+    _ = search_command.add_argument("--team", help="restrict to sessions whose key belongs to this team id")
+    _ = search_command.add_argument("--agent", help="restrict to sessions recorded with this agent")
+    _ = search_command.add_argument("--harness", help="restrict to sessions recorded with this harness")
+    _ = search_command.add_argument(
+        "--master-key-user", help="user the master key's sessions count as (default $MEMORY_MASTER_KEY_USER)"
+    )
     _ = search_command.add_argument("--limit", type=int, default=10)
     return parser
 

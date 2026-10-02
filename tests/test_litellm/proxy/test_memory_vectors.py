@@ -15,9 +15,12 @@ from litellm.proxy.memory_vectors import (
     DIMENSIONS,
     EMBED_BATCH_CHARS,
     EMBED_BATCH_SIZE,
+    EVERYTHING,
+    MASTER_KEY_OWNER,
     RETRY_ATTEMPTS,
     SCHEMA_SQL,
     DeepInfra,
+    Scope,
     chunk,
     embedding_batches,
     index_pass,
@@ -32,8 +35,10 @@ _vectors_postgresql: Final = factories.postgresql("_vectors_postgresql_proc")
 _STORE_SQL: Final = """
 CREATE TABLE "LiteLLM_ConversationSession" (
     session_id TEXT PRIMARY KEY, owner TEXT NOT NULL, version INTEGER NOT NULL,
-    title TEXT, source TEXT, updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+    title TEXT, source TEXT, metadata JSONB, updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE "LiteLLM_VerificationToken" (token TEXT PRIMARY KEY, user_id TEXT, team_id TEXT);
+INSERT INTO "LiteLLM_VerificationToken" VALUES ('alice', 'u_alice', 't_garden'), ('bob', 'u_bob', NULL);
 CREATE TABLE "LiteLLM_ConversationItem" (
     session_id TEXT NOT NULL REFERENCES "LiteLLM_ConversationSession" ON DELETE CASCADE,
     version INTEGER NOT NULL, seq INTEGER NOT NULL, content JSONB NOT NULL,
@@ -82,8 +87,9 @@ def store_fixture(_vectors_postgresql: psycopg.Connection) -> psycopg.Connection
     conn.execute(_STORE_SQL)
     conn.execute(SCHEMA_SQL)
     conn.execute(
-        """INSERT INTO "LiteLLM_ConversationSession" (session_id, owner, version, title) VALUES
-           ('ses_garden', 'alice', 1, 'garden'), ('ses_db', 'bob', 0, 'database')"""
+        """INSERT INTO "LiteLLM_ConversationSession" (session_id, owner, version, title, source, metadata) VALUES
+           ('ses_garden', 'alice', 1, 'garden', NULL, '{"agent": "sett", "harness": "openclaw"}'),
+           ('ses_db', 'bob', 0, 'database', 'opencode', NULL)"""
     )
     tomato: Final = _message("user", "my tomato seedlings are wilting in the greenhouse")
     rows: Final = (
@@ -192,19 +198,19 @@ def test_dry_run_and_char_budget_embed_nothing(store: psycopg.Connection) -> Non
 
 def test_search_finds_the_session_and_respects_the_owner(store: psycopg.Connection) -> None:
     index_pass(store, _Embedder(), dry_run=False, max_chars=None)
-    hits: Final = search(store, _Embedder(), _overlap_rerank, "greenhouse vents", owner=None, limit=5)
+    hits: Final = search(store, _Embedder(), _overlap_rerank, "greenhouse vents", scope=EVERYTHING, limit=5)
     assert hits[0].session_id == "ses_garden"
     assert "vents" in hits[0].content
     assert hits[0].seq == 2
     assert all(
         hit.session_id == "ses_db"
-        for hit in search(store, _Embedder(), _overlap_rerank, "greenhouse", owner="bob", limit=5)
+        for hit in search(store, _Embedder(), _overlap_rerank, "greenhouse", scope=Scope(owner="bob"), limit=5)
     )
 
 
 def test_search_returns_a_text_shared_by_two_versions_once(store: psycopg.Connection) -> None:
     index_pass(store, _Embedder(), dry_run=False, max_chars=None)
-    hits: Final = search(store, _Embedder(), _overlap_rerank, "tomato wilting", owner=None, limit=5)
+    hits: Final = search(store, _Embedder(), _overlap_rerank, "tomato wilting", scope=EVERYTHING, limit=5)
     tomato: Final = next(hit for hit in hits if "tomato" in hit.content)
     assert (tomato.session_id, tomato.seq) == ("ses_garden", 0)
     assert sum(1 for hit in hits if "tomato" in hit.content) == 1
@@ -246,3 +252,44 @@ def test_rerank_gives_up_after_the_last_attempt_and_never_retries_a_client_error
     with pytest.raises(httpx.HTTPStatusError):
         _ = rejected.rerank("query", ("document",))
     assert rejected_waits.seconds == ()
+
+
+def _sessions_found(store: psycopg.Connection, query: str, scope: Scope) -> frozenset[str]:
+    return frozenset(
+        hit.session_id for hit in search(store, _Embedder(), _overlap_rerank, query, scope=scope, limit=10)
+    )
+
+
+def test_search_filters_by_the_keys_user_and_team(store: psycopg.Connection) -> None:
+    _ = index_pass(store, _Embedder(), dry_run=False, max_chars=None)
+    query: Final = "greenhouse postgres tomato vacuum"
+    assert _sessions_found(store, query, EVERYTHING) == {"ses_garden", "ses_db"}
+    assert _sessions_found(store, query, Scope(user="u_alice")) == {"ses_garden"}
+    assert _sessions_found(store, query, Scope(user="u_bob")) == {"ses_db"}
+    assert _sessions_found(store, query, Scope(team="t_garden")) == {"ses_garden"}
+    assert _sessions_found(store, query, Scope(user="u_nobody")) == frozenset()
+
+
+def test_search_filters_by_agent_and_harness_with_the_source_as_the_older_harness(store: psycopg.Connection) -> None:
+    _ = index_pass(store, _Embedder(), dry_run=False, max_chars=None)
+    query: Final = "greenhouse postgres tomato vacuum"
+    assert _sessions_found(store, query, Scope(agent="sett")) == {"ses_garden"}
+    assert _sessions_found(store, query, Scope(harness="openclaw")) == {"ses_garden"}
+    assert _sessions_found(store, query, Scope(harness="opencode")) == {"ses_db"}
+    assert _sessions_found(store, query, Scope(agent="sett", harness="opencode")) == frozenset()
+    hits: Final = search(store, _Embedder(), _overlap_rerank, "greenhouse vents", scope=EVERYTHING, limit=1)
+    assert (hits[0].agent, hits[0].harness) == ("sett", "openclaw")
+
+
+def test_master_key_sessions_count_as_the_configured_user(store: psycopg.Connection) -> None:
+    _ = store.execute(
+        """INSERT INTO "LiteLLM_ConversationSession" (session_id, owner, version) VALUES ('ses_admin', %s, 0)""",
+        (MASTER_KEY_OWNER,),
+    )
+    _ = store.execute(
+        """INSERT INTO "LiteLLM_ConversationItem" (session_id, version, seq, content) VALUES ('ses_admin', 0, 0, %s)""",
+        (_message("user", "rotate the master key tonight"),),
+    )
+    _ = index_pass(store, _Embedder(), dry_run=False, max_chars=None)
+    assert "ses_admin" not in _sessions_found(store, "rotate master key", Scope(user="u_alice"))
+    assert "ses_admin" in _sessions_found(store, "rotate master key", Scope(user="u_alice", master_key_user="u_alice"))
