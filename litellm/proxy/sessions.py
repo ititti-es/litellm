@@ -105,6 +105,9 @@ class PrismaTranscriptStore:
         stored: Final = await self._repository.load_session(session_id)
         return _session_from(stored) if stored is not None else None
 
+    async def client_sessions(self, owner: str, client_session_id: str, limit: int) -> tuple[str, ...]:
+        return await self._repository.client_session_ids(owner, client_session_id, limit)
+
 
 def _session_from(stored: StoredSession) -> Session | None:
     """None unless the stored rows form the complete transcript, so a partial write never resumes a conversation"""

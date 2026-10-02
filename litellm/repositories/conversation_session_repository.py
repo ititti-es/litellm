@@ -133,8 +133,18 @@ class _ConversationDb(Protocol):
 
     def batch_(self) -> _ConversationBatch: ...
 
+    async def query_raw(self, query: str, *args: object) -> list[dict[str, object]]: ...  # mutable-ok: Prisma's rows
+
 
 _ITEM: Final = TypeAdapter(dict[str, JsonValue])
+
+# Rows recorded under a client's own session id, which PrismaTranscriptStore.save writes into the row's metadata
+_CLIENT_SESSIONS_SQL: Final = """
+SELECT session_id FROM "LiteLLM_ConversationSession"
+WHERE owner = $1 AND metadata->>'litellm_session_id' = $2
+ORDER BY updated_at DESC
+LIMIT $3::int
+"""
 
 
 class TranscriptConflict(Exception):
@@ -266,6 +276,11 @@ class ConversationSessionRepository:
             where={"session_id": session_id}  # mutable-ok: Prisma where filter must be a dict
         )
         return await self._transcript(session) if session is not None else None
+
+    async def client_session_ids(self, owner: str, client_session_id: str, limit: int) -> tuple[str, ...]:
+        """Sessions recorded under a client's own session id for this owner, most recently updated first"""
+        rows: Final = await self._db.query_raw(_CLIENT_SESSIONS_SQL, owner, client_session_id, limit)
+        return tuple(session_id for row in rows if isinstance(session_id := row.get("session_id"), str))
 
     async def load_session_history(self, session_id: str) -> StoredSession | None:
         """A session with the items of every stored version, oldest first

@@ -312,6 +312,7 @@ class BaseResponsesAPIStreamingIterator:
         self._completed_response_cache_hit: bool | None = None
         self._persist_completed_response_before_logging = True
         self._stream_created_time: float = time.time()
+        self._streamed_output_items: dict[int, object] = {}  # mutable-ok: output_item.done items by output_index
 
         # track request context for hooks
         self.litellm_metadata = litellm_metadata
@@ -464,6 +465,9 @@ class BaseResponsesAPIStreamingIterator:
                                         )
                                     )
                                     setattr(item, "encrypted_content", wrapped_content)
+
+                if _event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE:
+                    self._record_streamed_output_item(openai_responses_api_chunk)
 
                 # Store the completed response (also for incomplete/failed so logging still fires)
                 _chunk_type: Final = getattr(openai_responses_api_chunk, "type", None)
@@ -661,8 +665,16 @@ class BaseResponsesAPIStreamingIterator:
             is_pre_first_chunk=not self._yielded_first_chunk,
         )
 
+    def _record_streamed_output_item(self, chunk: object) -> None:
+        """Keep a finished output item as the client saw it, in case the completed event leaves it out"""
+        item: Final = getattr(chunk, "item", None)
+        if item is None:
+            return
+        index: Final = getattr(chunk, "output_index", None)
+        self._streamed_output_items[index if isinstance(index, int) else len(self._streamed_output_items)] = item
+
     def _notify_completed(self) -> None:
-        completed: Final = self._get_completed_response_object()
+        completed: Final = _with_streamed_output(self._get_completed_response_object(), self._streamed_output_items)
         if completed is None:
             return
         if self.on_completed_async is not None and self.settles_completion:
@@ -1402,6 +1414,23 @@ def _billed_terminal_response(
     return ResponsesAPIResponse.model_construct(
         **{**response_obj, "usage": usage if usage is not None or estimate is None else estimate()}  # pyright: ignore[reportUnknownArgumentType, reportArgumentType]  # same untyped dict spread
     )
+
+
+def _with_streamed_output(
+    completed: ResponsesAPIResponse | None, streamed: Mapping[int, object]
+) -> ResponsesAPIResponse | None:
+    """The completed response with the output its stream carried, when its completed event carries none
+
+    ChatGPT's Codex backend ends a `store: false` stream with `response.completed` holding `output: []`; the
+    items arrive only as `response.output_item.done` events. The non-streamed path already rebuilds the output
+    from them (`ChatGPTResponsesAPIConfig._build_completed_response_from_chunk`); without the same here, the
+    session store recorded such a turn's input and none of its reply. Only completion hooks see this copy.
+    """
+    if completed is None or not streamed:
+        return completed
+    if completed.output:  # pyright: ignore[reportUnknownMemberType]  # output items are a loosely typed union
+        return completed
+    return completed.model_copy(update={"output": [item for _, item in sorted(streamed.items())]})
 
 
 def _dump_json_safely(response: BaseModel) -> str | None:

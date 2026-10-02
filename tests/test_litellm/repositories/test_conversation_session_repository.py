@@ -154,6 +154,19 @@ class Database:
         self.batches += 1
         return Batch(self)
 
+    async def query_raw(self, query: str, *args: object) -> list[dict[str, object]]:
+        """Only the client-session lookup reads raw SQL; answer it from the session table"""
+        owner, client_session_id, limit = args
+        assert "ORDER BY updated_at DESC" in query
+        rows = [
+            row
+            for row in self.litellm_conversationsession.rows
+            if row.owner == owner
+            and row.metadata is not None
+            and json.loads(row.metadata).get("litellm_session_id") == client_session_id
+        ]
+        return [{"session_id": row.session_id} for row in reversed(rows)][: int(limit)]
+
 
 @dataclass(frozen=True, slots=True)
 class Client:
@@ -418,3 +431,19 @@ async def test_import_plans_append_or_version_rewritten_history_without_stealing
     assert tuple(json.loads(content) for content in current.contents) == (second.item,)
     assert len(db.litellm_conversationitem.rows) == 3
     assert db.litellm_conversationsession.rows[0].pinned
+
+
+async def test_client_session_ids_finds_every_row_a_client_id_was_recorded_on_for_its_owner_only() -> None:
+    db: Final = Database()
+    named: Final = jsonb_text({"litellm_session_id": "ses_parent"})
+    db.litellm_conversationsession.rows = (
+        Row(session_id="cs_first", metadata=named),
+        Row(session_id="other-owner", owner="owner-other", metadata=named),
+        Row(session_id="unnamed"),
+        Row(session_id="subagent", metadata=named),
+    )
+    repository: Final = ConversationSessionRepository(Client(db))
+
+    assert await repository.client_session_ids("owner-test", "ses_parent", 8) == ("subagent", "cs_first")
+    assert await repository.client_session_ids("owner-test", "ses_parent", 1) == ("subagent",)
+    assert await repository.client_session_ids("owner-test", "ses_other", 8) == ()

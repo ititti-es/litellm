@@ -216,3 +216,64 @@ async def test_the_completed_event_is_held_until_the_async_completion_hook_finis
 
     assert order == ["stored", "response.completed"]
     assert sync_calls == []
+
+
+def _item_fields(item, *keys):
+    raw = item if isinstance(item, dict) else item.model_dump(exclude_none=True)
+    return tuple(raw.get(key) for key in keys)
+
+
+async def test_a_completed_event_without_output_hands_the_hook_the_streamed_items():
+    """ChatGPT's Codex backend ends `store: false` streams with `output: []`; the session store must still see the reply."""
+    import json
+
+    from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+
+    iterator = ResponsesAPIStreamingIterator(
+        response=httpx.Response(200),
+        model="gpt-5.4-nano",
+        responses_api_provider_config=OpenAIResponsesAPIConfig(),
+        logging_obj=_make_logging_obj(),
+    )
+    received: list = []
+    iterator.on_completed = received.append
+    call = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "ls", "arguments": "{}", "status": "completed"}
+    text = {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "looking", "annotations": []}],
+    }
+    iterator._process_chunk(json.dumps({"type": "response.output_item.done", "output_index": 1, "item": call}))
+    iterator._process_chunk(json.dumps({"type": "response.output_item.done", "output_index": 0, "item": text}))
+    terminal = iterator._process_chunk(
+        json.dumps({"type": "response.completed", "response": {"id": "resp_x", "created_at": 0, "status": "completed", "output": []}})
+    )
+
+    assert len(received) == 1
+    assert [_item_fields(item, "type", "call_id") for item in received[0].output] == [("message", None), ("function_call", "c1")]
+    assert terminal.response.output == []
+
+
+async def test_a_completed_event_with_output_is_handed_on_as_it_is():
+    import json
+
+    from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+
+    iterator = ResponsesAPIStreamingIterator(
+        response=httpx.Response(200),
+        model="gpt-5.4-nano",
+        responses_api_provider_config=OpenAIResponsesAPIConfig(),
+        logging_obj=_make_logging_obj(),
+    )
+    received: list = []
+    iterator.on_completed = received.append
+    streamed = {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "content": []}
+    final = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]
+    iterator._process_chunk(json.dumps({"type": "response.output_item.done", "output_index": 0, "item": streamed}))
+    iterator._process_chunk(
+        json.dumps({"type": "response.completed", "response": {"id": "resp_x", "created_at": 0, "status": "completed", "output": final}})
+    )
+
+    assert [r.output for r in received] == [final]

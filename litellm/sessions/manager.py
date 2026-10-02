@@ -129,6 +129,10 @@ class TranscriptStore(Protocol):
         """The conversation stored under this id, for a client that names its session rather than its turn"""
         ...
 
+    async def client_sessions(self, owner: str, client_session_id: str, limit: int) -> tuple[str, ...]:
+        """Ids of the conversations recorded under a client's session id for this owner, most recent first"""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingWrite:
@@ -141,6 +145,8 @@ class _PendingWrite:
 
 # Write outcomes kept for `persisted`; a turn nobody waits on (a websocket or sync stream) ages out
 _SETTLED_KEPT: Final = 1024
+# Conversations under one client session id looked up in the store when none held in memory is continued
+_CLIENT_ROWS_LOADED: Final = 8
 
 
 class SessionManager:
@@ -167,6 +173,8 @@ class SessionManager:
         self._sessions: Final[OrderedDict[str, Session]] = OrderedDict()  # mutable-ok: LRU order of held sessions
         self._sizes: Final[dict[str, int]] = {}  # mutable-ok: byte size per held session, kept beside the LRU
         self._by_response: Final[dict[str, str]] = {}  # mutable-ok: response id to session id index
+        # mutable-ok: held session ids per client_session_key, insertion-ordered; see continue_client_session
+        self._by_client: Final[dict[str, dict[str, None]]] = {}
         self._commits = 0
         self._forks = 0
         self._evictions = 0
@@ -211,30 +219,58 @@ class SessionManager:
         when what arrived actually extends what is stored: the gateway replays its own copy of the history,
         and a caller can only ever extend a transcript it can already reproduce. Anything else starts a
         conversation of its own rather than overwriting one.
+
+        One client session id can carry several conversations at once: opencode sends its subagents' and its
+        title requests under the parent session's id. Each is kept in a row of its own and every row recorded
+        under the id is a candidate, so a turn extends the conversation it belongs to however the streams
+        interleave, and each conversation is stored once. Comparing against one row only made a stream that
+        lost that row fork a full copy of its history on every later turn.
         """
         key: Final = client_session_key(owner, client_session_id)
-        stored: Final = await self._client_session(key)
-        if stored is None:
-            return Continuation(key, None, tuple(items))
-        continued: Final = _continues(stored, items)
-        if continued is None or stored.owner != owner:
-            return Continuation(uuid.uuid4().hex, None, tuple(items))
-        response_id, tail = continued
-        return Continuation(stored.id, Resolved(stored, response_id), tuple(items)[tail:])
+        held: Final = self._client_rows(key, owner)
+        found = _best_continuation(held, items)  # rebind-ok: held rows first, then the store's
+        # The derived key goes to the first conversation under the id only; a later one must not land on it
+        claimed = bool(held) or key in self._sessions  # rebind-ok: widened by what the store holds
+        if found is None and self._store is not None:
+            loaded, any_stored = await self._load_client_rows(key, owner, client_session_id, held)
+            found = _best_continuation(loaded, items)
+            claimed = claimed or any_stored
+        if found is not None:
+            session, response_id, tail = found
+            self._sessions.move_to_end(session.id)
+            return Continuation(session.id, Resolved(session, response_id), tuple(items)[tail:])
+        return Continuation(uuid.uuid4().hex if claimed else key, None, tuple(items))
 
-    async def _client_session(self, session_id: str) -> Session | None:
-        held: Final = self._sessions.get(session_id)
-        if held is not None:
-            self._sessions.move_to_end(session_id)
-            return held
-        if self._store is None:
-            return None
-        loaded: Final = await self._store.load_session(session_id)
-        if loaded is None:
-            return None
-        self._hold(loaded)
-        self._rehydrations += 1
-        return loaded
+    def _client_rows(self, key: str, owner: str) -> tuple[Session, ...]:
+        """Held conversations recorded under one client session id"""
+        return tuple(
+            session
+            for session_id in self._by_client.get(key, {})
+            if (session := self._sessions.get(session_id)) is not None and session.owner == owner
+        )
+
+    async def _load_client_rows(
+        self, key: str, owner: str, client_session_id: str, held: Sequence[Session]
+    ) -> tuple[tuple[Session, ...], bool]:
+        """Rehydrate the stored conversations under a client session id that are not held
+
+        Also whether the store has any conversation under the id at all; the row at the derived key always
+        carries the client's id, so an empty answer means the key is free.
+        """
+        assert self._store is not None
+        recent: Final = await self._store.client_sessions(owner, client_session_id, _CLIENT_ROWS_LOADED)
+        skip: Final = frozenset(session.id for session in held)
+        loaded: list[Session] = []  # mutable-ok: collected in the order the store ranked them
+        for session_id in dict.fromkeys((key, *recent)):
+            if session_id in skip:
+                continue
+            session = await self._store.load_session(session_id)  # rebind-ok: one row per iteration
+            if session is None or session.owner != owner or session.superseded:
+                continue
+            self._hold(session)
+            self._rehydrations += 1
+            loaded.append(session)
+        return tuple(loaded), bool(recent) or bool(loaded)
 
     def resolve(self, response_id: str, owner: str) -> Resolution:
         session_id: Final = self._by_response.get(response_id)
@@ -443,6 +479,10 @@ class SessionManager:
         self._sizes[session.id] = session.size()
         for response_id in session.responses:
             self._by_response[response_id] = session.id
+        if session.client_session_id is not None and not session.superseded:
+            self._by_client.setdefault(client_session_key(session.owner, session.client_session_id), {})[session.id] = (
+                None
+            )
         self._evict_over_budget(keep=session.id)
 
     def _persist(self, write: _PendingWrite) -> None:
@@ -500,8 +540,12 @@ class SessionManager:
         client_session_id: str | None,
     ) -> Session:
         if prior is None:
+            # Two first turns under one client session id both resolve to its derived key while neither has
+            # finished; the one that commits second must not overwrite the first, so it takes an id of its own
             return _built(
-                new_session_id or uuid.uuid4().hex,
+                new_session_id
+                if new_session_id is not None and new_session_id not in self._sessions
+                else uuid.uuid4().hex,
                 owner,
                 (),
                 frozenset(),
@@ -562,25 +606,48 @@ class SessionManager:
         for response_id in session.responses:
             if self._by_response.get(response_id) == session_id:
                 del self._by_response[response_id]
+        if session.client_session_id is not None:
+            key: Final = client_session_key(session.owner, session.client_session_id)
+            rows: Final = self._by_client.get(key)
+            if rows is not None:
+                rows.pop(session_id, None)
+                if not rows:
+                    del self._by_client[key]
 
 
-def _continues(session: Session, items: Sequence[Item]) -> tuple[str, int] | None:
-    """The response this input continues from and where its new items start, or None if it is another story"""
-    latest: Final = _latest_response(session)
-    if latest is None:
-        return None
-    response_id, end = latest
-    stored: Final = tuple(form for _, form in comparable(session.items[:end]))
+def _best_continuation(sessions: Sequence[Session], items: Sequence[Item]) -> tuple[Session, str, int] | None:
+    """The stored turn this input continues and where its new items start, from whichever session it extends most
+
+    Extending a session's last turn appends to it; extending an earlier one (a retry or an edit) forks from there.
+    """
+    best: tuple[Session, str, int] | None = None  # rebind-ok: the longest match so far
+    best_rank = (-1, False)  # rebind-ok: (items reproduced, whether that is the whole session)
+    for session in sessions:
+        continued = _continues(session, items)  # rebind-ok: one session per iteration
+        if continued is None:
+            continue
+        response_id, tail, end = continued
+        rank = (end, end == len(session.items))  # rebind-ok: one session per iteration
+        if rank > best_rank:
+            best, best_rank = (session, response_id, tail), rank
+    return best
+
+
+def _continues(session: Session, items: Sequence[Item]) -> tuple[str, int, int] | None:
+    """The latest stored turn this input extends, where its new items start and where that turn ends
+
+    None if it is another story, or a resend of a stored turn with nothing new.
+    """
+    stored: Final = comparable(session.items)
     arrived: Final = comparable(items)
-    if len(arrived) <= len(stored) or tuple(form for _, form in arrived[: len(stored)]) != stored:
-        return None
-    return response_id, arrived[len(stored)][0]
-
-
-def _latest_response(session: Session) -> tuple[str, int] | None:
-    """The turn that ends the stored history; a session mid-fork has none that covers all of it"""
-    complete: Final = tuple(rid for rid, end in session.responses.items() if end == len(session.items))
-    return (complete[0], len(session.items)) if complete else None
+    for response_id, end in sorted(session.responses.items(), key=lambda response: -response[1]):
+        forms = tuple(form for index, form in stored if index < end)  # rebind-ok: one stored turn per iteration
+        if len(arrived) < len(forms) or tuple(form for _, form in arrived[: len(forms)]) != forms:
+            continue
+        if len(arrived) == len(forms):
+            return None
+        return response_id, arrived[len(forms)][0], end
+    return None
 
 
 def _built(

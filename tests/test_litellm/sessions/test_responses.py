@@ -445,6 +445,9 @@ class _RecordingStore:
     async def load_session(self, session_id):
         return None
 
+    async def client_sessions(self, owner, client_session_id, limit):
+        return ()
+
 
 async def test_a_reply_is_handed_back_only_once_its_turn_is_stored(manager):
     store = _RecordingStore()
@@ -500,3 +503,32 @@ async def test_a_store_false_client_is_never_refused_for_an_id_it_owns(manager, 
     )
 
     assert upstream_inputs[-1] == "two"
+
+
+# --- one client session id, several conversations: each stored once ---------------------------------------
+
+
+async def test_interleaved_conversations_under_one_client_session_id_are_each_stored_once(manager):
+    """opencode sends its subagents' turns under the parent's session id, each resending its own whole history."""
+    manager.record_store_false = True
+    histories: dict[str, list] = {"main": [], "subagent": []}
+
+    async def turn(stream: str, text: str):
+        histories[stream].append({"type": "message", "role": "user", "content": f"{stream}: {text}"})
+        await litellm.aresponses(
+            model="openai/gpt-4.1",
+            input=list(histories[stream]),
+            store=False,
+            mock_response=f"{stream} reply to {text}",
+            litellm_metadata={"user_api_key_hash": "key-a"},
+            litellm_session_id="ses_parent",
+        )
+        histories[stream].append({"type": "message", "role": "assistant", "content": f"{stream} reply to {text}"})
+
+    for text in ("one", "two", "three"):
+        await turn("main", text)
+        await turn("subagent", text)
+
+    rows = [s for s in manager._sessions.values() if s.client_session_id == "ses_parent"]
+    assert len(rows) == 2
+    assert [len(s.items) for s in rows] == [6, 6]  # the mock reuses one response id, so count items

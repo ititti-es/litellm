@@ -134,7 +134,14 @@ class MemoryStore:
         return self.sessions.get(response_id)
 
     async def load_session(self, session_id):
-        return next((s for s in self.sessions.values() if s.id == session_id), None)
+        saved = [s for s in self.sessions.values() if s.id == session_id]
+        return saved[-1] if saved else None
+
+    async def client_sessions(self, owner, client_session_id, limit):
+        ids = dict.fromkeys(
+            s.id for s in self.sessions.values() if s.owner == owner and s.client_session_id == client_session_id
+        )
+        return tuple(reversed(ids))[:limit]
 
 
 async def test_durable_commits_write_only_the_new_items_in_order():
@@ -262,6 +269,130 @@ async def test_a_named_session_is_found_again_after_a_restart():
     assert continuation.session_id == first.id
     assert continuation.prior is not None and continuation.turn_input == (NEXT,)
     assert restarted.stats().rehydrations == 1
+
+
+# --- several conversations under one client session id ----------------------------------------------------
+
+
+def _user(text: str):
+    return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
+def _reply(text: str):
+    return {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+
+
+async def _begin(manager: SessionManager, history: tuple, text: str, session: str = "thread-1"):
+    sent = (*history, _user(text))
+    return sent, await manager.continue_client_session("key-a", session, sent)
+
+
+def _finish(manager: SessionManager, continuation, text: str, response_id: str, session: str = "thread-1"):
+    return manager.commit(
+        owner="key-a",
+        prior=continuation.prior,
+        turn_input=continuation.turn_input,
+        output=(_reply(text),),
+        response_id=response_id,
+        now=1.0,
+        new_session_id=continuation.session_id,
+        client_session_id=session,
+    )
+
+
+async def _client_turn(manager: SessionManager, history: tuple, text: str, response_id: str) -> tuple:
+    """One turn of a client that resends its whole history; the history it will send next"""
+    sent, continuation = await _begin(manager, history, text)
+    _finish(manager, continuation, text, response_id)
+    return (*sent, _reply(text))
+
+
+def _rows(manager: SessionManager, session: str = "thread-1"):
+    return sorted((s for s in manager._sessions.values() if s.client_session_id == session), key=lambda s: s.id)
+
+
+async def test_interleaved_conversations_under_one_client_id_are_each_stored_once():
+    manager = SessionManager()
+    main: tuple = ()
+    subagent: tuple = ()
+    for turn in range(4):
+        main = await _client_turn(manager, main, f"main {turn}", f"m{turn}")
+        subagent = await _client_turn(manager, subagent, f"subagent {turn}", f"s{turn}")
+
+    rows = _rows(manager)
+    assert len(rows) == 2
+    assert sorted(len(row.items) for row in rows) == [8, 8]
+    assert sum(len(row.items) for row in rows) == len(main) + len(subagent)
+    assert manager.stats().forks == 0
+
+
+async def test_two_first_turns_in_flight_never_overwrite_each_other():
+    """A title request and the conversation's first turn both find the derived key free; both must be kept."""
+    manager = SessionManager()
+    title_sent, title = await _begin(manager, (), "name this")
+    main_sent, main = await _begin(manager, (), "hello")
+    assert title.session_id == main.session_id == client_session_key("key-a", "thread-1")
+
+    _finish(manager, main, "hello", "m0")
+    _finish(manager, title, "name this", "t0")
+
+    rows = _rows(manager)
+    assert len(rows) == 2
+    assert sorted(len(row.items) for row in rows) == [2, 2]
+    main_row = manager.resolve("m0", "key-a")
+    assert isinstance(main_row, Resolved) and main_row.session.items == (*main_sent, _reply("hello"))
+
+    after, continuation = await _begin(manager, (*main_sent, _reply("hello")), "and then")
+    assert continuation.session_id == main_row.session.id
+    assert continuation.turn_input == (_user("and then"),)
+
+
+async def test_a_conversation_keeps_its_own_row_once_another_has_the_key():
+    """The cascade seen in production: once the key held another stream, every turn forked a full copy."""
+    manager = SessionManager()
+    await _client_turn(manager, (), "name this", "t0")
+    main: tuple = ()
+    for turn in range(5):
+        main = await _client_turn(manager, main, f"main {turn}", f"m{turn}")
+
+    rows = _rows(manager)
+    assert len(rows) == 2
+    assert sorted(len(row.items) for row in rows) == [2, 10]
+
+
+async def test_every_conversation_is_found_again_after_a_restart():
+    store = MemoryStore()
+    manager = SessionManager()
+    manager.attach_store(store)
+    main = await _client_turn(manager, (), "main 0", "m0")
+    subagent = await _client_turn(manager, (), "subagent 0", "s0")
+    main = await _client_turn(manager, main, "main 1", "m1")
+    await manager.flush()
+
+    restarted = SessionManager()
+    restarted.attach_store(store)
+    main = await _client_turn(restarted, main, "main 2", "m2")
+    subagent = await _client_turn(restarted, subagent, "subagent 1", "s1")
+    await restarted.flush()
+
+    rows = _rows(restarted)
+    assert sorted(len(row.items) for row in rows) == [4, 6]
+    assert {row.id for row in rows} == {s.id for s in store.sessions.values()}
+
+
+async def test_retrying_an_earlier_turn_forks_from_it_and_leaves_the_conversation_alone():
+    manager = SessionManager()
+    first = await _client_turn(manager, (), "one", "r1")
+    second = await _client_turn(manager, first, "two", "r2")
+
+    sent, retry = await _begin(manager, first, "two, differently")
+
+    assert retry.prior is not None and retry.prior.response_id == "r1"
+    assert retry.turn_input == (_user("two, differently"),)
+    forked = _finish(manager, retry, "two, differently", "r2b")
+    assert forked.id != retry.prior.session.id
+    original = manager.resolve("r2", "key-a")
+    assert isinstance(original, Resolved) and original.session.items == second
 
 
 # --- a reply waits for its turn to be stored --------------------------------------------------------------
