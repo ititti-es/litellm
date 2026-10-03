@@ -20,6 +20,7 @@ from litellm.constants import (
     MINIMUM_CUSTOM_KEY_LENGTH,
     STANDARD_CUSTOMER_ID_HEADERS,
 )
+from litellm.litellm_core_utils.get_litellm_params import CLAUDE_CLI_KWARGS_KEYS
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import (
     SSRFError,
@@ -303,6 +304,16 @@ def _build_banned_observability_params() -> frozenset[str]:
     )
 
 
+# Deployment settings of the claude_cli provider. ``claude_cli_allowed_tools``
+# turns on Claude Code's own tools (Bash, Read, Write, ...) on the proxy host and
+# ``claude_cli_config_dir`` picks which Claude login the CLI runs as, so a
+# caller-supplied value is code execution as the proxy's user, not a credential
+# choice. Unlike ``_BANNED_REQUEST_BODY_PARAMS`` no admin opt-in lifts this:
+# neither ``allow_client_side_credentials`` nor
+# ``configurable_clientside_auth_params``. Deployments set them in config.yaml.
+_NEVER_FROM_REQUEST_BODY: Final[frozenset[str]] = CLAUDE_CLI_KWARGS_KEYS
+
+
 _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
     "api_base",
     "base_url",
@@ -382,6 +393,12 @@ def _check_banned_params(
     Shared between the root-level check and the nested-config check so a
     new banned param only needs to be added in one place.
     """
+    never: Final = sorted(_NEVER_FROM_REQUEST_BODY.intersection(body))
+    if never:
+        raise ValueError(
+            f"Rejected Request: {never[0]} is not allowed in request body. "
+            "It is a deployment setting of the claude_cli provider; set it in the proxy config.yaml."
+        )
     for param in _BANNED_REQUEST_BODY_PARAMS:
         if param not in body:
             continue

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import Request
 
+from litellm.litellm_core_utils.get_litellm_params import CLAUDE_CLI_KWARGS_KEYS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.auth_utils import (
     _get_customer_id_from_standard_headers,
@@ -3915,6 +3916,71 @@ class TestIsRequestBodySafeBlocksAwsIdentitySelectors:
                 general_settings={},
                 llm_router=None,
                 model="bedrock-batch-model",
+            )
+            is True
+        )
+
+
+class TestIsRequestBodySafeBlocksClaudeCliParams:
+    """The claude_cli provider reads ``claude_cli_allowed_tools``,
+    ``claude_cli_config_dir`` and ``claude_cli_timeout`` from
+    ``litellm_params``, and ``completion()`` forwards them there from its
+    kwargs. The proxy splats the request body into those kwargs, so without
+    this block any key could switch on Claude Code's Bash tool on the proxy
+    host. No admin opt-in lifts it."""
+
+    @pytest.mark.parametrize("param", sorted(CLAUDE_CLI_KWARGS_KEYS))
+    def test_rejected_at_root(self, param):
+        with pytest.raises(ValueError, match=param):
+            is_request_body_safe(
+                request_body={"model": "claude-sonnet-5", param: ["Bash"]},
+                general_settings={},
+                llm_router=None,
+                model="claude-sonnet-5",
+            )
+
+    @pytest.mark.parametrize("container", ["extra_body", "litellm_embedding_config", "metadata", "litellm_metadata"])
+    @pytest.mark.parametrize("param", sorted(CLAUDE_CLI_KWARGS_KEYS))
+    def test_rejected_when_nested(self, container, param):
+        with pytest.raises(ValueError, match=param):
+            is_request_body_safe(
+                request_body={"model": "claude-sonnet-5", container: {param: "Bash"}},
+                general_settings={},
+                llm_router=None,
+                model="claude-sonnet-5",
+            )
+
+    @pytest.mark.parametrize("param", sorted(CLAUDE_CLI_KWARGS_KEYS))
+    def test_proxy_wide_opt_in_does_not_lift_it(self, param):
+        with pytest.raises(ValueError, match=param):
+            is_request_body_safe(
+                request_body={"model": "claude-sonnet-5", param: "Bash"},
+                general_settings={"allow_client_side_credentials": True},
+                llm_router=None,
+                model="claude-sonnet-5",
+            )
+
+    def test_deployment_opt_in_does_not_lift_it(self):
+        router = MagicMock()
+        with patch(
+            "litellm.proxy.auth.auth_utils._allow_model_level_clientside_configurable_parameters",
+            return_value=True,
+        ):
+            with pytest.raises(ValueError, match="claude_cli_allowed_tools"):
+                is_request_body_safe(
+                    request_body={"model": "claude-sonnet-5", "claude_cli_allowed_tools": "Bash"},
+                    general_settings={},
+                    llm_router=router,
+                    model="claude-sonnet-5",
+                )
+
+    def test_ordinary_request_still_passes(self):
+        assert (
+            is_request_body_safe(
+                request_body={"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]},
+                general_settings={},
+                llm_router=None,
+                model="claude-sonnet-5",
             )
             is True
         )
