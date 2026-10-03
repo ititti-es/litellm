@@ -120,6 +120,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+from litellm.proxy.public_edge import enforce_public_edge, is_public_edge
 from litellm.proxy.spend_tracking.carried_budget_state import carry_team_and_user_budget_state
 from litellm.proxy.spend_tracking.spend_counter_batch import (
     bind_admission_counter_keys,
@@ -3225,6 +3226,16 @@ def _seed_request_destinations(user_api_key_dict: UserAPIKeyAuth, request: Reque
         verbose_proxy_logger.debug("OTel V2: tenant destination resolution failed: %s", exc)
 
 
+def _deployments_for_requested_model(request_data: object) -> list | None:
+    """The router's deployments for the body's ``model``, for the public-edge model check."""
+    from litellm.proxy.proxy_server import llm_router
+
+    model: Final = request_data.get("model") if isinstance(request_data, dict) else None
+    if llm_router is None or not isinstance(model, str):
+        return None
+    return llm_router.get_model_list(model_name=model)
+
+
 @tracer.wrap()
 async def user_api_key_auth(
     request: Request,
@@ -3273,6 +3284,14 @@ async def user_api_key_auth(
             raise
         user_api_key_auth_obj.budget_reservation = None
         _seed_request_destinations(user_api_key_auth_obj, request)
+        if is_public_edge(request.headers):
+            enforce_public_edge(
+                request,
+                request_data if isinstance(request_data, dict) else {},
+                key_metadata=user_api_key_auth_obj.metadata,
+                is_admin=user_api_key_auth_obj.user_role == LitellmUserRoles.PROXY_ADMIN,
+                deployments_for_model=_deployments_for_requested_model(request_data),
+            )
 
         # A body that never parsed is authenticated (so the trace carries identity
         # and this ``auth`` span) but not authorized: there is no model to check it

@@ -691,6 +691,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     router as pass_through_router,
 )
 from litellm.proxy.prometheus_cleanup import mark_dead_workers, mark_worker_exit
+from litellm.proxy.public_edge import PublicEdgeMiddleware
 from litellm.proxy.public_endpoints import router as public_endpoints_router
 from litellm.proxy.public_endpoints.public_v1 import router as public_v1_router
 from litellm.proxy.rag_endpoints.endpoints import router as rag_router
@@ -19109,6 +19110,9 @@ app.add_middleware(
     get_settings=lambda: get_admission_control_settings(general_settings),
     state=admission_control_state,
 )
+# Public-edge requests (X-Liminal-Edge: public) reach only the inference routes, including
+# the mounted apps such as /mcp that never pass through user_api_key_auth.
+app.add_middleware(PublicEdgeMiddleware)
 # Added last on purpose - last-added is outermost, and the client-visible URL
 # prefix must be resolved into scope["root_path"] before any inner middleware
 # or the router inspects the path. Only added when SERVER_ROOT_PATHS is
