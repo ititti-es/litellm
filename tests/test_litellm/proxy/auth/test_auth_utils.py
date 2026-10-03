@@ -3984,3 +3984,44 @@ class TestIsRequestBodySafeBlocksClaudeCliParams:
             )
             is True
         )
+
+
+class TestIsRequestBodySafeBlocksSubscriptionAndAuthUrlParams:
+    """``use_anthropic_oauth`` and ``use_xai_oauth`` switch a deployment onto the
+    subscription logins in the proxy's database, and ``gigachat_auth_url``
+    retargets the request that carries the deployment's GigaChat credentials.
+    All three reach ``litellm_params`` from the request body the same way the
+    claude_cli settings do, and no admin opt-in lifts the block."""
+
+    PARAMS = ("gigachat_auth_url", "use_anthropic_oauth", "use_xai_oauth")
+
+    @pytest.mark.parametrize("param", PARAMS)
+    def test_rejected_at_root(self, param):
+        with pytest.raises(ValueError, match=param):
+            is_request_body_safe(
+                request_body={"model": "grok-5", param: True},
+                general_settings={},
+                llm_router=None,
+                model="grok-5",
+            )
+
+    @pytest.mark.parametrize("container", ["extra_body", "metadata"])
+    @pytest.mark.parametrize("param", PARAMS)
+    def test_rejected_when_nested(self, container, param):
+        with pytest.raises(ValueError, match=param):
+            is_request_body_safe(
+                request_body={"model": "grok-5", container: {param: True}},
+                general_settings={},
+                llm_router=None,
+                model="grok-5",
+            )
+
+    @pytest.mark.parametrize("param", PARAMS)
+    def test_proxy_wide_opt_in_does_not_lift_it(self, param):
+        with pytest.raises(ValueError, match=param):
+            is_request_body_safe(
+                request_body={"model": "grok-5", param: True},
+                general_settings={"allow_client_side_credentials": True},
+                llm_router=None,
+                model="grok-5",
+            )

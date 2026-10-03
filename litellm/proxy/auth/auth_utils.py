@@ -304,14 +304,23 @@ def _build_banned_observability_params() -> frozenset[str]:
     )
 
 
-# Deployment settings of the claude_cli provider. ``claude_cli_allowed_tools``
-# turns on Claude Code's own tools (Bash, Read, Write, ...) on the proxy host and
-# ``claude_cli_config_dir`` picks which Claude login the CLI runs as, so a
-# caller-supplied value is code execution as the proxy's user, not a credential
-# choice. Unlike ``_BANNED_REQUEST_BODY_PARAMS`` no admin opt-in lifts this:
-# neither ``allow_client_side_credentials`` nor
-# ``configurable_clientside_auth_params``. Deployments set them in config.yaml.
-_NEVER_FROM_REQUEST_BODY: Final[frozenset[str]] = CLAUDE_CLI_KWARGS_KEYS
+# Deployment settings no request may set, whatever the admin opt-ins say: neither
+# ``allow_client_side_credentials`` nor ``configurable_clientside_auth_params``
+# lifts them, unlike ``_BANNED_REQUEST_BODY_PARAMS``. Deployments set them in
+# config.yaml.
+#
+# - claude_cli: ``claude_cli_allowed_tools`` turns on Claude Code's own tools
+#   (Bash, Read, Write, ...) on the proxy host and ``claude_cli_config_dir``
+#   picks which Claude login the CLI runs as, so a caller-supplied value is code
+#   execution as the proxy's user, not a credential choice.
+# - ``use_anthropic_oauth`` / ``use_xai_oauth`` move a deployment onto the
+#   subscription logins stored in the proxy's database, spending the owner's
+#   subscription on any caller's request.
+# - ``gigachat_auth_url`` sends the deployment's GigaChat credentials to
+#   whatever URL the caller names.
+_NEVER_FROM_REQUEST_BODY: Final[frozenset[str]] = CLAUDE_CLI_KWARGS_KEYS | frozenset(
+    {"use_anthropic_oauth", "use_xai_oauth", "gigachat_auth_url"}
+)
 
 
 _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
@@ -397,7 +406,7 @@ def _check_banned_params(
     if never:
         raise ValueError(
             f"Rejected Request: {never[0]} is not allowed in request body. "
-            "It is a deployment setting of the claude_cli provider; set it in the proxy config.yaml."
+            "It is a deployment setting; set it in the proxy config.yaml."
         )
     for param in _BANNED_REQUEST_BODY_PARAMS:
         if param not in body:
