@@ -58,6 +58,7 @@ class AnthropicResponsesStreamWrapper:
         self._item_id_to_block_index: dict[str, int] = {}
         # Track open function_call items by item_id so we can emit tool_use start
         self._pending_tool_ids: dict[str, str] = {}  # item_id -> call_id / name accumulator
+        self._saw_function_call = False
         self._sent_message_start = False
         self._sent_message_stop = False
         self._chunk_queue: deque[dict[str, object]] = deque()
@@ -160,6 +161,7 @@ class AnthropicResponsesStreamWrapper:
             if item_type == "message":
                 self._open_block(item_id, {"type": "text", "text": ""})
             elif item_type == "function_call":
+                self._saw_function_call = True
                 call_id: Final = (
                     getattr(item, "call_id", None) or (item.get("call_id") if isinstance(item, dict) else None) or ""
                 )
@@ -282,6 +284,8 @@ class AnthropicResponsesStreamWrapper:
             if self._field(item, "type") == "reasoning":
                 self._close_reasoning_item(item, item_id)
                 return
+            if self._field(item, "type") == "function_call":
+                self._saw_function_call = True
             block_idx = self._item_id_to_block_index.get(item_id, -1) if item_id else self._current_block_index
             if block_idx < 0:
                 return
@@ -305,7 +309,7 @@ class AnthropicResponsesStreamWrapper:
             output: Final = (getattr(response_obj, "output", None) or ()) if response_obj is not None else ()
             refusal_text: Final = responses_output_refusal_text(output) or (self._refusal_text or None)
             status: Final = getattr(response_obj, "status", None) if response_obj is not None else None
-            has_tool_call: Final = any(
+            has_tool_call: Final = self._saw_function_call or any(
                 getattr(item, "type", None) == "function_call"
                 or (isinstance(item, dict) and item.get("type") == "function_call")
                 for item in output

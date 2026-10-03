@@ -7,6 +7,9 @@ import asyncio
 import os
 import sys
 from types import SimpleNamespace
+from typing import Final
+
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../..")))
 
@@ -234,9 +237,7 @@ class TestEncryptedReasoningIsStreamedForReplay:
         ]
         chunks = _process_all(events)
 
-        thinking = "".join(
-            c["delta"]["thinking"] for c in chunks if c.get("delta", {}).get("type") == "thinking_delta"
-        )
+        thinking = "".join(c["delta"]["thinking"] for c in chunks if c.get("delta", {}).get("type") == "thinking_delta")
         assert thinking == "First.\n\nSecond."
         assert [c["type"] for c in chunks].count("content_block_start") == 1
 
@@ -452,3 +453,39 @@ class TestRefusalStreamEvents:
         message_delta = next(c for c in chunks if c["type"] == "message_delta")
         assert message_delta["delta"]["stop_reason"] == "max_tokens"
         assert "stop_details" not in message_delta["delta"]
+
+
+class TestToolUseStopReasonWhenCompletedOutputIsEmpty:
+    """The ChatGPT subscription backend emits ``response.completed`` with an empty
+    ``output``, so the tool call is only visible in ``output_item`` events."""
+
+    @staticmethod
+    def _events(item_events: list[str]) -> list[dict[str, object]]:
+        function_call: Final = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Bash"}
+        by_name: Final = {
+            "added": {"type": "response.output_item.added", "item": {**function_call, "arguments": ""}},
+            "done": {"type": "response.output_item.done", "item": {**function_call, "arguments": "{}"}},
+        }
+        return [
+            {"type": "response.created"},
+            *(by_name[name] for name in item_events),
+            {"type": "response.completed", "response": {"status": "completed", "output": []}},
+        ]
+
+    @pytest.mark.parametrize("item_events", [["added", "done"], ["added"], ["done"]])
+    def test_function_call_item_events_yield_tool_use(self, item_events):
+        chunks = _drain_async(self._events(item_events))
+
+        message_delta = next(c for c in chunks if c["type"] == "message_delta")
+        assert message_delta["delta"]["stop_reason"] == "tool_use"
+
+    def test_turn_without_function_call_still_ends_turn(self):
+        chunks = _drain_async(
+            [
+                {"type": "response.created"},
+                {"type": "response.completed", "response": {"status": "completed", "output": []}},
+            ]
+        )
+
+        message_delta = next(c for c in chunks if c["type"] == "message_delta")
+        assert message_delta["delta"]["stop_reason"] == "end_turn"

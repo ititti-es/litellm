@@ -44,7 +44,7 @@ __all__ = ("anthropic_messages", "anthropic_messages_handler")
 
 # Providers that are routed directly to the OpenAI Responses API instead of
 # going through chat/completions.
-_RESPONSES_API_PROVIDERS: Final = frozenset({"openai"})
+_RESPONSES_API_PROVIDERS: Final = frozenset({"openai", "chatgpt"})
 
 
 def _bridges_to_responses_api(model: str, custom_llm_provider: str) -> bool:

@@ -78,6 +78,36 @@ def test_build_responses_kwargs_asks_openai_for_encrypted_reasoning_without_thin
     assert "reasoning" not in responses_kwargs
 
 
+CLAUDE_CODE_TRAILING_SYSTEM_MESSAGES = [
+    {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+    {"role": "system", "content": [{"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}]},
+]
+
+
+def test_build_responses_kwargs_converts_trailing_system_turn_to_user_for_chatgpt():
+    responses_kwargs = _build_responses_kwargs(
+        max_tokens=1024,
+        messages=CLAUDE_CODE_TRAILING_SYSTEM_MESSAGES,
+        model="chatgpt/gpt-6-sol",
+        system=[{"type": "text", "text": "top-level system", "cache_control": {"type": "ephemeral"}}],
+        thinking={"type": "adaptive"},
+        extra_kwargs={"custom_llm_provider": "chatgpt"},
+    )
+    assert [item["role"] for item in responses_kwargs["input"]] == ["user", "user"]
+    assert "reminder" in json.dumps(responses_kwargs["input"][1])
+    assert responses_kwargs["instructions"] == "top-level system"
+
+
+def test_build_responses_kwargs_keeps_trailing_system_turn_for_openai():
+    responses_kwargs = _build_responses_kwargs(
+        max_tokens=1024,
+        messages=CLAUDE_CODE_TRAILING_SYSTEM_MESSAGES,
+        model="openai/gpt-5.6-luna",
+        extra_kwargs={"custom_llm_provider": "openai"},
+    )
+    assert [item["role"] for item in responses_kwargs["input"]] == ["user", "system"]
+
+
 def test_build_responses_kwargs_skips_include_for_a_responses_provider_that_rejects_it():
     responses_kwargs = _build_responses_kwargs(
         max_tokens=1024,

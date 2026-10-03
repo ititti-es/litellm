@@ -124,5 +124,5 @@ async def test_bad_calls_come_back_as_tool_errors() -> None:
 def test_context_gives_tool_output_a_smaller_share_than_conversation() -> None:
     said: Final = memory_mcp_tools._item_text({"type": "message", "role": "user", "content": "y" * 5000})
     ran: Final = memory_mcp_tools._item_text({"type": "function_call_output", "call_id": "c", "output": "z" * 5000})
-    assert len(said) > 3000 > 1000 > len(ran)
+    assert len(said) > 3000 and len(ran) < 1000
     assert memory_mcp_tools._item_text({"type": "reasoning"}).startswith("(no text")

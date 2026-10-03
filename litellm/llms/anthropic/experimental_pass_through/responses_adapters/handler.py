@@ -7,6 +7,8 @@ Used when the target model is an OpenAI or Azure model.
 from collections.abc import AsyncIterator, Coroutine, Mapping
 from typing import Any, Final, TypeAlias
 
+from pydantic import TypeAdapter
+
 import litellm
 from litellm.types.llms.anthropic import (
     AllAnthropicMessageValues,
@@ -21,11 +23,15 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.utils import ProviderConfigManager
 
+from ..messages.mid_conversation_system import convert_mid_conversation_system_turns
 from ..utils import litellm_logging_obj_from_kwargs, local_model_name
 from .streaming_iterator import AnthropicResponsesStreamWrapper
 from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
+_NO_SYSTEM_ROLE_INPUT_PROVIDERS: Final = frozenset({"chatgpt"})
+
 AnthropicRequestMessages: TypeAlias = list[AllAnthropicMessageValues] | list[dict[str, object]]
+_REQUEST_MESSAGES_ADAPTER: Final = TypeAdapter(list[dict[str, object]])
 
 _ADAPTER: Final = LiteLLMAnthropicToResponsesAPIAdapter()
 
@@ -35,10 +41,12 @@ def _forwarded_kwargs(extra_kwargs: Mapping[str, object] | None) -> Mapping[str,
     return extra_kwargs or {}
 
 
+def _target_provider(model: str, custom_llm_provider: object) -> str:
+    return custom_llm_provider if isinstance(custom_llm_provider, str) else litellm.get_llm_provider(model=model)[1]
+
+
 def _provider_returns_encrypted_reasoning(model: str, custom_llm_provider: object) -> bool:
-    provider: Final = (
-        custom_llm_provider if isinstance(custom_llm_provider, str) else litellm.get_llm_provider(model=model)[1]
-    )
+    provider: Final = _target_provider(model, custom_llm_provider)
     provider_model: Final = local_model_name(model, provider)
     responses_config: Final = ProviderConfigManager.get_provider_responses_api_config(provider, provider_model)
     return responses_config is not None and "include" in responses_config.get_supported_openai_params(provider_model)
@@ -67,10 +75,16 @@ def _build_responses_kwargs(
     """
     Build the kwargs dict to pass directly to litellm.responses() / litellm.aresponses().
     """
+    forwarded_kwargs: Final = _forwarded_kwargs(extra_kwargs)
+    request_messages: Final = (
+        _REQUEST_MESSAGES_ADAPTER.validate_python(convert_mid_conversation_system_turns(messages))
+        if _target_provider(model, forwarded_kwargs.get("custom_llm_provider")) in _NO_SYSTEM_ROLE_INPUT_PROVIDERS
+        else messages
+    )
     # Build a typed AnthropicMessagesRequest for the adapter
     request_data: Final[AnthropicMessagesRequest] = {
         "model": model,
-        "messages": messages,
+        "messages": request_messages,
         "max_tokens": max_tokens,
     }
     if context_management:
@@ -95,7 +109,6 @@ def _build_responses_kwargs(
         request_data["output_format"] = output_format
 
     anthropic_request: Final = AnthropicMessagesRequest(**request_data)
-    forwarded_kwargs: Final = _forwarded_kwargs(extra_kwargs)
     responses_kwargs: Final = _ADAPTER.translate_request(
         anthropic_request,
         include_encrypted_reasoning=_provider_returns_encrypted_reasoning(

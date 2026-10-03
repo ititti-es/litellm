@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import time
 import uuid
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, Final, List
 
 import httpx
 import pytest
@@ -1070,6 +1072,82 @@ async def test_messages_strips_provider_prefix_exactly_once(requested_model, exp
 
     assert captured["body"]["model"] == expected_wire_model
     assert captured["url"] == expected_url
+
+
+_CHATGPT_RESPONSES_SSE: Final = (
+    b"event: response.created\n"
+    b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response",'
+    b'"created_at":1,"status":"in_progress","model":"gpt-6-sol","output":[]}}\n\n'
+    b"event: response.completed\n"
+    b'data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","object":"response",'
+    b'"created_at":1,"status":"completed","model":"gpt-6-sol","output":[],'
+    b'"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}\n\n'
+)
+
+
+@pytest.fixture
+def chatgpt_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "auth.json").write_text(
+        json.dumps({"access_token": "test-token", "account_id": "test-account", "expires_at": time.time() + 3600})
+    )
+    monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path))
+    monkeypatch.setenv("CHATGPT_AUTH_FILE", "auth.json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("chatgpt_credentials")
+@pytest.mark.parametrize("stream", [False, True])
+async def test_messages_routes_chatgpt_subscription_models_through_responses_api(stream: bool):
+    """
+    The ChatGPT subscription backend only serves the Responses API, so /v1/messages must
+    bridge chatgpt/ models there for both streaming and non-streaming requests, including
+    models whose cost-map entry reports no native streaming (gpt-6-sol).
+    """
+    wire: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        wire.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_CHATGPT_RESPONSES_SSE, request=request
+        )
+
+    client = AsyncHTTPHandler()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+
+    response = await litellm.anthropic.messages.acreate(
+        max_tokens=100,
+        messages=[{"role": "user", "content": "ping"}],
+        model="chatgpt/gpt-6-sol",
+        stream=stream,
+        client=client,
+    )
+    if stream:
+        _ = [chunk async for chunk in response]
+
+    assert len(wire) == 1
+    assert wire[0].url.path.endswith("/responses")
+    body = json.loads(wire[0].content)
+    assert body["input"]
+    assert body["store"] is False
+    assert body["stream"] is True
+
+
+@pytest.mark.parametrize("use_chat_completions, expected_responses_route", [(False, True), (True, False)])
+def test_chatgpt_responses_routing_honors_the_chat_completions_opt_out(
+    monkeypatch: pytest.MonkeyPatch, use_chat_completions: bool, expected_responses_route: bool
+):
+    from litellm.llms.anthropic.experimental_pass_through.messages.handler import _should_route_to_responses_api
+
+    monkeypatch.setattr(litellm, "use_chat_completions_url_for_anthropic_messages", use_chat_completions)
+
+    assert _should_route_to_responses_api("chatgpt", "chatgpt/gpt-6-sol", "gpt-6-sol") is expected_responses_route
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "model-not-in-the-cost-map"])
+def test_chatgpt_responses_config_never_fake_streams(model: str):
+    from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+
+    assert ChatGPTResponsesAPIConfig().should_fake_stream(model, True, "chatgpt") is False
 
 
 @pytest.mark.asyncio

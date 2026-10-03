@@ -63,6 +63,14 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
         return {**default_headers, **headers}
 
+    def should_fake_stream(
+        self,
+        model: str | None,
+        stream: bool | None,
+        custom_llm_provider: str | None = None,
+    ) -> bool:
+        return False
+
     def transform_responses_api_request(
         self,
         model: str,
