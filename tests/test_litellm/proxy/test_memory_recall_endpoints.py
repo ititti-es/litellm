@@ -101,3 +101,9 @@ def test_context_outside_the_callers_memory_is_a_404(monkeypatch: pytest.MonkeyP
     assert response.status_code == 404
     assert "ses_other" in response.json()["detail"]
     assert _client().post("/v1/memory/context", json={"session_id": "s", "seq": 0, "after": 99}).status_code == 422
+
+
+def test_recall_routes_are_open_to_ordinary_keys() -> None:
+    from litellm.proxy._types import LiteLLMRoutes
+
+    assert {"/v1/memory/search", "/v1/memory/rerank", "/v1/memory/context"} <= set(LiteLLMRoutes.openai_routes.value)

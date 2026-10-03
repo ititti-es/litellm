@@ -436,6 +436,9 @@ class LiteLLMRoutes(enum.Enum):
         "/v1/sessions/{client_session_id}/items",
         # semantic search over the session store, scoped to the caller (proxy/memory_search_endpoints.py)
         "/v1/memory/search",
+        # recall companions: rerank a client's own candidates, read around a hit (proxy/memory_recall_endpoints.py)
+        "/v1/memory/rerank",
+        "/v1/memory/context",
         "/responses/{response_id}/cancel",
         "/v1/responses/{response_id}/cancel",
         "/openai/v1/responses/{response_id}/cancel",
