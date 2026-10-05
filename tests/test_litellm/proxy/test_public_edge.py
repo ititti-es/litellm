@@ -270,3 +270,63 @@ async def test_user_api_key_auth_runs_the_public_edge_check(metadata: dict, expe
             with pytest.raises(HTTPException) as exc:
                 await auth_module.user_api_key_auth(request=request, api_key="Bearer sk-x")
             assert exc.value.status_code == expected
+
+
+CHATGPT_KEY: Final = {"public": True, "allow_chatgpt_subscription": True}
+
+
+def test_chatgpt_opt_in_key_may_use_chatgpt_models() -> None:
+    enforce_public_edge(
+        _request(EDGE),
+        {"model": "gpt-6-luna", "tools": [{"type": "image_generation"}]},
+        key_metadata=CHATGPT_KEY,
+        is_admin=False,
+        deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
+    )
+
+
+@pytest.mark.parametrize("opt_in", [False, "true", 1, None])
+def test_chatgpt_needs_a_literal_true_opt_in(opt_in: object) -> None:
+    with pytest.raises(HTTPException) as exc:
+        enforce_public_edge(
+            _request(EDGE),
+            {"model": "gpt-6-luna"},
+            key_metadata={"public": True, "allow_chatgpt_subscription": opt_in},
+            is_admin=False,
+            deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"model": "claude_cli/claude-sonnet-5"},
+        {"model": "blitzcrank/ensemble"},
+        {"model": "xai/grok-4.3", "use_xai_oauth": True},
+        {"model": "anthropic/claude-sonnet-5", "use_anthropic_oauth": True},
+        {"model": "chatgpt/gpt-6-luna", "use_anthropic_oauth": True},
+    ],
+)
+def test_chatgpt_opt_in_does_not_unlock_other_private_models(params: dict) -> None:
+    with pytest.raises(HTTPException) as exc:
+        enforce_public_edge(
+            _request(EDGE),
+            {"model": "m"},
+            key_metadata=CHATGPT_KEY,
+            is_admin=False,
+            deployments_for_model=[{"litellm_params": params}],
+        )
+    assert exc.value.status_code == 403
+
+
+def test_chatgpt_opt_in_still_refuses_mcp_tools() -> None:
+    with pytest.raises(HTTPException) as exc:
+        enforce_public_edge(
+            _request(EDGE),
+            {"model": "gpt-6-luna", "tools": [{"type": "mcp", "server_label": "cua_soraka"}]},
+            key_metadata=CHATGPT_KEY,
+            is_admin=False,
+            deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
+        )
+    assert exc.value.status_code == 403

@@ -15,6 +15,8 @@ For public-edge requests liminal enforces, in addition to the edge's own path al
   - no MCP tools in the body (``tools`` entries of type ``mcp``);
   - no model whose deployments run on the proxy host or on a subscription login: the
     ``claude_cli``, ``chatgpt`` and ``blitzcrank`` providers and ``use_*_oauth`` deployments.
+    A key whose metadata sets ``allow_chatgpt_subscription`` to ``true`` may use ``chatgpt``
+    models; the other private providers stay refused for every key.
 """
 
 from __future__ import annotations
@@ -55,6 +57,8 @@ PUBLIC_ROUTE_PREFIXES: Final = ("/responses/", "/v1/responses/")
 # Providers that execute on the proxy host or spend a subscription login stored by the proxy.
 PRIVATE_PROVIDERS: Final = frozenset({"claude_cli", "chatgpt", "blitzcrank"})
 SUBSCRIPTION_FLAGS: Final = ("use_anthropic_oauth", "use_xai_oauth")
+# Key metadata opt-in for the ChatGPT subscription provider on the public edge.
+CHATGPT_OPT_IN: Final = "allow_chatgpt_subscription"
 
 
 def is_public_edge(headers: Mapping[str, str]) -> bool:
@@ -110,17 +114,22 @@ def _has_mcp_tools(request_data: Mapping[str, object]) -> bool:
     return any(isinstance(tool, Mapping) and tool.get("type") == "mcp" for tool in tools)
 
 
-def _is_private_deployment(litellm_params: Mapping[str, object]) -> bool:
+def _is_private_deployment(litellm_params: Mapping[str, object], *, allow_chatgpt: bool) -> bool:
     model: Final = str(litellm_params.get("model") or "")
     provider: Final = str(litellm_params.get("custom_llm_provider") or model.split("/", 1)[0])
-    return provider in PRIVATE_PROVIDERS or any(litellm_params.get(flag) for flag in SUBSCRIPTION_FLAGS)
+    if any(litellm_params.get(flag) for flag in SUBSCRIPTION_FLAGS):
+        return True
+    return provider in PRIVATE_PROVIDERS and not (allow_chatgpt and provider == "chatgpt")
 
 
-def private_model(deployments: Iterable[Mapping[str, object]] | None) -> bool:
-    """Whether any deployment of a model group is host-executed or subscription-backed."""
+def private_model(deployments: Iterable[Mapping[str, object]] | None, *, allow_chatgpt: bool = False) -> bool:
+    """Whether any deployment of a model group is host-executed or subscription-backed.
+
+    ``allow_chatgpt`` exempts the ``chatgpt`` provider only (see ``CHATGPT_OPT_IN``).
+    """
     for deployment in deployments or ():
         params = deployment.get("litellm_params")
-        if isinstance(params, Mapping) and _is_private_deployment(params):
+        if isinstance(params, Mapping) and _is_private_deployment(params, allow_chatgpt=allow_chatgpt):
             return True
     return False
 
@@ -140,5 +149,5 @@ def enforce_public_edge(
         raise _deny(status.HTTP_401_UNAUTHORIZED, "This key is not enabled for the public endpoint.")
     if _has_mcp_tools(request_data):
         raise _deny(status.HTTP_403_FORBIDDEN, "MCP tools are not available on the public endpoint.")
-    if private_model(deployments_for_model):
+    if private_model(deployments_for_model, allow_chatgpt=key_metadata.get(CHATGPT_OPT_IN) is True):
         raise _deny(status.HTTP_403_FORBIDDEN, "This model is not available on the public endpoint.")
