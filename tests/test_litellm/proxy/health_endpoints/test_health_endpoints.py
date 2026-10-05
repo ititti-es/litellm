@@ -34,8 +34,16 @@ from litellm.proxy.health_endpoints._health_endpoints import (
     test_model_connection as health_test_model_connection,
 )
 
+from starlette.requests import Request as StarletteRequest
+
 # Import shared proxy test helpers from conftest
 from tests.test_litellm.proxy.conftest import create_proxy_test_client
+
+
+def _health_request(headers: Mapping[str, str] | None = None) -> StarletteRequest:
+    """A bare ``GET /health`` request, as FastAPI would pass to ``health_endpoint``."""
+    raw: Final = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()]
+    return StarletteRequest({"type": "http", "method": "GET", "path": "/health", "headers": raw})
 
 
 @pytest.mark.asyncio
@@ -1638,7 +1646,13 @@ async def test_health_endpoint_filters_model_list_by_user_access():
     ):
         from fastapi import Response
 
-        await health_endpoint(response=Response(), user_api_key_dict=user_api_key_dict, model=None, model_id=None)
+        await health_endpoint(
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            model=None,
+            model_id=None,
+        )
 
     assert "model_list" in captured, "health_endpoint did not call _perform_health_check_and_save"
     returned_names = {m["model_name"] for m in captured["model_list"]}
@@ -1701,7 +1715,13 @@ async def test_health_endpoint_keeps_full_model_list_for_all_proxy_models():
     ):
         from fastapi import Response
 
-        await health_endpoint(response=Response(), user_api_key_dict=user_api_key_dict, model=None, model_id=None)
+        await health_endpoint(
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            model=None,
+            model_id=None,
+        )
 
     returned_names = {m["model_name"] for m in captured["model_list"]}
     assert returned_names == {
@@ -1769,7 +1789,13 @@ async def test_health_endpoint_resolves_all_team_models_to_team_allowlist():
     ):
         from fastapi import Response
 
-        await health_endpoint(response=Response(), user_api_key_dict=user_api_key_dict, model=None, model_id=None)
+        await health_endpoint(
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            model=None,
+            model_id=None,
+        )
 
     returned_names = {m["model_name"] for m in captured["model_list"]}
     assert returned_names == {"model-b"}, f"all-team-models key should health-check the team's models: {returned_names}"
@@ -1888,6 +1914,7 @@ async def test_health_endpoint_expands_access_group_on_live_path():
         ),
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-group"]),
             model=None,
@@ -1916,6 +1943,7 @@ async def test_health_endpoint_expands_access_group_on_background_cache_path():
         health_check_results=_ACCESS_GROUP_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-group"]),
             model=None,
@@ -1953,6 +1981,7 @@ async def test_health_endpoint_treats_no_team_all_team_models_as_unrestricted():
         ),
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(
                 api_key="hashed-test-key", models=[SpecialModelNames.all_team_models.value], team_id=None
@@ -1983,6 +2012,7 @@ async def test_health_endpoint_omits_model_id_warning_when_no_deployment_matches
         health_check_results=_ACCESS_GROUP_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["no-such-model"]),
             model=None,
@@ -2062,6 +2092,7 @@ async def test_health_endpoint_filters_background_cache_by_user_access():
         # handler skip FastAPI's Query() resolution, so unspecified params
         # would otherwise carry the Query() sentinel (which is truthy).
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=user_api_key_dict,
             model=None,
@@ -2151,12 +2182,14 @@ async def test_health_endpoint_admin_sees_routing_fields_non_admin_does_not():
         admin_response = Response()
         non_admin_response = Response()
         admin_result = await health_endpoint(
+            request=_health_request(),
             response=admin_response,
             user_api_key_dict=admin_key,
             model=None,
             model_id=None,
         )
         non_admin_result = await health_endpoint(
+            request=_health_request(),
             response=non_admin_response,
             user_api_key_dict=non_admin_key,
             model=None,
@@ -2250,6 +2283,7 @@ async def test_health_endpoint_warns_when_scoped_models_lack_model_id():
         patch("litellm.proxy.proxy_server.health_check_concurrency", 1),
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=user_api_key_dict,
             model=None,
@@ -2329,6 +2363,7 @@ async def test_health_endpoint_blocks_cross_scope_model_id_under_background_cach
         # model_list is refused before the cache is read.
         with pytest.raises(HTTPException) as refused:
             await health_endpoint(
+                request=_health_request(),
                 response=response,
                 user_api_key_dict=user_api_key_dict,
                 model="model-b",
@@ -2393,6 +2428,7 @@ async def test_health_endpoint_503_for_targeted_unhealthy_model_under_background
         patch("litellm.proxy.proxy_server.health_check_concurrency", 1),
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=response,
             user_api_key_dict=user_api_key_dict,
             model="model-a",
@@ -2465,6 +2501,7 @@ async def test_health_endpoint_returns_503_when_requested_model_has_no_healthy_e
         ),
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=response,
             user_api_key_dict=user_api_key_dict,
             model="model-a",
@@ -2526,6 +2563,7 @@ async def test_health_endpoint_returns_200_when_requested_model_has_healthy_endp
         ),
     ):
         await health_endpoint(
+            request=_health_request(),
             response=response,
             user_api_key_dict=user_api_key_dict,
             model="model-a",
@@ -2588,6 +2626,7 @@ async def test_health_endpoint_no_model_param_returns_200_even_when_zero_healthy
         # function calls in unit tests receive Query() sentinel objects
         # (which are truthy). The explicit None mirrors production routing.
         await health_endpoint(
+            request=_health_request(),
             response=response,
             user_api_key_dict=user_api_key_dict,
             model=None,
@@ -2934,7 +2973,13 @@ async def _live_probed_model_ids(
             side_effect=fake_perform,
         ),
     ):
-        await health_endpoint(response=Response(), user_api_key_dict=user_api_key_dict, model=model, model_id=None)
+        await health_endpoint(
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            model=model,
+            model_id=None,
+        )
 
     return {m["model_info"]["id"] for m in captured["model_list"]}
 
@@ -3010,6 +3055,7 @@ async def test_health_endpoint_keeps_an_unrestricted_non_admin_key_to_its_own_te
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=[], team_id="team-a"),
             model=None,
@@ -3048,6 +3094,7 @@ async def test_health_endpoint_hides_another_teams_deployment_on_background_cach
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-group"], team_id="team-a"),
             model=None,
@@ -3080,6 +3127,7 @@ async def test_health_endpoint_refuses_a_targeted_deployment_outside_the_callers
         pytest.raises(HTTPException) as excinfo,
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-group"], team_id=None),
             model=None,
@@ -3106,6 +3154,7 @@ async def test_health_endpoint_refuses_a_targeted_deployment_outside_the_callers
         pytest.raises(HTTPException) as excinfo,
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-group"], team_id="team-a"),
             model="bedrock-nova_team-b_9f2c",
@@ -3128,6 +3177,7 @@ async def test_health_endpoint_hides_team_deployments_from_a_key_with_no_team_on
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-group"], team_id=None),
             model=None,
@@ -3187,6 +3237,7 @@ async def test_health_endpoint_returns_a_team_only_deployment_by_its_public_name
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-nova"], team_id="team-b"),
             model="bedrock-nova",
@@ -3209,6 +3260,7 @@ async def test_health_endpoint_returns_only_the_owning_teams_copy_behind_a_share
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-nova"], team_id="team-b"),
             model="bedrock-nova",
@@ -3239,7 +3291,11 @@ async def _live_narrowed_model_ids(
         ),
     ):
         result = await health_endpoint(
-            response=Response(), user_api_key_dict=user_api_key_dict, model=model, model_id=model_id
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            model=model,
+            model_id=model_id,
         )
 
     return {ep["model_id"] for ep in result["healthy_endpoints"]}
@@ -3298,6 +3354,7 @@ async def test_health_endpoint_returns_only_the_teams_copy_when_provider_model_e
         health_check_results=_BARE_NAME_CACHED_RESULTS,
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["gpt-5.4-nano"], team_id="team-b"),
             model="gpt-5.4-nano",
@@ -3320,7 +3377,11 @@ async def test_health_endpoint_keeps_an_admin_probe_by_name_off_other_teams_publ
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
-            response=Response(), user_api_key_dict=_ADMIN_OUTSIDE_TEAM_B, model="bedrock-nova", model_id=None
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=_ADMIN_OUTSIDE_TEAM_B,
+            model="bedrock-nova",
+            model_id=None,
         )
 
     assert [ep["model_id"] for ep in result["healthy_endpoints"]] == ["id-bedrock"]
@@ -3351,7 +3412,11 @@ async def test_health_endpoint_returns_a_team_only_public_name_for_an_admin_on_b
         health_check_results=_TEAM_CACHED_RESULTS,
     ):
         result = await health_endpoint(
-            response=Response(), user_api_key_dict=_ADMIN_OUTSIDE_TEAM_B, model="bedrock-nova", model_id=None
+            request=_health_request(),
+            response=Response(),
+            user_api_key_dict=_ADMIN_OUTSIDE_TEAM_B,
+            model="bedrock-nova",
+            model_id=None,
         )
 
     assert [ep["model_id"] for ep in result["healthy_endpoints"]] == ["id-team-b"]
@@ -3381,6 +3446,7 @@ async def test_health_endpoint_keeps_a_team_only_public_name_off_a_team_less_key
         pytest.raises(HTTPException) as refused,
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-nova"]),
             model="bedrock-nova",
@@ -3428,6 +3494,7 @@ async def test_health_endpoint_rejects_an_in_scope_model_paired_with_a_foreign_m
         pytest.raises(HTTPException) as refused,
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["bedrock-nova"]),
             model="bedrock-nova",
@@ -3464,6 +3531,7 @@ async def test_health_endpoint_returns_404_for_a_model_paired_with_an_unknown_mo
         pytest.raises(HTTPException) as refused,
     ):
         await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=_ADMIN_OUTSIDE_TEAM_B,
             model="bedrock-nova",
@@ -3583,6 +3651,7 @@ async def test_health_endpoint_result_survives_non_json_safe_deployment_params()
         ),
     ):
         result = await health_endpoint(
+            request=_health_request(),
             response=Response(),
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-admin-key", user_role=LitellmUserRoles.PROXY_ADMIN),
             model=None,
@@ -4179,3 +4248,48 @@ async def test_health_services_endpoint_pointfive_blocks_non_admin(monkeypatch, 
 
     assert str(raised.value.code) == "403"
     logger_class.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("headers", "expected"), [({}, {"cloud", "cli"}), ({"X-Liminal-Edge": "public"}, {"cloud"})])
+async def test_health_endpoint_skips_private_deployments_on_public_edge(
+    headers: dict[str, str], expected: set[str]
+) -> None:
+    """Probing a host-executed or subscription deployment runs it, so the public edge never probes one."""
+    from fastapi import Response
+
+    from litellm.proxy.health_endpoints._health_endpoints import health_endpoint
+
+    model_list: Final = [
+        {"model_name": "cloud", "litellm_params": {"model": "openai/gpt-4o"}, "model_info": {"id": "id-cloud"}},
+        {"model_name": "cli", "litellm_params": {"model": "claude_cli/claude-opus-5"}, "model_info": {"id": "id-cli"}},
+    ]
+    captured: dict = {}
+
+    async def fake_perform(**kwargs):
+        captured["model_list"] = kwargs["model_list"]
+        return {"healthy_endpoints": [], "unhealthy_endpoints": [], "healthy_count": 0, "unhealthy_count": 0}
+
+    with (
+        patch("litellm.proxy.proxy_server.llm_model_list", model_list),
+        patch("litellm.proxy.proxy_server.llm_router", None),
+        patch("litellm.proxy.proxy_server.prisma_client", None),
+        patch("litellm.proxy.proxy_server.use_background_health_checks", False),
+        patch("litellm.proxy.proxy_server.user_model", None),
+        patch("litellm.proxy.proxy_server.health_check_results", {}),
+        patch("litellm.proxy.proxy_server.health_check_details", True),
+        patch("litellm.proxy.proxy_server.health_check_concurrency", 1),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints._perform_health_check_and_save",
+            side_effect=fake_perform,
+        ),
+    ):
+        await health_endpoint(
+            request=_health_request(headers),
+            response=Response(),
+            user_api_key_dict=UserAPIKeyAuth(api_key="hashed-test-key", models=["cloud", "cli"]),
+            model=None,
+            model_id=None,
+        )
+
+    assert {m["model_name"] for m in captured["model_list"]} == expected

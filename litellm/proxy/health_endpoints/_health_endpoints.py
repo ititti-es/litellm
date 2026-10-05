@@ -65,6 +65,7 @@ from litellm.proxy.middleware.admission_control_middleware import (
 from litellm.proxy.middleware.in_flight_requests_middleware import (
     get_in_flight_requests,
 )
+from litellm.proxy.public_edge import is_public_edge, private_model
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.router import Router
 from litellm.router_utils.clientside_credential_handler import (
@@ -1117,6 +1118,7 @@ def _health_endpoint_resolve_target_model_name(
 
 @router.get("/health", tags=["health"], dependencies=[Depends(user_api_key_auth)])
 async def health_endpoint(
+    request: Request,
     response: Response,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
     model: str | None = fastapi.Query(None, description="Specify the model name (optional)"),
@@ -1162,6 +1164,7 @@ async def health_endpoint(
     target_model: Final = _health_endpoint_resolve_target_model_name(model, model_id, llm_router)
 
     is_admin: Final = _is_proxy_admin(user_api_key_dict)
+    public_edge: Final = is_public_edge(request.headers)
     model_specific_request: Final = bool(model or model_id)
 
     def _post_process(result: dict) -> dict:
@@ -1211,6 +1214,8 @@ async def health_endpoint(
             for m in copy.deepcopy(llm_model_list)
             if not restrict_to_allowed_models
             or _caller_may_probe_deployment(m, allowed_models, llm_router, user_api_key_dict.team_id, is_admin)
+            # Probing a host-executed or subscription deployment runs it, which the public edge never allows.
+            if not (public_edge and private_model([m]))
         ]
         targeted_ids: Final = _resolve_targeted_model_ids(_llm_model_list, model, model_id, user_api_key_dict.team_id)
         if restrict_to_allowed_models and targeted_ids is not None and not targeted_ids:
