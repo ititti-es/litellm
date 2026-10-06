@@ -1493,6 +1493,13 @@ def completion_cost(
                     completion_response, ImageResponse
                 ):
                     ### IMAGE GENERATION COST CALCULATION ###
+                    deployment_image_cost: Final = _deployment_per_image_cost(
+                        _deployment_model_info(litellm_logging_obj, custom_pricing, router_model_id),
+                        completion_response,
+                        n,
+                    )
+                    if deployment_image_cost is not None:
+                        return deployment_image_cost
                     return CostCalculatorUtils.route_image_generation_cost_calculator(
                         model=model,
                         custom_llm_provider=custom_llm_provider,
@@ -1997,6 +2004,29 @@ def _deployment_model_info(
         None,
     )
 
+
+def _deployment_per_image_cost(
+    model_info: ModelInfo | None,
+    image_response: ImageResponse,
+    n: int | None,
+) -> float | None:
+    """Price an image call from the deployment's own per-image pricing.
+
+    Router deployments keep custom pricing only under their model id, which the
+    provider/size cost-map lookups in the image calculators never consult, so a
+    config-priced image model would otherwise be logged as free. Returns None
+    when the deployment sets no per-image price, leaving the existing calculators
+    in charge.
+    """
+    if model_info is None:
+        return None
+    per_image_costs: Final = [
+        cost for key in ("input_cost_per_image", "output_cost_per_image") if (cost := model_info.get(key)) is not None
+    ]
+    if not per_image_costs:
+        return None
+    image_count: Final = len(image_response.data) if image_response.data else (n or 1)
+    return sum(per_image_costs) * image_count
 
 def _ocr_model_info(
     litellm_logging_obj: LitellmLoggingObject | None,
