@@ -7,7 +7,8 @@ gets the public treatment; it never unlocks anything.
 
 For public-edge requests liminal enforces, in addition to the edge's own path allowlist:
 
-- ``PublicEdgeMiddleware``: only the inference routes in ``PUBLIC_ROUTES`` and ``/health``. This also covers the
+- ``PublicEdgeMiddleware``: only the inference routes in ``PUBLIC_ROUTES``, ``/health`` and the docs page (``/``,
+  ``/openapi.json``, ``/swagger/``). This also covers the
   ASGI apps mounted beside the API router (``/mcp``) that never reach ``user_api_key_auth``.
 - ``enforce_public_edge`` (called from ``user_api_key_auth`` once the key is known):
   - the key must be flagged public (``metadata.public`` is ``true``); the master key and other
@@ -49,10 +50,11 @@ PUBLIC_ROUTES: Final = frozenset(
     )
 )
 # Model health for the caller's own models; ``health_endpoint`` skips private deployments on the edge.
-PUBLIC_EXACT_ROUTES: Final = frozenset({"/health"})
+# The API docs page at / with its spec, and the static Swagger assets it loads.
+PUBLIC_EXACT_ROUTES: Final = frozenset({"/health", "/", "/openapi.json"})
 # A stored response can be read back by its id (``/v1/responses/{id}``, ``.../input_items``);
 # ownership is still checked by the responses endpoints.
-PUBLIC_ROUTE_PREFIXES: Final = ("/responses/", "/v1/responses/")
+PUBLIC_ROUTE_PREFIXES: Final = ("/responses/", "/v1/responses/", "/swagger/")
 
 # Providers that execute on the proxy host or spend a subscription login stored by the proxy.
 PRIVATE_PROVIDERS: Final = frozenset({"claude_cli", "chatgpt", "blitzcrank"})

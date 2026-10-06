@@ -76,8 +76,9 @@ def test_inference_routes_are_public(path: str) -> None:
         "/sso/key/generate",
         "/login",
         "/v1/memory/search",
-        "/openapi.json",
         "/redoc",
+        "/docs",
+        "/swaggerX",
         "/routes",
         "/health/readiness",
         "/health/services",
@@ -92,6 +93,11 @@ def test_inference_routes_are_public(path: str) -> None:
 )
 def test_everything_else_is_not_public(path: str) -> None:
     assert not is_public_route(path)
+
+
+@pytest.mark.parametrize("path", ["/", "/openapi.json", "/swagger/swagger-ui.css", "/swagger/root.jpg"])
+def test_docs_page_is_public(path: str) -> None:
+    assert is_public_route(path)
 
 
 def _app(root_path: str = "") -> Starlette:
@@ -224,8 +230,10 @@ def test_proxy_app_refuses_admin_and_mcp_routes_on_the_edge() -> None:
 
     assert isinstance(app, FastAPI)
     client: Final = TestClient(app)
-    for path in ("/key/list", "/mcp/", "/v1/memory/search", "/openapi.json"):
+    for path in ("/key/list", "/mcp/", "/v1/memory/search", "/routes"):
         assert client.get(path, headers=EDGE).status_code == 403, path
+    for path in ("/", "/openapi.json"):
+        assert client.get(path, headers=EDGE).status_code == 200, path
     # Without the header the middleware lets the request through to the route as before.
     assert client.get("/key/list").status_code != 403
 

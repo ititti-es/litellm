@@ -961,6 +961,13 @@ custom_swagger_message: Final = (
     "[**Customize Swagger Docs**](https://docs.litellm.ai/docs/proxy/enterprise#swagger-docs---custom-routes--branding)"
 )
 
+# An image shipped beside the Swagger assets (swagger/root.jpg) heads the docs page served at /.
+_docs_image: Final = (
+    "![](swagger/root.jpg)\n\n"
+    if os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "swagger", "root.jpg"))
+    else ""
+)
+
 ### CUSTOM BRANDING [ENTERPRISE FEATURE] ###
 _title: Final = os.getenv("DOCS_TITLE", "LiteLLM API") if premium_user else "LiteLLM API"
 _description: Final = (
@@ -969,7 +976,7 @@ _description: Final = (
         f"Enterprise Edition \n\nProxy Server to call 100+ LLMs in the OpenAI format. {custom_swagger_message}\n\n{ui_message}",
     )
     if premium_user
-    else f"Proxy Server to call 100+ LLMs in the OpenAI format. {custom_swagger_message}\n\n{ui_message}"
+    else f"{_docs_image}Proxy Server to call 100+ LLMs in the OpenAI format. {custom_swagger_message}\n\n{ui_message}"
 )
 
 
