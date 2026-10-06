@@ -339,7 +339,7 @@ def _result(text: str, is_error: bool = False) -> CallToolResult:
 async def call_memory_tool(name: str, arguments: Mapping[str, object], caller: UserAPIKeyAuth | None) -> CallToolResult:
     """Run memory_search or memory_context for an MCP caller, answering errors as isError results"""
     if caller is None:
-        return _result("Memory tools need an authenticated liminal key", is_error=True)
+        return _result("Memory tools need an authenticated API key", is_error=True)
     master_key_user: Final = os.environ.get("MEMORY_MASTER_KEY_USER") or None
     try:
         if name == MEMORY_SEARCH_TOOL_NAME:
