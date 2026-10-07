@@ -12,12 +12,12 @@ For public-edge requests liminal enforces, in addition to the edge's own path al
   ASGI apps mounted beside the API router (``/mcp``) that never reach ``user_api_key_auth``.
 - ``enforce_public_edge`` (called from ``user_api_key_auth`` once the key is known):
   - the key must be flagged public (``metadata.public`` is ``true``); the master key and other
-    admin keys are refused even when flagged;
-  - no MCP tools in the body (``tools`` entries of type ``mcp``);
-  - no model whose deployments run on the proxy host or on a subscription login: the
-    ``claude_cli``, ``chatgpt`` and ``blitzcrank`` providers and ``use_*_oauth`` deployments.
-    A key whose metadata sets ``allow_chatgpt_subscription`` to ``true`` may use ``chatgpt``
-    models; the other private providers stay refused for every key.
+    admin keys are refused even when flagged.
+
+  A key flagged public was issued accepting that it is usable from anywhere, so the edge does not
+  restrict it further: every model on its own allowlist (including host-executed and
+  subscription-backed ones) and MCP tools in the body are allowed. ``private_model`` is still used
+  to hide private deployments from ``/health`` on the edge.
 """
 
 from __future__ import annotations
@@ -109,13 +109,6 @@ def _deny(code: int, message: str) -> HTTPException:
     return HTTPException(status_code=code, detail={"error": message})
 
 
-def _has_mcp_tools(request_data: Mapping[str, object]) -> bool:
-    tools: Final = request_data.get("tools")
-    if not isinstance(tools, list):
-        return False
-    return any(isinstance(tool, Mapping) and tool.get("type") == "mcp" for tool in tools)
-
-
 def _is_private_deployment(litellm_params: Mapping[str, object], *, allow_chatgpt: bool) -> bool:
     model: Final = str(litellm_params.get("model") or "")
     provider: Final = str(litellm_params.get("custom_llm_provider") or model.split("/", 1)[0])
@@ -144,12 +137,8 @@ def enforce_public_edge(
     is_admin: bool,
     deployments_for_model: Iterable[Mapping[str, object]] | None,
 ) -> None:
-    """Raise 401/403 for a public-edge request the public endpoint must not serve. No-op otherwise."""
+    """Raise 401 for a public-edge request the public endpoint must not serve. No-op otherwise."""
     if not is_public_edge(request.headers):
         return
     if is_admin or not key_metadata or key_metadata.get("public") is not True:
         raise _deny(status.HTTP_401_UNAUTHORIZED, "This key is not enabled for the public endpoint.")
-    if _has_mcp_tools(request_data):
-        raise _deny(status.HTTP_403_FORBIDDEN, "MCP tools are not available on the public endpoint.")
-    if private_model(deployments_for_model, allow_chatgpt=key_metadata.get(CHATGPT_OPT_IN) is True):
-        raise _deny(status.HTTP_403_FORBIDDEN, "This model is not available on the public endpoint.")

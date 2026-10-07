@@ -1,4 +1,4 @@
-"""Public-edge restrictions (X-Liminal-Edge: public): routes, keys, MCP tools, private models."""
+"""Public-edge restrictions (X-Liminal-Edge: public): routes and public-flagged keys."""
 
 from __future__ import annotations
 
@@ -173,22 +173,32 @@ def test_only_non_admin_keys_flagged_public_are_accepted(metadata: dict | None, 
     assert exc.value.status_code == 401
 
 
-def test_mcp_tools_are_refused() -> None:
+def test_mcp_tools_are_allowed_for_public_keys() -> None:
+    enforce_public_edge(
+        _request(EDGE),
+        {
+            "model": "glm-5.3-flash",
+            "tools": [
+                {"type": "function", "function": {"name": "f"}},
+                {"type": "mcp", "server_label": "cua_soraka"},
+            ],
+        },
+        key_metadata=PUBLIC_KEY,
+        is_admin=False,
+        deployments_for_model=PUBLIC_DEPLOYMENT,
+    )
+
+
+def test_non_public_key_is_refused_even_for_public_models() -> None:
     with pytest.raises(HTTPException) as exc:
         enforce_public_edge(
             _request(EDGE),
-            {
-                "model": "glm-5.3-flash",
-                "tools": [
-                    {"type": "function", "function": {"name": "f"}},
-                    {"type": "mcp", "server_label": "cua_soraka"},
-                ],
-            },
-            key_metadata=PUBLIC_KEY,
+            {"model": "glm-5.3-flash"},
+            key_metadata={"public": False},
             is_admin=False,
             deployments_for_model=PUBLIC_DEPLOYMENT,
         )
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 401
 
 
 def test_function_tools_are_allowed() -> None:
@@ -212,17 +222,16 @@ def test_function_tools_are_allowed() -> None:
         {"model": "ensemble", "custom_llm_provider": "blitzcrank"},
     ],
 )
-def test_host_executed_and_subscription_models_are_refused(params: dict) -> None:
+def test_host_executed_and_subscription_models_are_allowed_for_public_keys(params: dict) -> None:
+    # Still flagged private (``/health`` hides them on the edge), but no longer refused.
     assert private_model([{"litellm_params": params}])
-    with pytest.raises(HTTPException) as exc:
-        enforce_public_edge(
-            _request(EDGE),
-            {"model": "x"},
-            key_metadata=PUBLIC_KEY,
-            is_admin=False,
-            deployments_for_model=[{"litellm_params": params}],
-        )
-    assert exc.value.status_code == 403
+    enforce_public_edge(
+        _request(EDGE),
+        {"model": "x"},
+        key_metadata=PUBLIC_KEY,
+        is_admin=False,
+        deployments_for_model=[{"litellm_params": params}],
+    )
 
 
 def test_proxy_app_refuses_admin_and_mcp_routes_on_the_edge() -> None:
@@ -294,47 +303,21 @@ def test_chatgpt_opt_in_key_may_use_chatgpt_models() -> None:
 
 
 @pytest.mark.parametrize("opt_in", [False, "true", 1, None])
-def test_chatgpt_needs_a_literal_true_opt_in(opt_in: object) -> None:
-    with pytest.raises(HTTPException) as exc:
-        enforce_public_edge(
-            _request(EDGE),
-            {"model": "gpt-6-luna"},
-            key_metadata={"public": True, "allow_chatgpt_subscription": opt_in},
-            is_admin=False,
-            deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
-        )
-    assert exc.value.status_code == 403
+def test_chatgpt_models_need_no_opt_in(opt_in: object) -> None:
+    enforce_public_edge(
+        _request(EDGE),
+        {"model": "gpt-6-luna"},
+        key_metadata={"public": True, "allow_chatgpt_subscription": opt_in},
+        is_admin=False,
+        deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
+    )
 
 
-@pytest.mark.parametrize(
-    "params",
-    [
-        {"model": "claude_cli/claude-sonnet-5"},
-        {"model": "blitzcrank/ensemble"},
-        {"model": "xai/grok-4.3", "use_xai_oauth": True},
-        {"model": "anthropic/claude-sonnet-5", "use_anthropic_oauth": True},
-        {"model": "chatgpt/gpt-6-luna", "use_anthropic_oauth": True},
-    ],
-)
-def test_chatgpt_opt_in_does_not_unlock_other_private_models(params: dict) -> None:
-    with pytest.raises(HTTPException) as exc:
-        enforce_public_edge(
-            _request(EDGE),
-            {"model": "m"},
-            key_metadata=CHATGPT_KEY,
-            is_admin=False,
-            deployments_for_model=[{"litellm_params": params}],
-        )
-    assert exc.value.status_code == 403
-
-
-def test_chatgpt_opt_in_still_refuses_mcp_tools() -> None:
-    with pytest.raises(HTTPException) as exc:
-        enforce_public_edge(
-            _request(EDGE),
-            {"model": "gpt-6-luna", "tools": [{"type": "mcp", "server_label": "cua_soraka"}]},
-            key_metadata=CHATGPT_KEY,
-            is_admin=False,
-            deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
-        )
-    assert exc.value.status_code == 403
+def test_subscription_model_with_mcp_tools_is_allowed_for_public_keys() -> None:
+    enforce_public_edge(
+        _request(EDGE),
+        {"model": "gpt-6-luna", "tools": [{"type": "mcp", "server_label": "cua_soraka"}]},
+        key_metadata=PUBLIC_KEY,
+        is_admin=False,
+        deployments_for_model=[{"litellm_params": {"model": "chatgpt/gpt-6-luna"}}],
+    )
