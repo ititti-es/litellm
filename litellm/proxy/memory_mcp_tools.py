@@ -52,7 +52,7 @@ MAX_CONTEXT_SIDE: Final = 20
 _FILTERS: Final = {
     "agent": {
         "type": "string",
-        "description": "Only recall sessions of this agent (for example sett). Omit to search every agent.",
+        "description": "Only recall sessions of this agent. Omit to search every agent.",
     },
     "harness": {
         "type": "string",
@@ -339,7 +339,7 @@ def _result(text: str, is_error: bool = False) -> CallToolResult:
 async def call_memory_tool(name: str, arguments: Mapping[str, object], caller: UserAPIKeyAuth | None) -> CallToolResult:
     """Run memory_search or memory_context for an MCP caller, answering errors as isError results"""
     if caller is None:
-        return _result("Memory tools need an authenticated liminal key", is_error=True)
+        return _result("Memory tools need an authenticated key", is_error=True)
     master_key_user: Final = os.environ.get("MEMORY_MASTER_KEY_USER") or None
     try:
         if name == MEMORY_SEARCH_TOOL_NAME:

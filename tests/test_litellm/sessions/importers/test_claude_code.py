@@ -24,7 +24,7 @@ def _record(uuid, parent, **fields):
         "sessionId": SESSION,
         "timestamp": "2026-09-20T10:00:00.000Z",
         "version": "2.1.278",
-        "cwd": "/home/sett/work",
+        "cwd": "/home/user/work",
         "isSidechain": False,
         **fields,
     }
@@ -259,7 +259,7 @@ def test_a_harness_note_is_stored_as_what_it_is(tmp_path):
                 "u1",
                 type="attachment",
                 attachment={"type": "environment"},
-                rendered=[{"content": "<system-reminder>cwd is /home/sett/work</system-reminder>"}],
+                rendered=[{"content": "<system-reminder>cwd is /home/user/work</system-reminder>"}],
             ),
             _assistant("a1", "e1", [{"type": "text", "text": "noted"}]),
         ],
@@ -370,7 +370,7 @@ def test_where_it_ran_is_recorded(tmp_path):
     metadata = read_claude_code_session(SESSION, tmp_path).metadata
 
     assert metadata["harness"] == "claude_code"
-    assert metadata["cwd"] == "/home/sett/work"
+    assert metadata["cwd"] == "/home/user/work"
     assert metadata["model"] == "claude-opus-5"
 
 
