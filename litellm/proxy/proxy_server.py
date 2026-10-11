@@ -11751,9 +11751,14 @@ async def _audio_speech_chunk_generator(
     # too small: latency is high
     # too large: latency is low, but memory usage is high
     # 8192 is a good compromise
-    _generator: Final = await _response.aiter_bytes(chunk_size=AUDIO_SPEECH_CHUNK_SIZE)
-    async for chunk in _generator:
-        yield chunk
+    try:
+        _generator: Final = await _response.aiter_bytes(chunk_size=AUDIO_SPEECH_CHUNK_SIZE)
+        async for chunk in _generator:
+            yield chunk
+    finally:
+        # Upstream bodies are streamed, so a client that disconnects mid-clip must not leave
+        # the provider connection open.
+        await _response.response.aclose()
 
 
 @router.post(

@@ -1652,14 +1652,18 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             },
         )
 
-        response: Final = await openai_client.audio.speech.create(
+        # Open the upstream body as a stream instead of reading it whole, so the proxy can
+        # relay audio as the provider produces it (OpenRouter's Fish sends first bytes after
+        # ~1-2 s of a ~6 s clip). Status errors still raise here, before any byte is relayed.
+        # Whoever iterates the returned body closes it; the proxy's chunk generator does.
+        streamed: Final = await openai_client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice,
             input=input,
             **optional_params,
-        )
+        ).__aenter__()
 
-        return HttpxBinaryResponseContent(response=response.response)
+        return HttpxBinaryResponseContent(response=streamed.http_response)
 
 
 class OpenAIFilesAPI(BaseLLM):
