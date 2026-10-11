@@ -133,7 +133,31 @@ class TestChatGPTResponsesAPITransformation:
 
         assert request["stream"] is True
         assert "reasoning.encrypted_content" in request["include"]
-        assert request["instructions"].startswith("You are Codex, based on GPT-5.")
+        assert request["instructions"] == ""
+
+    def test_chatgpt_instructions_are_callers_own(self, monkeypatch):
+        monkeypatch.delenv("CHATGPT_DEFAULT_INSTRUCTIONS", raising=False)
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-5.2-codex",
+            input="hi",
+            response_api_optional_request_params={"instructions": "Be terse."},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert request["instructions"] == "Be terse."
+
+    def test_chatgpt_default_instructions_env_opt_in(self, monkeypatch):
+        monkeypatch.setenv("CHATGPT_DEFAULT_INSTRUCTIONS", "House rules.")
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-5.2-codex",
+            input="hi",
+            response_api_optional_request_params={"instructions": "Be terse."},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert request["instructions"] == "House rules.\n\nBe terse."
 
     @pytest.mark.parametrize(
         "model_name",

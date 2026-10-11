@@ -88,11 +88,10 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         )
         base_instructions: Final = get_chatgpt_default_instructions()
         existing_instructions: Final = request.get("instructions")
-        if existing_instructions:
-            if base_instructions not in existing_instructions:
-                request["instructions"] = f"{base_instructions}\n\n{existing_instructions}"
-        else:
+        if not existing_instructions:
             request["instructions"] = base_instructions
+        elif base_instructions and base_instructions not in existing_instructions:
+            request["instructions"] = f"{base_instructions}\n\n{existing_instructions}"
         request["store"] = False
         request["stream"] = True
         include: Final = list(request.get("include") or [])

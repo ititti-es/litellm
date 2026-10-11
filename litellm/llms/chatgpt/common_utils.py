@@ -247,7 +247,10 @@ def get_chatgpt_default_headers(
 
 
 def get_chatgpt_default_instructions() -> str:
-    return os.getenv("CHATGPT_DEFAULT_INSTRUCTIONS") or CHATGPT_DEFAULT_INSTRUCTIONS
+    """Opt-in default prepended to every request's instructions; empty unless
+    CHATGPT_DEFAULT_INSTRUCTIONS is set. The Codex CLI prompt above is no longer
+    injected implicitly."""
+    return os.getenv("CHATGPT_DEFAULT_INSTRUCTIONS") or ""
 
 
 def _normalize_litellm_params(litellm_params: Any | None) -> dict:
