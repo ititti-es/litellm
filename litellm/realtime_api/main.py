@@ -510,6 +510,11 @@ async def _arealtime(
         )
         # set API KEY
         api_key = XAIModelInfo.get_api_key(dynamic_api_key, legacy_generic_before_env=True)
+        if not api_key and litellm_params.use_xai_oauth:
+            from litellm.llms.xai.oauth import XAIOAuthAuthenticator
+
+            # Token refresh is a blocking HTTP call.
+            api_key = await asyncio.to_thread(XAIOAuthAuthenticator().get_access_token)
 
         await xai_realtime.async_realtime(
             model=model,
