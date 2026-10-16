@@ -23,7 +23,16 @@ from typing_extensions import ReadOnly
 from litellm.types.utils import Choices, GenericStreamingChunk, Message, ModelResponse, Usage
 
 from .common_utils import ClaudeCLIError, binary_path, session_uuid
-from .transformation import final_chunk, render_prompt, stream_result, system_prompt_of, text_chunk
+from .transformation import (
+    StepUsage,
+    final_chunk,
+    render_prompt,
+    step_usage,
+    stream_result,
+    system_prompt_of,
+    text_chunk,
+    usage_block,
+)
 
 _MAX_SESSIONS: Final = 32
 _MAX_RELAY_LINE: Final = 1024 * 1024
@@ -316,6 +325,7 @@ class BridgeSession:
         self.closed: bool = False
         self.capability: Final = secrets.token_urlsafe(32)
         self.history: tuple[Mapping[str, object], ...] = ()
+        self.step: StepUsage | None = None
 
     async def start(self, model: str, system: str, prompt: str, env: Mapping[str, str], token: str) -> None:
         from .handler import (
@@ -545,6 +555,7 @@ class BridgeSession:
 
     async def _event_outcome(self, event: Mapping[str, object]) -> _EventOutcome:
         kind: Final = event.get("type")
+        self.step = step_usage(event, self.step)
         if kind == "bridge_exit":
             raise ClaudeCLIError("tool bridge process exited before completing turn", status_code=502)
         if kind == "stream_event":
@@ -568,7 +579,7 @@ class BridgeSession:
                 "text": "",
                 "is_finished": True,
                 "finish_reason": "tool_calls",
-                "usage": None,
+                "usage": usage_block(self.step.usage()) if self.step is not None else None,
                 "index": 0,
                 "tool_use": None,
             }
@@ -590,7 +601,9 @@ class BridgeSession:
                 if not waiter.done():
                     waiter.cancel()
             self.refresh_expiry()
-            return _EventOutcome((final_chunk(result),), True)
+            closing: Final = final_chunk(result, self.step)
+            self.step = None
+            return _EventOutcome((closing,), True)
         return _EventOutcome((), False)
 
     @staticmethod

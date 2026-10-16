@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, TypedDict
 
@@ -123,6 +124,40 @@ def usage_of(result: CliResult) -> Usage:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class StepUsage:
+    """One Messages API call inside a Claude Code run: the context it read and what it wrote.
+
+    A run's closing `result` record sums usage over every call the run made, so a turn that went through tools
+    reports its whole context once per call (three calls over a 390k-token conversation read as 1.18M). Only the
+    last call says how large the conversation is.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+
+    def usage(self) -> Usage:
+        return Usage(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            total_tokens=self.prompt_tokens + self.completion_tokens,
+        )
+
+
+def _prompt_size(usage: Mapping[str, object]) -> int:
+    """Input, cache reads and cache writes, counted together as `usage_of` counts them"""
+    fields: Final = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    return sum(value for field in fields if isinstance(value := usage.get(field), int))
+
+
+def usage_block(usage: Usage) -> ChatCompletionUsageBlock:
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
 def finish_reason_of(result: CliResult) -> str:
     return _FINISH_REASONS.get(result.get("stop_reason") or "", "stop")
 
@@ -205,15 +240,43 @@ def text_chunk(text: str) -> GenericStreamingChunk:
     }
 
 
-def final_chunk(result: CliResult) -> GenericStreamingChunk:
-    """The closing chunk: why the reply stopped and what it cost. Carries no text of its own."""
+def step_usage(record: Mapping[str, object], current: StepUsage | None) -> StepUsage | None:
+    """The latest call's usage once this stream record is seen: `message_start` opens a call with its prompt
+    size, and `message_delta` carries that call's final output count."""
+    if record.get("type") != _STREAM_EVENT:
+        return current
+    event: Final = record.get("event")
+    if not isinstance(event, Mapping):
+        return current
+    if event.get("type") == "message_start":
+        message: Final = event.get("message")
+        opened: Final = message.get("usage") if isinstance(message, Mapping) else None
+        if not isinstance(opened, Mapping):
+            return current
+        output: Final = opened.get("output_tokens")
+        return StepUsage(_prompt_size(opened), output if isinstance(output, int) else 0)
+    if event.get("type") == "message_delta" and current is not None:
+        closed: Final = event.get("usage")
+        written: Final = closed.get("output_tokens") if isinstance(closed, Mapping) else None
+        if isinstance(written, int):
+            return StepUsage(current.prompt_tokens, written)
+    return current
+
+
+def step_usage_of_line(line: str, current: StepUsage | None) -> StepUsage | None:
+    """`step_usage` for a raw stream-json line"""
+    record: Final = _line_object(line)
+    return current if record is None else step_usage(record, current)
+
+
+def final_chunk(result: CliResult, step: StepUsage | None = None) -> GenericStreamingChunk:
+    """The closing chunk: why the reply stopped and what it cost. Carries no text of its own.
+
+    With the run's last call in hand, that call is the usage, since the result record's totals add up every call.
+    """
     raise_if_error(result)
-    usage: Final = usage_of(result)
-    block: Final[ChatCompletionUsageBlock] = {
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens,
-    }
+    usage: Final = step.usage() if step is not None else usage_of(result)
+    block: Final = usage_block(usage)
     return {  # mutable-ok: GenericStreamingChunk is the TypedDict CustomLLM streaming requires
         "text": "",
         "is_finished": True,

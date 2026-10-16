@@ -11,8 +11,10 @@ from litellm.llms.claude_cli.common_utils import (
 )
 from litellm.llms.claude_cli.handler import ClaudeCLIHandler
 from litellm.llms.claude_cli.transformation import (
+    final_chunk,
     parse_cli_output,
     render_prompt,
+    step_usage_of_line,
     stream_text,
     system_prompt_of,
     to_model_response,
@@ -311,6 +313,56 @@ def test_usage_counts_cached_tokens_in_the_prompt_total():
     assert usage.prompt_tokens == 4 + 2000 + 100
     assert usage.completion_tokens == 8
     assert usage.total_tokens == 2112
+
+
+def _message_start(input_tokens, cache_read, cache_creation=0):
+    usage = {
+        "input_tokens": input_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+        "output_tokens": 1,
+    }
+    return json.dumps({"type": "stream_event", "event": {"type": "message_start", "message": {"usage": usage}}})
+
+
+def _message_delta(output_tokens):
+    return json.dumps(
+        {"type": "stream_event", "event": {"type": "message_delta", "usage": {"output_tokens": output_tokens}}}
+    )
+
+
+def test_a_streamed_run_reports_its_last_call_not_the_sum_of_its_calls():
+    """Three calls over one conversation: the result sums them, but the context is the last call's prompt."""
+    lines = (
+        _message_start(5, 390_000),
+        _message_delta(200),
+        '{"type":"assistant","message":{"content":[]}}',
+        _message_start(3, 390_500, 300),
+        _message_delta(150),
+        _message_start(2, 391_000, 100),
+        _message_delta(80),
+    )
+    step = None
+    for line in lines:
+        step = step_usage_of_line(line, step)
+    summed = parse_cli_output(
+        _cli_json(usage={"input_tokens": 10, "cache_read_input_tokens": 1_171_500, "output_tokens": 430})
+    )
+
+    usage = final_chunk(summed, step)["usage"]
+
+    assert usage == {"prompt_tokens": 391_102, "completion_tokens": 80, "total_tokens": 391_182}
+
+
+def test_without_call_records_the_result_totals_still_stand():
+    assert final_chunk(parse_cli_output(_cli_json()))["usage"]["prompt_tokens"] == 4 + 2000 + 100
+
+
+def test_lines_that_are_not_call_boundaries_leave_the_step_alone():
+    step = step_usage_of_line(_message_start(1, 10), None)
+
+    for line in ("not json", '{"type":"result"}', '{"type":"stream_event","event":{"type":"content_block_delta"}}'):
+        assert step_usage_of_line(line, step) is step
 
 
 def test_the_response_carries_the_text_and_the_model():

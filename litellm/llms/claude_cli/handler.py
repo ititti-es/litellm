@@ -47,9 +47,11 @@ from .sync import SyncRequest, sync_transcript
 from .tool_bridge import complete_bridge, stream_bridge
 from .transformation import (
     CliResult,
+    StepUsage,
     final_chunk,
     parse_cli_output,
     render_prompt,
+    step_usage_of_line,
     stream_result,
     stream_text,
     system_prompt_of,
@@ -554,6 +556,7 @@ class _StreamedTurn:
 
     spoke: bool = False
     result: CliResult | None = None
+    step: StepUsage | None = None
     exit: StreamExit | None = None
 
     def take(self, item: StreamItem) -> GenericStreamingChunk | None:
@@ -561,6 +564,7 @@ class _StreamedTurn:
         if isinstance(item, StreamExit):
             self.exit = item
             return None
+        self.step = step_usage_of_line(item, self.step)
         text: Final = stream_text(item)
         if text is not None:
             self.spoke = True
@@ -588,7 +592,7 @@ class _StreamedTurn:
             code: Final = ended.returncode if ended is not None else "?"
             detail: Final = (ended.stderr if ended is not None else "").strip()[:400] or "no result record"
             raise ClaudeCLIError(f"Claude CLI exited {code}: {detail}")
-        chunk: Final = final_chunk(self.result)
+        chunk: Final = final_chunk(self.result, self.step)
         if session:
             _STARTED_SESSIONS.add(session)
         _record_transcript(self.result, session, params)
